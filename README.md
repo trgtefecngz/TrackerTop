@@ -47,7 +47,7 @@ Click **Connect Claude Code (Global)** and **+ Add Project** — no terminal com
 ./target/release/trackertop stats
 ./target/release/trackertop projects
 
-# Export standalone offline HTML report + GRAPH_REPORT.md
+# Export concise Markdown summary (.trackertop/GRAPH_REPORT.md)
 ./target/release/trackertop report
 ```
 

@@ -63,20 +63,26 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
 
     if global {
         // Attempt `claude mcp add --transport stdio --scope user trackertop -- <exe> mcp`
-        let status = Command::new("claude")
-            .args([
-                "mcp",
-                "add",
-                "--transport",
-                "stdio",
-                "--scope",
-                "user",
-                "trackertop",
-                "--",
-                &exe_str,
-                "mcp",
-            ])
-            .status();
+        let mut cmd = Command::new("claude");
+        cmd.args([
+            "mcp",
+            "add",
+            "--transport",
+            "stdio",
+            "--scope",
+            "user",
+            "trackertop",
+            "--",
+            &exe_str,
+            "mcp",
+        ]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let status = cmd.status();
         match status {
             Ok(s) if s.success() => {
                 actions.push(format!("Registered global Claude Code MCP server: `{exe_str} mcp`"));

@@ -1,6 +1,6 @@
 [package]
 name = "trackertop"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "AI-first codebase knowledge graph, surgical context packer, MCP server, native multi-project desktop app, and token-savings tracker"
 license = "MIT"

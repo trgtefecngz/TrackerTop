@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", feature = "gui"), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -8,7 +10,38 @@ use trackertop::install::install_claude_code;
 use trackertop::mcp::run_mcp_server;
 use trackertop::parser::default_registry;
 use trackertop::registry::load_global_overview;
-use trackertop::report::generate_reports;
+use trackertop::report::generate_markdown_report;
+
+/// On Windows GUI builds (`windows_subsystem = "windows"`), double-clicking opens
+/// zero console window. When invoked with CLI arguments from PowerShell/CMD (and stdout
+/// is NOT already a redirected pipe like Claude Code MCP), attach the parent console
+/// so CLI output prints normally.
+#[cfg(all(target_os = "windows", feature = "gui"))]
+fn attach_parent_console_if_cli() {
+    use std::ffi::c_void;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> *mut c_void;
+        fn GetFileType(h_file: *mut c_void) -> u32;
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let is_gui_launch = args.len() <= 1 || args.iter().any(|a| a == "ui");
+    if is_gui_launch {
+        return;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        // FILE_TYPE_UNKNOWN (0) means no valid pipe/file/console is attached yet
+        if handle.is_null() || GetFileType(handle) == 0 {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -52,7 +85,7 @@ enum Commands {
     Projects,
     /// List all registered language extractors in the open parser core
     Languages,
-    /// Generate offline interactive HTML graph + token-savings dashboard and GRAPH_REPORT.md
+    /// Generate concise Markdown summary at .trackertop/GRAPH_REPORT.md
     Report,
     /// Configure Claude Code integration (.mcp.json, SKILL.md, CLAUDE.md)
     Install {
@@ -126,6 +159,9 @@ enum QueryAction {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(target_os = "windows", feature = "gui"))]
+    attach_parent_console_if_cli();
+
     let cli = Cli::parse();
     let repo_root = match cli.repo.clone() {
         Some(p) => std::fs::canonicalize(&p).unwrap_or(p),
@@ -271,10 +307,8 @@ fn main() -> Result<()> {
         }
         Commands::Report => {
             index_repository(&repo_root, false)?;
-            let paths = generate_reports(&repo_root)?;
-            println!("Generated TrackerTop reports:");
-            println!("  Interactive Dashboard : {}", paths.html_path.display());
-            println!("  Markdown Summary      : {}", paths.markdown_path.display());
+            let md_path = generate_markdown_report(&repo_root)?;
+            println!("Generated Markdown summary: {}", md_path.display());
         }
         Commands::Install { target, global } => {
             if !target.eq_ignore_ascii_case("claude") {

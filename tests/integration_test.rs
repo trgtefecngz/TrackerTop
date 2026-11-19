@@ -3,7 +3,7 @@ use tempfile::TempDir;
 use trackertop::context::TrackerEngine;
 use trackertop::indexer::index_repository;
 use trackertop::mcp::handle_jsonrpc_message;
-use trackertop::report::generate_reports;
+use trackertop::report::generate_markdown_report;
 
 #[test]
 fn parses_rust_html_wgsl_powershell_and_tracks_token_savings() {
@@ -188,13 +188,12 @@ function Start-Pipeline {
     assert_eq!(token_stats.total_queries, 4);
     assert!(token_stats.total_baseline_tokens > 0);
 
-    // Generate HTML + Markdown reports
-    let reports = generate_reports(root).unwrap();
-    assert!(reports.html_path.exists());
-    assert!(reports.markdown_path.exists());
-    let html = std::fs::read_to_string(&reports.html_path).unwrap();
-    assert!(html.contains("TrackerTop"));
-    assert!(html.contains("shaders/scene.wgsl"));
+    // Generate concise Markdown report
+    let md_path = generate_markdown_report(root).unwrap();
+    assert!(md_path.exists());
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("TrackerTop"));
+    assert!(md.contains("Architectural Hubs"));
 }
 
 #[test]

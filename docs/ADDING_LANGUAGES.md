@@ -73,5 +73,5 @@ Once registered in `LanguageRegistry`, your language immediately works across:
 - Cross-file edge resolution, PageRank God Nodes, and Community clustering
 - All 9 MCP tools (`repo_map`, `task_context`, `file_outline`, `read_symbol`, `impact_analysis`, etc.)
 - Exact BPE token-savings telemetry (`trackertop stats`)
-- Native Desktop GUI graph colors, filters, and inspector
-- Offline HTML dashboard (`trackertop report`)
+- Native Desktop GUI graph colors, island layout, filters, and inspector
+- Concise Markdown summary (`trackertop report`)
