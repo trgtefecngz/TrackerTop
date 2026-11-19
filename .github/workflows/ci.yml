@@ -7,15 +7,22 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
+  test-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run tests
+      - name: Run tests (with native GUI)
         run: cargo test --verbose
-      - name: Build release binary
+      - name: Build release binary (with native GUI)
         run: cargo build --release
+
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run headless CLI/MCP tests
+        run: cargo test --no-default-features --verbose
+      - name: Build headless release binary
+        run: cargo build --release --no-default-features

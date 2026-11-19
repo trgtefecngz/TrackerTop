@@ -1,4 +1,4 @@
-use crate::model::{EdgeKind, Language, RawReference, Symbol, SymbolKind};
+use crate::model::{EdgeKind, RawReference, Symbol, SymbolKind};
 use crate::parser::{
     LanguageExtractor, ParsedFile, compact_signature, file_symbol_id, make_file_symbol,
     make_symbol_id,
@@ -11,8 +11,20 @@ use tree_sitter::{Node, Parser};
 pub struct RustExtractor;
 
 impl LanguageExtractor for RustExtractor {
-    fn language(&self) -> Language {
-        Language::Rust
+    fn id(&self) -> &'static str {
+        "rust"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Rust"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["rs"]
+    }
+
+    fn color_hex(&self) -> &'static str {
+        "#fb923c"
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {

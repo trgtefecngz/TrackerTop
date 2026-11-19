@@ -1,7 +1,8 @@
 use crate::db::Database;
 use crate::graph::CodeGraph;
 use crate::indexer::index_repository;
-use crate::model::{Language, Symbol, SymbolKind, TokenStatsSummary};
+use crate::model::{Symbol, SymbolKind, TokenStatsSummary};
+use crate::parser::default_registry;
 use crate::tokens::{count_tokens, truncate_to_tokens};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -100,14 +101,15 @@ impl TrackerEngine {
         let total_edges = cg.edges.len();
         let total_repo_tokens: usize = cg.files.values().map(|f| f.token_count).sum();
 
-        // Language breakdown
-        let mut lang_counts: HashMap<Language, (usize, usize)> = HashMap::new();
+        // Language breakdown (driven dynamically by LanguageRegistry)
+        let reg = default_registry();
+        let mut lang_counts: HashMap<String, (usize, usize)> = HashMap::new();
         for f in cg.files.values() {
-            let e = lang_counts.entry(f.language).or_insert((0, 0));
+            let e = lang_counts.entry(f.language.clone()).or_insert((0, 0));
             e.0 += 1;
             e.1 += f.token_count;
         }
-        let mut lang_vec: Vec<(Language, usize, usize)> = lang_counts
+        let mut lang_vec: Vec<(String, usize, usize)> = lang_counts
             .into_iter()
             .map(|(l, (c, t))| (l, c, t))
             .collect();
@@ -119,7 +121,7 @@ impl TrackerEngine {
         ));
         let lang_str: Vec<String> = lang_vec
             .iter()
-            .map(|(l, c, t)| format!("{}:{c}f/{t}t", l.display_name()))
+            .map(|(l, c, t)| format!("{}:{c}f/{t}t", reg.display_name_for(l)))
             .collect();
         out.push_str(&format!("Langs: {}\n", lang_str.join(", ")));
 
@@ -204,7 +206,7 @@ impl TrackerEngine {
         let mut out = format!(
             "# OUTLINE {} ({}, {} lines, {} full tok)\n",
             file.path,
-            file.language.display_name(),
+            default_registry().display_name_for(&file.language),
             file.line_count,
             file.token_count
         );

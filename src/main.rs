@@ -6,13 +6,15 @@ use trackertop::db::Database;
 use trackertop::indexer::index_repository;
 use trackertop::install::install_claude_code;
 use trackertop::mcp::run_mcp_server;
+use trackertop::parser::default_registry;
+use trackertop::registry::load_global_overview;
 use trackertop::report::generate_reports;
 
 #[derive(Parser)]
 #[command(
     name = "trackertop",
     version,
-    about = "AI-first codebase knowledge graph, surgical context packer, MCP server & token-savings tracker"
+    about = "AI-first codebase knowledge graph, surgical context packer, MCP server, multi-project desktop app & token-savings tracker"
 )]
 struct Cli {
     /// Path to target repository (defaults to current directory)
@@ -20,11 +22,13 @@ struct Cli {
     repo: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Launch the offline native multi-project desktop application (default when run with no arguments)
+    Ui,
     /// Incrementally index the repository into .trackertop/index.db
     Index {
         /// Force full re-parse of all files
@@ -44,6 +48,10 @@ enum Commands {
         #[arg(long)]
         reset: bool,
     },
+    /// List all tracked projects and global cumulative token savings
+    Projects,
+    /// List all registered language extractors in the open parser core
+    Languages,
     /// Generate offline interactive HTML graph + token-savings dashboard and GRAPH_REPORT.md
     Report,
     /// Configure Claude Code integration (.mcp.json, SKILL.md, CLAUDE.md)
@@ -119,12 +127,25 @@ enum QueryAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo_root = match cli.repo {
+    let repo_root = match cli.repo.clone() {
         Some(p) => std::fs::canonicalize(&p).unwrap_or(p),
         None => std::env::current_dir()?,
     };
 
-    match cli.command {
+    let cmd = cli.command.unwrap_or(Commands::Ui);
+
+    match cmd {
+        Commands::Ui => {
+            #[cfg(feature = "gui")]
+            {
+                let initial = cli.repo.or_else(|| std::env::current_dir().ok());
+                trackertop::ui::run_desktop_app(initial)?;
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                anyhow::bail!("TrackerTop was built without the `gui` feature. Rebuild with `--features gui` or pass a CLI subcommand (`trackertop --help`).");
+            }
+        }
         Commands::Index { force } => {
             let stats = index_repository(&repo_root, force)?;
             println!(
@@ -210,6 +231,42 @@ fn main() -> Result<()> {
                         t.savings_percent
                     );
                 }
+            }
+        }
+        Commands::Projects => {
+            let ov = load_global_overview();
+            println!(
+                "=== TrackerTop Tracked Projects ({}) ===",
+                ov.projects.len()
+            );
+            println!(
+                "Global Savings: {} tok ({:.1}%) | Est. USD: ${:.4} (Sonnet) / ${:.4} (Opus)\n",
+                ov.total_tokens_saved,
+                ov.savings_percent,
+                ov.est_usd_saved_sonnet,
+                ov.est_usd_saved_opus
+            );
+            for p in ov.projects {
+                println!(
+                    "  {:<22} {:>4} files | {:>7} saved ({:>5.1}%) | {}",
+                    p.entry.name,
+                    p.total_files,
+                    p.stats.total_tokens_saved,
+                    p.stats.savings_percent,
+                    p.entry.path
+                );
+            }
+        }
+        Commands::Languages => {
+            println!("=== Registered Language Extractors ===");
+            for l in default_registry().languages() {
+                println!(
+                    "  {:<12} {:<12} [{}] ({})",
+                    l.id,
+                    l.display_name,
+                    l.extensions.join(", "),
+                    l.color_hex
+                );
             }
         }
         Commands::Report => {

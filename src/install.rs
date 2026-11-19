@@ -28,6 +28,28 @@ This project has **TrackerTop** configured as an MCP server (`trackertop`).
 - Every TrackerTop call is strictly token-budgeted and logs real token savings (`trackertop stats`).
 "#;
 
+/// Checks whether TrackerTop appears registered in user-level Claude Code configuration.
+pub fn is_claude_global_installed() -> bool {
+    let Some(home) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+    else {
+        return false;
+    };
+    let candidates = [
+        home.join(".claude.json"),
+        home.join(".claude").join("settings.json"),
+    ];
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.contains("\"trackertop\"") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Installs TrackerTop integration for Claude Code:
 /// 1. Registers MCP server (project `.mcp.json` by default, or user-level via `claude mcp add --scope user`)
 /// 2. Creates `.claude/skills/trackertop/SKILL.md`
@@ -96,15 +118,32 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
         actions.push(format!("Wrote project MCP config: {}", mcp_json_path.display()));
     }
 
-    // Write `.claude/skills/trackertop/SKILL.md`
-    let skill_dir = repo_root.join(".claude").join("skills").join("trackertop");
+    // Write skill + CLAUDE.md in global `~/.claude/` when `global` is true, otherwise project-local
+    let (skill_dir, claude_md) = if global {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| repo_root.to_path_buf());
+        let claude_home = home.join(".claude");
+        (
+            claude_home.join("skills").join("trackertop"),
+            claude_home.join("CLAUDE.md"),
+        )
+    } else {
+        (
+            repo_root.join(".claude").join("skills").join("trackertop"),
+            repo_root.join("CLAUDE.md"),
+        )
+    };
+
     std::fs::create_dir_all(&skill_dir)?;
     let skill_path = skill_dir.join("SKILL.md");
     std::fs::write(&skill_path, SKILL_MD)?;
     actions.push(format!("Wrote Claude Code skill: {}", skill_path.display()));
 
-    // Idempotently update `CLAUDE.md`
-    let claude_md = repo_root.join("CLAUDE.md");
+    if let Some(parent) = claude_md.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let existing_md = std::fs::read_to_string(&claude_md).unwrap_or_default();
     if !existing_md.contains("TrackerTop MCP Navigation") {
         let mut updated = existing_md;

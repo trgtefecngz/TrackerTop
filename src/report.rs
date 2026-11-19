@@ -1,6 +1,7 @@
 use crate::db::Database;
 use crate::graph::CodeGraph;
-use crate::model::{EdgeKind, SymbolKind};
+use crate::model::{EdgeKind, LanguageInfo, SymbolKind};
+use crate::parser::default_registry;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ struct HtmlGraphPayload {
     total_symbols: usize,
     total_edges: usize,
     total_repo_tokens: usize,
+    languages: Vec<LanguageInfo>,
     nodes: Vec<HtmlNode>,
     links: Vec<HtmlLink>,
     god_nodes: Vec<crate::graph::ScoredNode>,
@@ -104,7 +106,7 @@ pub fn generate_reports(repo_root: &Path) -> Result<ReportPaths> {
             HtmlNode {
                 id: f.path.clone(),
                 label: f.path.rsplit('/').next().unwrap_or(&f.path).to_string(),
-                language: f.language.as_str().to_string(),
+                language: f.language.clone(),
                 community: *cg.file_communities.get(&f.path).unwrap_or(&0),
                 tokens: f.token_count,
                 lines: f.line_count,
@@ -175,6 +177,7 @@ pub fn generate_reports(repo_root: &Path) -> Result<ReportPaths> {
         total_symbols,
         total_edges: cg.edges.len(),
         total_repo_tokens,
+        languages: default_registry().languages(),
         nodes,
         links,
         god_nodes,
@@ -461,12 +464,6 @@ const HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
       <input id="searchBox" type="text" placeholder="Filter file or symbol..." />
       <select id="langFilter">
         <option value="all">All Languages</option>
-        <option value="rust">Rust</option>
-        <option value="html">HTML</option>
-        <option value="wgsl">WGSL</option>
-        <option value="powershell">PowerShell</option>
-        <option value="markdown">Markdown</option>
-        <option value="toml">TOML</option>
       </select>
       <select id="colorMode">
         <option value="language">Color: Language</option>
@@ -474,13 +471,7 @@ const HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
       </select>
       <button id="resetViewBtn">Reset View</button>
     </div>
-    <div class="legend">
-      <span><i class="dot" style="background:#fb923c"></i>Rust</span>
-      <span><i class="dot" style="background:#38bdf8"></i>HTML</span>
-      <span><i class="dot" style="background:#a78bfa"></i>WGSL</span>
-      <span><i class="dot" style="background:#22d3ee"></i>PowerShell</span>
-      <span><i class="dot" style="background:#34d399"></i>Docs/TOML</span>
-    </div>
+    <div class="legend" id="langLegend"></div>
   </div>
 
   <aside>
@@ -496,15 +487,18 @@ const HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 <script>
 const DATA = __TRACKERTOP_DATA__;
 
-const LANG_COLORS = {
-  rust: '#fb923c',
-  html: '#38bdf8',
-  wgsl: '#a78bfa',
-  powershell: '#22d3ee',
-  markdown: '#34d399',
-  toml: '#94a3b8'
-};
+const LANG_COLORS = Object.fromEntries((DATA.languages || []).map(l => [l.id, l.color_hex]));
 const CLUSTER_COLORS = ['#38bdf8','#34d399','#fb923c','#a78bfa','#f472b6','#fbbf24','#22d3ee','#f87171'];
+
+const langSelect = document.getElementById('langFilter');
+const langLegend = document.getElementById('langLegend');
+for (const l of (DATA.languages || [])) {
+  const opt = document.createElement('option');
+  opt.value = l.id;
+  opt.textContent = l.display_name;
+  langSelect.appendChild(opt);
+  langLegend.innerHTML += `<span><i class="dot" style="background:${l.color_hex}"></i>${l.display_name}</span>`;
+}
 
 document.getElementById('repoName').textContent = DATA.repo_name;
 

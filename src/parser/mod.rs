@@ -4,9 +4,12 @@ pub mod powershell;
 pub mod rust_lang;
 pub mod wgsl;
 
-use crate::model::{Language, RawReference, Symbol, SymbolKind};
+use crate::model::{LanguageInfo, RawReference, Symbol, SymbolKind};
 use crate::tokens::count_tokens;
 use anyhow::Result;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 /// Output of parsing a single source file.
 #[derive(Debug, Default)]
@@ -15,10 +18,108 @@ pub struct ParsedFile {
     pub refs: Vec<RawReference>,
 }
 
-/// Extensible trait for deterministic language-specific AST/symbol extractors.
+/// Open, extensible trait for deterministic language extractors.
+///
+/// Implement this trait and register it in `LanguageRegistry` to add support for any language
+/// without modifying the database, graph engine, MCP server, HTML report, or desktop UI.
 pub trait LanguageExtractor: Send + Sync {
-    fn language(&self) -> Language;
+    /// Stable lowercase identifier (e.g. `"rust"`, `"wgsl"`, `"python"`).
+    fn id(&self) -> &'static str;
+    /// Human-readable label shown in reports & UI (e.g. `"Rust"`, `"WGSL"`).
+    fn display_name(&self) -> &'static str;
+    /// Lowercase file extensions without leading dot (e.g. `&["rs"]`, `&["ps1", "psm1"]`).
+    fn extensions(&self) -> &'static [&'static str];
+    /// Hex color for graphs and badges (e.g. `"#fb923c"`).
+    fn color_hex(&self) -> &'static str;
+    /// Deterministically extract symbols and references from a single file.
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile>;
+}
+
+/// Runtime registry of pluggable `LanguageExtractor` implementations.
+pub struct LanguageRegistry {
+    extractors: Vec<Arc<dyn LanguageExtractor>>,
+    by_id: HashMap<String, usize>,
+    by_ext: HashMap<String, usize>,
+}
+
+impl LanguageRegistry {
+    pub fn new() -> Self {
+        Self {
+            extractors: Vec::new(),
+            by_id: HashMap::new(),
+            by_ext: HashMap::new(),
+        }
+    }
+
+    /// Registers a new language extractor (can also override an existing extension).
+    pub fn register(&mut self, extractor: Arc<dyn LanguageExtractor>) {
+        let idx = self.extractors.len();
+        self.by_id.insert(extractor.id().to_ascii_lowercase(), idx);
+        for ext in extractor.extensions() {
+            self.by_ext.insert(ext.to_ascii_lowercase(), idx);
+        }
+        self.extractors.push(extractor);
+    }
+
+    /// Default registry populated with TrackerTop's built-in extractors.
+    /// Contributors adding a new language simply add one `reg.register(...)` line here!
+    pub fn default_builtin() -> Self {
+        let mut reg = Self::new();
+        reg.register(Arc::new(rust_lang::RustExtractor));
+        reg.register(Arc::new(html::HtmlExtractor));
+        reg.register(Arc::new(wgsl::WgslExtractor));
+        reg.register(Arc::new(powershell::PowerShellExtractor));
+        reg.register(Arc::new(docs::MarkdownExtractor));
+        reg.register(Arc::new(docs::TomlExtractor));
+        reg
+    }
+
+    pub fn extractor_for_path(&self, path: &Path) -> Option<Arc<dyn LanguageExtractor>> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let &idx = self.by_ext.get(&ext)?;
+        Some(Arc::clone(&self.extractors[idx]))
+    }
+
+    pub fn extractor_by_id(&self, id: &str) -> Option<Arc<dyn LanguageExtractor>> {
+        let &idx = self.by_id.get(&id.to_ascii_lowercase())?;
+        Some(Arc::clone(&self.extractors[idx]))
+    }
+
+    pub fn display_name_for(&self, id: &str) -> String {
+        self.extractor_by_id(id)
+            .map(|e| e.display_name().to_string())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    pub fn color_for(&self, id: &str) -> &'static str {
+        self.extractor_by_id(id)
+            .map(|e| e.color_hex())
+            .unwrap_or("#94a3b8")
+    }
+
+    pub fn languages(&self) -> Vec<LanguageInfo> {
+        self.extractors
+            .iter()
+            .map(|e| LanguageInfo {
+                id: e.id().to_string(),
+                display_name: e.display_name().to_string(),
+                extensions: e.extensions().iter().map(|s| s.to_string()).collect(),
+                color_hex: e.color_hex().to_string(),
+            })
+            .collect()
+    }
+}
+
+impl Default for LanguageRegistry {
+    fn default() -> Self {
+        Self::default_builtin()
+    }
+}
+
+static DEFAULT_REGISTRY: OnceLock<LanguageRegistry> = OnceLock::new();
+
+pub fn default_registry() -> &'static LanguageRegistry {
+    DEFAULT_REGISTRY.get_or_init(LanguageRegistry::default_builtin)
 }
 
 /// Creates the root File symbol for a parsed file so file-level edges work uniformly.
@@ -85,16 +186,4 @@ pub fn collapse_spaces(s: &str) -> String {
         }
     }
     out.trim().to_string()
-}
-
-/// Dispatches parsing to the appropriate language extractor.
-pub fn parse_file(lang: Language, file_path: &str, source: &str) -> Result<ParsedFile> {
-    match lang {
-        Language::Rust => rust_lang::RustExtractor.parse(file_path, source),
-        Language::Html => html::HtmlExtractor.parse(file_path, source),
-        Language::Wgsl => wgsl::WgslExtractor.parse(file_path, source),
-        Language::PowerShell => powershell::PowerShellExtractor.parse(file_path, source),
-        Language::Markdown => docs::MarkdownExtractor.parse(file_path, source),
-        Language::Toml => docs::TomlExtractor.parse(file_path, source),
-    }
 }

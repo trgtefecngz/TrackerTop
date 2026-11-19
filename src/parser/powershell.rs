@@ -1,4 +1,4 @@
-use crate::model::{EdgeKind, Language, RawReference, Symbol, SymbolKind};
+use crate::model::{EdgeKind, RawReference, Symbol, SymbolKind};
 use crate::parser::{
     LanguageExtractor, ParsedFile, compact_signature, file_symbol_id, make_file_symbol,
     make_symbol_id,
@@ -10,8 +10,20 @@ use std::collections::HashSet;
 pub struct PowerShellExtractor;
 
 impl LanguageExtractor for PowerShellExtractor {
-    fn language(&self) -> Language {
-        Language::PowerShell
+    fn id(&self) -> &'static str {
+        "powershell"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "PowerShell"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["ps1", "psm1", "psd1"]
+    }
+
+    fn color_hex(&self) -> &'static str {
+        "#22d3ee"
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {

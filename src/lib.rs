@@ -6,5 +6,8 @@ pub mod install;
 pub mod mcp;
 pub mod model;
 pub mod parser;
+pub mod registry;
 pub mod report;
 pub mod tokens;
+#[cfg(feature = "gui")]
+pub mod ui;

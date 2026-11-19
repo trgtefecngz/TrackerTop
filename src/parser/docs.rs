@@ -1,4 +1,4 @@
-use crate::model::{EdgeKind, Language, RawReference, Symbol, SymbolKind};
+use crate::model::{EdgeKind, RawReference, Symbol, SymbolKind};
 use crate::parser::{
     LanguageExtractor, ParsedFile, compact_signature, file_symbol_id, make_file_symbol,
     make_symbol_id,
@@ -10,8 +10,20 @@ use std::collections::HashSet;
 pub struct MarkdownExtractor;
 
 impl LanguageExtractor for MarkdownExtractor {
-    fn language(&self) -> Language {
-        Language::Markdown
+    fn id(&self) -> &'static str {
+        "markdown"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Markdown"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["md", "markdown"]
+    }
+
+    fn color_hex(&self) -> &'static str {
+        "#34d399"
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {
@@ -83,8 +95,20 @@ impl LanguageExtractor for MarkdownExtractor {
 pub struct TomlExtractor;
 
 impl LanguageExtractor for TomlExtractor {
-    fn language(&self) -> Language {
-        Language::Toml
+    fn id(&self) -> &'static str {
+        "toml"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "TOML"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["toml"]
+    }
+
+    fn color_hex(&self) -> &'static str {
+        "#94a3b8"
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {

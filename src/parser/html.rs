@@ -1,4 +1,4 @@
-use crate::model::{EdgeKind, Language, RawReference, Symbol, SymbolKind};
+use crate::model::{EdgeKind, RawReference, Symbol, SymbolKind};
 use crate::parser::{
     LanguageExtractor, ParsedFile, compact_signature, file_symbol_id, make_file_symbol,
     make_symbol_id,
@@ -11,8 +11,20 @@ use tree_sitter::{Node, Parser};
 pub struct HtmlExtractor;
 
 impl LanguageExtractor for HtmlExtractor {
-    fn language(&self) -> Language {
-        Language::Html
+    fn id(&self) -> &'static str {
+        "html"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "HTML"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["html", "htm"]
+    }
+
+    fn color_hex(&self) -> &'static str {
+        "#38bdf8"
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {

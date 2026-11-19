@@ -1,72 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::path::Path;
 
-/// Supported source and configuration languages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Language {
-    Rust,
-    Html,
-    Wgsl,
-    PowerShell,
-    Markdown,
-    Toml,
-}
-
-impl Language {
-    pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        match ext.as_str() {
-            "rs" => Some(Self::Rust),
-            "html" | "htm" => Some(Self::Html),
-            "wgsl" => Some(Self::Wgsl),
-            "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
-            "md" | "markdown" => Some(Self::Markdown),
-            "toml" => Some(Self::Toml),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Rust => "rust",
-            Self::Html => "html",
-            Self::Wgsl => "wgsl",
-            Self::PowerShell => "powershell",
-            Self::Markdown => "markdown",
-            Self::Toml => "toml",
-        }
-    }
-
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s {
-            "rust" => Self::Rust,
-            "html" => Self::Html,
-            "wgsl" => Self::Wgsl,
-            "powershell" => Self::PowerShell,
-            "markdown" => Self::Markdown,
-            "toml" => Self::Toml,
-            _ => Self::Markdown,
-        }
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Rust => "Rust",
-            Self::Html => "HTML",
-            Self::Wgsl => "WGSL",
-            Self::PowerShell => "PowerShell",
-            Self::Markdown => "Markdown",
-            Self::Toml => "TOML",
-        }
-    }
-}
-
-impl fmt::Display for Language {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
+/// Metadata describing any language registered in `LanguageRegistry`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageInfo {
+    pub id: String,
+    pub display_name: String,
+    pub extensions: Vec<String>,
+    pub color_hex: String,
 }
 
 /// Structural symbol categories extracted deterministically from source code.
@@ -85,17 +25,17 @@ pub enum SymbolKind {
     Const,
     TypeAlias,
     Macro,
-    // WGSL-specific
+    // Shader / GPU
     ShaderEntry,
     Binding,
-    // HTML-specific
+    // Web / Markup
     Element,
     Script,
     Style,
-    // PowerShell-specific
+    // Scripting / OOP
     Class,
     Filter,
-    // Docs/Config
+    // Docs / Config
     Section,
     Dependency,
 }
@@ -194,11 +134,11 @@ impl EdgeKind {
     }
 }
 
-/// Indexed file metadata.
+/// Indexed file metadata. `language` holds the open `LanguageExtractor::id()` string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
     pub path: String, // forward-slash normalized path relative to repo root
-    pub language: Language,
+    pub language: String,
     pub hash: String,
     pub mtime_secs: i64,
     pub size_bytes: u64,
@@ -218,7 +158,7 @@ pub struct Symbol {
     pub start_line: usize, // 1-based inclusive
     pub end_line: usize,   // 1-based inclusive
     pub token_count: usize,
-    pub visibility: String, // "pub", "pub(crate)", "private", "@vertex", etc.
+    pub visibility: String,
     pub doc_summary: String,
     pub parent_id: Option<String>,
 }
@@ -256,7 +196,7 @@ pub struct TelemetryEntry {
 }
 
 /// Aggregated token-savings statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenStatsSummary {
     pub total_queries: usize,
     pub total_tokens_sent: usize,

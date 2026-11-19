@@ -1,12 +1,14 @@
 use crate::db::Database;
-use crate::model::{Edge, EdgeKind, FileRecord, Language, RawReference, Symbol, SymbolKind};
-use crate::parser::{file_symbol_id, parse_file};
+use crate::model::{Edge, EdgeKind, FileRecord, RawReference, Symbol, SymbolKind};
+use crate::parser::{LanguageExtractor, LanguageRegistry, default_registry, file_symbol_id};
+use crate::registry::register_project;
 use crate::tokens::count_tokens;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -21,10 +23,20 @@ pub struct IndexStats {
     pub elapsed_ms: u128,
 }
 
-/// Runs an incremental index of `repo_root` into `.trackertop/index.db`.
+/// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
 /// Only new or changed files (detected via mtime + blake3 hash) are re-parsed.
 pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
+    index_repository_with_registry(repo_root, force, default_registry())
+}
+
+/// Runs an incremental index using any custom `LanguageRegistry` (open core for community languages).
+pub fn index_repository_with_registry(
+    repo_root: &Path,
+    force: bool,
+    registry: &LanguageRegistry,
+) -> Result<IndexStats> {
     let start = Instant::now();
+    let _ = register_project(repo_root);
     let mut db = Database::open_for_repo(repo_root)?;
     let existing = if force {
         HashMap::new()
@@ -32,7 +44,7 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
         db.load_file_map()?
     };
 
-    let discovered = discover_supported_files(repo_root);
+    let discovered = discover_supported_files(repo_root, registry);
     let current_paths: HashSet<String> = discovered.iter().map(|(rel, _, _)| rel.clone()).collect();
 
     // Detect deleted files
@@ -46,7 +58,7 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
     struct Candidate {
         rel_path: String,
         abs_path: PathBuf,
-        lang: Language,
+        extractor: Arc<dyn LanguageExtractor>,
         mtime: i64,
         size: u64,
     }
@@ -54,7 +66,7 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
     let mut candidates = Vec::new();
     let mut skipped_files = 0usize;
 
-    for (rel_path, abs_path, lang) in discovered {
+    for (rel_path, abs_path, extractor) in discovered {
         let meta = match std::fs::metadata(&abs_path) {
             Ok(m) => m,
             Err(_) => continue,
@@ -80,7 +92,7 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
         candidates.push(Candidate {
             rel_path,
             abs_path,
-            lang,
+            extractor,
             mtime,
             size,
         });
@@ -99,12 +111,12 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
                 }
             }
 
-            let parsed = parse_file(cand.lang, &cand.rel_path, &source).ok()?;
+            let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
             let line_count = source.lines().count().max(1);
             let token_count = count_tokens(&source);
             let rec = FileRecord {
                 path: cand.rel_path,
-                language: cand.lang,
+                language: cand.extractor.id().to_string(),
                 hash,
                 mtime_secs: cand.mtime,
                 size_bytes: cand.size,
@@ -153,7 +165,10 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
 }
 
 /// Discovers supported files respecting `.gitignore`, skipping `.trackertop/` and `.git/`.
-fn discover_supported_files(repo_root: &Path) -> Vec<(String, PathBuf, Language)> {
+fn discover_supported_files(
+    repo_root: &Path,
+    registry: &LanguageRegistry,
+) -> Vec<(String, PathBuf, Arc<dyn LanguageExtractor>)> {
     let mut results = Vec::new();
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -174,7 +189,7 @@ fn discover_supported_files(repo_root: &Path) -> Vec<(String, PathBuf, Language)
         if !path.is_file() {
             continue;
         }
-        let Some(lang) = Language::from_path(path) else {
+        let Some(extractor) = registry.extractor_for_path(path) else {
             continue;
         };
         let Ok(rel) = path.strip_prefix(repo_root) else {
@@ -185,7 +200,7 @@ fn discover_supported_files(repo_root: &Path) -> Vec<(String, PathBuf, Language)
         if norm.ends_with("GRAPH_REPORT.md") || norm.starts_with(".trackertop/") {
             continue;
         }
-        results.push((norm, path.to_path_buf(), lang));
+        results.push((norm, path.to_path_buf(), extractor));
     }
     results.sort_by(|a, b| a.0.cmp(&b.0));
     results

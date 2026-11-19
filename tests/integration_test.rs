@@ -196,3 +196,65 @@ function Start-Pipeline {
     assert!(html.contains("TrackerTop"));
     assert!(html.contains("shaders/scene.wgsl"));
 }
+
+#[test]
+fn open_language_registry_accepts_custom_community_language() {
+    use std::sync::Arc;
+    use trackertop::indexer::index_repository_with_registry;
+    use trackertop::model::{Symbol, SymbolKind};
+    use trackertop::parser::{
+        LanguageExtractor, LanguageRegistry, ParsedFile, file_symbol_id, make_file_symbol,
+        make_symbol_id,
+    };
+
+    struct ToyLangExtractor;
+    impl LanguageExtractor for ToyLangExtractor {
+        fn id(&self) -> &'static str {
+            "toylang"
+        }
+        fn display_name(&self) -> &'static str {
+            "ToyLang"
+        }
+        fn extensions(&self) -> &'static [&'static str] {
+            &["toy"]
+        }
+        fn color_hex(&self) -> &'static str {
+            "#f472b6"
+        }
+        fn parse(&self, file_path: &str, source: &str) -> anyhow::Result<ParsedFile> {
+            let mut out = ParsedFile::default();
+            let fid = file_symbol_id(file_path);
+            out.symbols.push(make_file_symbol(file_path, source));
+            for (idx, line) in source.lines().enumerate() {
+                if let Some(name) = line.trim().strip_prefix("def ") {
+                    let line_no = idx + 1;
+                    out.symbols.push(Symbol {
+                        id: make_symbol_id(file_path, name, line_no),
+                        file_path: file_path.to_string(),
+                        name: name.to_string(),
+                        qualified_name: name.to_string(),
+                        kind: SymbolKind::Function,
+                        signature: format!("def {name}"),
+                        start_line: line_no,
+                        end_line: line_no,
+                        token_count: 3,
+                        visibility: "pub".to_string(),
+                        doc_summary: String::new(),
+                        parent_id: Some(fid.clone()),
+                    });
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("hello.toy"), "def greet_world\n").unwrap();
+
+    let mut reg = LanguageRegistry::default_builtin();
+    reg.register(Arc::new(ToyLangExtractor));
+
+    let stats = index_repository_with_registry(tmp.path(), false, &reg).unwrap();
+    assert_eq!(stats.total_files, 1);
+    assert_eq!(stats.total_symbols, 2); // file + greet_world
+}

@@ -1,5 +1,5 @@
 use crate::model::{
-    Edge, EdgeKind, FileRecord, Language, Symbol, SymbolKind, TelemetryEntry, TokenStatsSummary,
+    Edge, EdgeKind, FileRecord, Symbol, SymbolKind, TelemetryEntry, TokenStatsSummary,
     ToolSavingsBreakdown,
 };
 use crate::tokens::estimate_usd_saved;
@@ -115,10 +115,9 @@ impl Database {
             "SELECT path, language, hash, mtime_secs, size_bytes, line_count, token_count FROM files",
         )?;
         let rows = stmt.query_map([], |row| {
-            let lang_str: String = row.get(1)?;
             Ok(FileRecord {
                 path: row.get(0)?,
-                language: Language::from_str_lossy(&lang_str),
+                language: row.get(1)?,
                 hash: row.get(2)?,
                 mtime_secs: row.get(3)?,
                 size_bytes: row.get::<_, i64>(4)? as u64,
@@ -184,7 +183,7 @@ impl Database {
             for (file, syms, refs) in entries {
                 ins_file.execute(params![
                     file.path,
-                    file.language.as_str(),
+                    file.language,
                     file.hash,
                     file.mtime_secs,
                     file.size_bytes as i64,
@@ -247,10 +246,9 @@ impl Database {
              FROM files ORDER BY path",
         )?;
         let rows = stmt.query_map([], |row| {
-            let lang_str: String = row.get(1)?;
             Ok(FileRecord {
                 path: row.get(0)?,
-                language: Language::from_str_lossy(&lang_str),
+                language: row.get(1)?,
                 hash: row.get(2)?,
                 mtime_secs: row.get(3)?,
                 size_bytes: row.get::<_, i64>(4)? as u64,
