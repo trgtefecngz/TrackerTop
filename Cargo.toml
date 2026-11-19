@@ -1,0 +1,32 @@
+[package]
+name = "trackertop"
+version = "0.1.0"
+edition = "2024"
+description = "AI-first codebase knowledge graph, surgical context packer, MCP server, and token-savings tracker"
+license = "MIT"
+repository = "https://github.com/trgtefecngz/TrackerTop"
+keywords = ["ai", "mcp", "claude-code", "knowledge-graph", "tree-sitter"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "trackertop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+ignore = "0.4"
+petgraph = "0.7"
+rayon = "1.10"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tiktoken-rs = "0.6"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-html = "0.23"
+
+[dev-dependencies]
+tempfile = "3.19"
