@@ -1,7 +1,10 @@
 pub mod docs;
+pub mod golang;
 pub mod html;
 pub mod powershell;
+pub mod python;
 pub mod rust_lang;
+pub mod typescript;
 pub mod wgsl;
 
 use crate::model::{LanguageInfo, RawReference, Symbol, SymbolKind};
@@ -66,6 +69,9 @@ impl LanguageRegistry {
     pub fn default_builtin() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(rust_lang::RustExtractor));
+        reg.register(Arc::new(typescript::TypeScriptExtractor));
+        reg.register(Arc::new(python::PythonExtractor));
+        reg.register(Arc::new(golang::GoExtractor));
         reg.register(Arc::new(html::HtmlExtractor));
         reg.register(Arc::new(wgsl::WgslExtractor));
         reg.register(Arc::new(powershell::PowerShellExtractor));

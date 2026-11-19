@@ -317,3 +317,93 @@ pub fn render_frame() -> &'static str {
     let health = engine.health_check(800).unwrap();
     assert!(health.text.contains("# CODE HEALTH CHECK"));
 }
+
+#[test]
+fn v05_global_languages_typescript_python_and_go() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // TypeScript
+    std::fs::write(
+        root.join("app.ts"),
+        r#"
+import { helper } from "./util";
+
+export class ApiClient {
+    async fetchUser(id: string) {
+        return helper(id);
+    }
+}
+
+export const formatTitle = (name: string) => {
+    return helper(name);
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("util.ts"),
+        "export function helper(v: string) { return v.trim(); }\n",
+    )
+    .unwrap();
+
+    // Python
+    std::fs::write(
+        root.join("service.py"),
+        r#"
+from models import User
+
+class AuthService:
+    """Handles login tokens."""
+    def verify_user(self, uid: str) -> User:
+        return build_user(uid)
+
+def build_user(uid: str) -> User:
+    return User(uid)
+
+def test_verify_user():
+    assert build_user("1") is not None
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models.py"),
+        "class User:\n    def __init__(self, uid: str):\n        self.uid = uid\n",
+    )
+    .unwrap();
+
+    // Go
+    std::fs::write(
+        root.join("server.go"),
+        r#"
+package main
+
+type Server struct {
+    Addr string
+}
+
+func (s *Server) Start() error {
+    return bootCluster()
+}
+
+func bootCluster() error {
+    return nil
+}
+"#,
+    )
+    .unwrap();
+
+    let stats = index_repository(root, false).unwrap();
+    assert_eq!(stats.total_files, 5);
+    assert!(stats.total_symbols >= 12);
+
+    let engine = TrackerEngine::new(root);
+    let ts_call = engine.call_graph("fetchUser", 2, 800).unwrap();
+    assert!(ts_call.text.contains("helper"));
+
+    let py_impact = engine.impact_analysis("build_user", 2, 800).unwrap();
+    assert!(py_impact.text.contains("test_verify_user"));
+
+    let go_call = engine.call_graph("Server::Start", 2, 800).unwrap();
+    assert!(go_call.text.contains("bootCluster"));
+}

@@ -290,5 +290,63 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
         actions.push(format!("{} already configured", claude_md.display()));
     }
 
+    // Install lightweight SessionStart hook in `~/.claude/settings.json` when global
+    if global {
+        if let Some(home) = user_home() {
+            let settings_path = home.join(".claude").join("settings.json");
+            if install_claude_session_hook(&settings_path, &exe_str).is_ok() {
+                actions.push(format!(
+                    "Installed Claude Code SessionStart hook in {}",
+                    settings_path.display()
+                ));
+            }
+        }
+    }
+
     Ok(actions)
+}
+
+/// Safely merges a lightweight `SessionStart` hook into `~/.claude/settings.json`
+/// without overwriting any existing user settings or hooks.
+fn install_claude_session_hook(settings_path: &Path, exe_str: &str) -> Result<()> {
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut root: Value = if settings_path.exists() {
+        let text = std::fs::read_to_string(settings_path).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let hook_cmd = format!("\"{exe_str}\" hook-hint");
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    if let Some(hooks_obj) = hooks.as_object_mut() {
+        let session_start = hooks_obj
+            .entry("SessionStart")
+            .or_insert_with(|| json!([]));
+        if let Some(arr) = session_start.as_array_mut() {
+            let already = arr
+                .iter()
+                .any(|entry| entry.to_string().contains("hook-hint"));
+            if !already {
+                arr.push(json!({
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_cmd
+                        }
+                    ]
+                }));
+            }
+        }
+    }
+    std::fs::write(settings_path, serde_json::to_string_pretty(&root)?)?;
+    Ok(())
 }

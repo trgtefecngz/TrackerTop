@@ -1252,16 +1252,16 @@ impl TrackerTopApp {
                                 reset_stats_for = Some(lp.path.clone());
                             }
                             ui.add_space(6.0);
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new("Preview Savings")
-                                    .corner_radius(CornerRadius::same(14)),
-                            )
-                            .on_hover_text("Dry-run preview — does NOT add to your real token savings counter")
-                            .clicked()
-                        {
-                            run_preview_for = Some(lp.path.clone());
+                            if ui
+                                .add(
+                                    egui::Button::new("Preview Savings")
+                                        .corner_radius(CornerRadius::same(14)),
+                                )
+                                .on_hover_text("Dry-run preview — does NOT add to your real token savings counter")
+                                .clicked()
+                            {
+                                run_preview_for = Some(lp.path.clone());
+                            }
                         }
                     });
                 });
@@ -2242,6 +2242,7 @@ pub fn run_desktop_app(initial_repo: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("TrackerTop — AI Codebase Graph & Token Savings")
+            .with_icon(std::sync::Arc::new(build_app_icon()))
             .with_inner_size([1300.0, 820.0])
             .with_min_inner_size([900.0, 580.0]),
         ..Default::default()
@@ -2252,6 +2253,100 @@ pub fn run_desktop_app(initial_repo: Option<PathBuf>) -> Result<()> {
         Box::new(move |_cc| Ok(Box::new(TrackerTopApp::new(initial_repo)))),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
+}
+
+/// Procedurally renders a crisp 64x64 anti-aliased TrackerTop node-graph "T" icon
+/// so the native window & taskbar display a custom brand emblem across Windows, macOS, and Linux.
+fn build_app_icon() -> egui::IconData {
+    const S: usize = 64;
+    let mut rgba = vec![0u8; S * S * 4];
+
+    let nodes: [(f32, f32, f32, (f32, f32, f32)); 4] = [
+        (17.0, 20.0, 6.2, (56.0, 189.0, 248.0)), // top-left cyan
+        (32.0, 20.0, 7.2, (110.0, 231.0, 183.0)), // top-center emerald hub
+        (47.0, 20.0, 6.2, (129.0, 140.0, 248.0)), // top-right indigo
+        (32.0, 46.0, 6.8, (52.0, 211.0, 153.0)), // bottom-center emerald
+    ];
+    let segments: [((f32, f32), (f32, f32)); 2] = [
+        ((17.0, 20.0), (47.0, 20.0)), // horizontal T bar
+        ((32.0, 20.0), (32.0, 46.0)), // vertical T stem
+    ];
+
+    for y in 0..S {
+        for x in 0..S {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            // Rounded square SDF
+            let cx = (fx - 32.0).abs() - 20.0;
+            let cy = (fy - 32.0).abs() - 20.0;
+            let sdf = cx.max(0.0).hypot(cy.max(0.0)) + cx.max(cy).min(0.0) - 10.0;
+            if sdf > 1.0 {
+                continue;
+            }
+            let bg_alpha = (1.0 - sdf).clamp(0.0, 1.0);
+
+            // Deep midnight rounded background with soft top-left glow
+            let g_dist = ((fx - 18.0).powi(2) + (fy - 16.0).powi(2)).sqrt() / 48.0;
+            let glow = (-g_dist * g_dist * 2.2).exp() * 0.28;
+            let mut r = 11.0 + (56.0 - 11.0) * glow;
+            let mut g = 17.0 + (189.0 - 17.0) * glow;
+            let mut b = 32.0 + (248.0 - 32.0) * glow;
+
+            // Subtle glowing border
+            if sdf > -2.0 && sdf <= 0.5 {
+                let edge_t = (1.0 - (sdf + 0.75).abs() / 1.4).clamp(0.0, 1.0);
+                r += (56.0 - r) * edge_t * 0.55;
+                g += (189.0 - g) * edge_t * 0.55;
+                b += (248.0 - b) * edge_t * 0.55;
+            }
+
+            // Draw T-bar edges
+            for &((x1, y1), (x2, y2)) in &segments {
+                let vx = x2 - x1;
+                let vy = y2 - y1;
+                let len2 = (vx * vx + vy * vy).max(1.0);
+                let t = (((fx - x1) * vx + (fy - y1) * vy) / len2).clamp(0.0, 1.0);
+                let px = x1 + t * vx;
+                let py = y1 + t * vy;
+                let d = (fx - px).hypot(fy - py);
+                if d < 4.5 {
+                    let a = ((3.4 - d) / 1.5).clamp(0.0, 1.0);
+                    r = r * (1.0 - a) + 125.0 * a;
+                    g = g * (1.0 - a) + 211.0 * a;
+                    b = b * (1.0 - a) + 252.0 * a;
+                }
+            }
+
+            // Draw glowing graph nodes
+            for &(nx, ny, nr, (cr, cg, cb)) in &nodes {
+                let d = (fx - nx).hypot(fy - ny);
+                if d < nr + 5.0 {
+                    let halo = (-(d * d) / (nr * nr * 2.2)).exp() * 0.45;
+                    r += (cr - r) * halo;
+                    g += (cg - g) * halo;
+                    b += (cb - b) * halo;
+                }
+                if d < nr + 1.0 {
+                    let a = (nr + 0.5 - d).clamp(0.0, 1.0);
+                    r = r * (1.0 - a) + cr * a;
+                    g = g * (1.0 - a) + cg * a;
+                    b = b * (1.0 - a) + cb * a;
+                }
+            }
+
+            let idx = (y * S + x) * 4;
+            rgba[idx] = r.clamp(0.0, 255.0) as u8;
+            rgba[idx + 1] = g.clamp(0.0, 255.0) as u8;
+            rgba[idx + 2] = b.clamp(0.0, 255.0) as u8;
+            rgba[idx + 3] = (bg_alpha * 255.0) as u8;
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: S as u32,
+        height: S as u32,
+    }
 }
 
 fn poll_agent_statuses() -> Vec<(AiAgentKind, bool)> {

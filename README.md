@@ -1,53 +1,80 @@
 # ⚡ TrackerTop
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-34d399.svg)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/Rust-100%25%20Offline-fb923c.svg)](Cargo.toml)
+[![MCP Compatible](https://img.shields.io/badge/MCP-15%20AI%20Tools-38bdf8.svg)](src/mcp.rs)
+[![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-a78bfa.svg)](https://github.com/trgtefecngz/TrackerTop/releases/latest)
+
 **AI-first codebase knowledge graph, surgical context packer, MCP server, offline native multi-project desktop app, and real token-savings tracker — built in Rust.**
 
-TrackerTop replaces blind `grep` loops and full-file reads for AI coding agents (Claude Code, Cursor, Codex, etc.) with a deterministic, token-budgeted knowledge graph, tracks **exact BPE tokens saved** on every query, and ships with a **100% offline native desktop app** to monitor all your projects in one place.
+TrackerTop replaces blind `grep` loops and full-file reads for **Claude Code, Cursor, Codex CLI, Windsurf, and any MCP client** with a deterministic, token-budgeted knowledge graph, tracks **exact BPE tokens saved** on every query, and ships with a **100% offline native desktop app** to monitor all your projects in one place.
 
 ---
 
-## Key Features
+## Real-World Token Savings Benchmark
 
-- **AI-First Surgical Context:** Exposes 9 MCP tools (`repo_map`, `task_context`, `file_outline`, `read_symbol`, `find_symbol`, `call_graph`, `impact_analysis`, `shortest_path`, `token_stats`) strictly bounded by `max_tokens`.
-- **Automatic On-Demand Incremental Indexing:** Zero background CPU drain. On every AI query, TrackerTop checks file mtimes/hashes (`blake3`) in ~5–10 ms and re-parses only modified files — so AI agents always see 100% fresh code.
-- **Real Token-Savings Telemetry:** Uses offline BPE tokenization (`cl100k_base`) to measure exact tokens sent vs. baseline full-file tokens avoided, logging every query with estimated USD savings (Sonnet / Opus).
-- **Offline Native Multi-Project Desktop App:** Double-click `trackertop.exe` (or run `trackertop ui`) to open the native GPU-rendered desktop app:
-  - Track and switch between **multiple projects** (any repo used by Claude Code auto-registers!)
-  - **All Projects** global savings overview + live per-project token-savings feed
-  - Interactive force-directed **Code Graph** with symbol inspector
-  - One-click **Connect Claude Code (Global)** setup
-- **Open, Pluggable Language Core (`LanguageRegistry`):** Built-in extractors for **Rust**, **HTML**, **WGSL**, **PowerShell**, **Markdown**, and **TOML** — and designed so contributors can add any new language in 3 steps without touching the graph, MCP, or UI. See [docs/ADDING_LANGUAGES.md](docs/ADDING_LANGUAGES.md).
+Measured offline on a real **342-file, 443,561-token** multi-language game repository (Rust + WGSL + HTML + TOML + Markdown):
+
+| Operation | Traditional Raw Reads | TrackerTop MCP | Savings | Latency |
+|---|---:|---:|---:|---:|
+| Architectural overview (`repo_map`) | 120,688 tok | **819 tok** | **99.3%** | **88 ms** |
+| Git change blast radius (`diff_impact`) | 79,815 tok | **319 tok** | **99.6%** | **<40 ms** |
+| Symbol-tagged search (`smart_grep`) | 11,690 tok | **135 tok** | **98.8%** | **<25 ms** |
+| Surgical single-symbol read (`read_symbol`) | 16,456 tok | **1,296 tok** | **92.1%** | **<20 ms** |
 
 ---
 
 ## Quick Start
 
-### Option A: Download Portable Windows App (No Rust Required)
-1. Download **`TrackerTop-v0.4.1-windows-x64.exe`** from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
-2. Double-click to open the offline native desktop app (no console window, no installation needed).
-3. Click **Connect AI Agents** (Claude Code, Cursor, Codex CLI, Windsurf, or copy universal MCP JSON) and **+ Add**.
+### Option A: One-Line Install (No Rust Required)
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/trgtefecngz/TrackerTop/main/scripts/install.ps1 | iex
+```
+*(Downloads the latest portable `.exe`, adds it to User PATH, creates a Desktop shortcut, and launches TrackerTop.)*
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/trgtefecngz/TrackerTop/main/scripts/install.sh | bash
+```
+
+**Or download directly:** grab `TrackerTop-v0.5.0-windows-x64.exe` / `TrackerTop-v0.5.0-macos-arm64` from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
 
 ### Option B: Build from Source
 ```bash
+cargo install --git https://github.com/trgtefecngz/TrackerTop
+# Or locally:
 cargo build --release
 ```
-*(For headless CLI/MCP servers without GUI dependencies: `cargo build --release --no-default-features`)*
+*(Headless CLI/MCP-only build: `cargo build --release --no-default-features`)*
 
-### CLI Usage (Optional)
-```bash
-# Connect Claude Code globally across all repositories
-./target/release/trackertop install claude --global
+### Connect Your AI Coding Agents (1 Click)
+1. Open **TrackerTop** (double-click — zero console window, 100% offline).
+2. Click **Connect AI Agents** in the top bar:
+   - **Claude Code** (global MCP + `SKILL.md` + `CLAUDE.md` + `SessionStart` hook)
+   - **Cursor**, **Codex CLI**, **Windsurf** (1-click config merge)
+   - **Copy Universal MCP JSON** for VS Code Copilot, Zed, Cline, Antigravity, etc.
+3. Click **+ Add** (or just open any folder in Claude Code — it auto-registers and updates live!).
 
-# Index current repo
-./target/release/trackertop index
+---
 
-# Inspect real token savings
-./target/release/trackertop stats
-./target/release/trackertop projects
+## Supported Languages (9 Built-In + Open Core)
 
-# Export concise Markdown summary (.trackertop/GRAPH_REPORT.md)
-./target/release/trackertop report
-```
+TrackerTop uses an open, pluggable **`LanguageRegistry`** (`LanguageExtractor` trait). Built-in extractors:
+
+| Language | Extensions | Extracted Structures & Bridges |
+|---|---|---|
+| **Rust** | `.rs` | Tree-sitter AST (`mod`, `use`, `struct`, `enum`, `trait`, `impl`, `fn`, `#[test]`, calls, type refs, **Rust ↔ WGSL/HTML/TOML asset bridge**) |
+| **TypeScript / JS** | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` | Imports/require, classes, methods, interfaces, types, enums, arrow functions, tests, calls |
+| **Python** | `.py`, `.pyi` | Imports, classes & inheritance, functions/methods, `test_*`, docstrings, calls |
+| **Go** | `.go` | Imports, structs, interfaces, receiver methods, `Test*`, calls |
+| **HTML** | `.html`, `.htm` | Tree-sitter AST (assets/links, `#id`, `<canvas>`, `<template>`, custom elements, inline `<script>` & shader fetches) |
+| **WGSL** | `.wgsl` | `@vertex`/`@fragment`/`@compute`, `@group/@binding` uniforms/storage, `struct`, `fn`, `#import`, calls |
+| **PowerShell** | `.ps1`, `.psm1`, `.psd1` | `function`/`filter`/`class`/`enum`, `param(...)`, `Import-Module`, dot-sourcing, Verb-Noun calls |
+| **Markdown & TOML** | `.md`, `.toml` | Section headings, backtick symbol cross-refs, Cargo dependencies |
+
+Want to add **C/C++, C#, Java, Zig, GLSL, Ruby, or Swift**? Read [docs/ADDING_LANGUAGES.md](docs/ADDING_LANGUAGES.md) — 3 steps, zero changes to the graph, MCP server, or UI.
 
 ---
 
@@ -69,13 +96,6 @@ cargo build --release
 | `shortest_path` | Shortest dependency path connecting two symbols or files |
 | `remember` / `recall` | Persistent AI architectural memory auto-injected into future sessions |
 | `token_stats` | Real cumulative tokens saved and estimated USD cost reduction |
-
----
-
-## Contributing a Language
-
-TrackerTop's parser core is completely open via `LanguageExtractor` and `LanguageRegistry`.
-Read [docs/ADDING_LANGUAGES.md](docs/ADDING_LANGUAGES.md) to add Python, TypeScript, Go, C++, GLSL, Zig, or any other language in minutes.
 
 ---
 

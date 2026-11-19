@@ -87,15 +87,17 @@ enum Commands {
     Languages,
     /// Generate concise Markdown summary at .trackertop/GRAPH_REPORT.md
     Report,
-    /// Configure Claude Code integration (.mcp.json, SKILL.md, CLAUDE.md)
+    /// Configure AI agent integration (claude, cursor, codex, windsurf)
     Install {
-        /// Target agent (currently: claude)
+        /// Target agent (claude, cursor, codex, windsurf)
         #[arg(default_value = "claude")]
         target: String,
         /// Register globally in Claude Code user scope instead of project .mcp.json
         #[arg(long)]
         global: bool,
     },
+    /// Lightweight SessionStart hook output reminding AI agents to prefer TrackerTop MCP tools
+    HookHint,
 }
 
 #[derive(Subcommand)]
@@ -349,6 +351,11 @@ fn main() -> Result<()> {
             for a in actions {
                 println!("  - {a}");
             }
+        }
+        Commands::HookHint => {
+            println!(
+                "TrackerTop MCP is active for this workspace. Prefer `repo_map`, `task_context`, `smart_grep`, `file_outline`, `read_symbol`, `read_symbols_batch`, and `diff_impact` BEFORE raw grep or reading full files (saves 80-99% tokens)."
+            );
         }
     }
 
