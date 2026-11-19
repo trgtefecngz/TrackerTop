@@ -22,20 +22,18 @@ TrackerTop replaces blind `grep` loops and full-file reads for AI coding agents 
 
 ## Quick Start
 
-### 1. Build
+### Option A: Download Portable Windows App (No Rust Required)
+1. Download **`TrackerTop-v0.3.0-windows-x64.exe`** from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
+2. Double-click to open the offline native desktop app (no console window, no installation needed).
+3. Click **Connect Claude Code (Global)** and **+ Add Project**.
+
+### Option B: Build from Source
 ```bash
 cargo build --release
 ```
 *(For headless CLI/MCP servers without GUI dependencies: `cargo build --release --no-default-features`)*
 
-### 2. Launch the Desktop App
-Double-click `target/release/trackertop.exe` or run:
-```bash
-./target/release/trackertop
-```
-Click **Connect Claude Code (Global)** and **+ Add Project** — no terminal commands required.
-
-### 3. Or Use from CLI
+### CLI Usage (Optional)
 ```bash
 # Connect Claude Code globally across all repositories
 ./target/release/trackertop install claude --global

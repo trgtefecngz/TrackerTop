@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Windows release executable
+        run: cargo build --release
+      - name: Rename portable executable
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Copy-Item "target/release/trackertop.exe" "TrackerTop-$tag-windows-x64.exe"
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TrackerTop-*-windows-x64.exe
+
+  build-linux-headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux headless CLI/MCP binary
+        run: cargo build --release --no-default-features
+      - name: Rename binary
+        run: |
+          TAG="${{ github.ref_name }}"
+          cp target/release/trackertop "trackertop-${TAG}-linux-x64-headless"
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: trackertop-*-linux-x64-headless
