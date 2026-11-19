@@ -1,10 +1,12 @@
 use crate::db::Database;
 use crate::model::TokenStatsSummary;
 use crate::tokens::estimate_usd_saved;
-use anyhow::Result;
-use chrono::Utc;
+use crate::fsutil::{FileLock, atomic_write};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
@@ -69,26 +71,90 @@ fn is_temp_path(path: &Path) -> bool {
     cur.starts_with(&tmp)
 }
 
-fn load_registry_file() -> RegistryFile {
-    let Some(path) = registry_file_path() else {
-        return RegistryFile::default();
+/// How long to wait for another TrackerTop process holding the registry lock.
+const REGISTRY_LOCK_WAIT: Duration = Duration::from_secs(3);
+/// A lock file older than this was left behind by a crashed process and is broken.
+const REGISTRY_LOCK_STALE: Duration = Duration::from_secs(30);
+/// An already-registered project only gets `last_seen` rewritten this often, so the
+/// per-query re-index of every MCP call does not rewrite `projects.json` each time.
+const LAST_SEEN_REFRESH_SECS: i64 = 300;
+
+/// Reads the registry. Missing/empty file -> empty registry; unparseable file -> `Err`.
+fn read_registry_at(path: &Path) -> Result<RegistryFile> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RegistryFile::default()),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return RegistryFile::default();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
+    if text.trim().is_empty() {
+        return Ok(RegistryFile::default());
+    }
+    serde_json::from_str(&text).with_context(|| format!("{} is corrupted", path.display()))
 }
 
-fn save_registry_file(reg: &RegistryFile) -> Result<()> {
-    let Some(path) = registry_file_path() else {
-        return Ok(());
+/// Lenient read for display purposes only (never used as the base for a write).
+fn load_registry_file() -> RegistryFile {
+    registry_file_path()
+        .and_then(|p| read_registry_at(&p).ok())
+        .unwrap_or_default()
+}
+
+/// Locked read-modify-write of the registry at `path`. `mutate` returns whether anything
+/// changed. A corrupted file is moved aside to `projects.json.corrupt-<timestamp>` (kept for
+/// manual recovery) instead of being silently overwritten.
+fn update_registry_at(path: &Path, mutate: impl FnOnce(&mut RegistryFile) -> bool) -> Result<()> {
+    let _lock = FileLock::acquire(path, REGISTRY_LOCK_WAIT, REGISTRY_LOCK_STALE)?;
+    let mut reg = match read_registry_at(path) {
+        Ok(r) => r,
+        Err(_) => {
+            let aside = path.with_file_name(format!(
+                "projects.json.corrupt-{}",
+                Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            std::fs::rename(path, &aside).with_context(|| {
+                format!("{} is corrupted and could not be moved aside", path.display())
+            })?;
+            RegistryFile::default()
+        }
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if mutate(&mut reg) {
+        atomic_write(path, serde_json::to_string_pretty(&reg)?.as_bytes())?;
     }
-    let json = serde_json::to_string_pretty(reg)?;
-    std::fs::write(&path, json)?;
     Ok(())
+}
+
+fn is_recently_seen(entry: &ProjectEntry) -> bool {
+    DateTime::parse_from_rfc3339(&entry.last_seen)
+        .map(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds() < LAST_SEEN_REFRESH_SECS)
+        .unwrap_or(false)
+}
+
+fn upsert_project(reg: &mut RegistryFile, canon: &str) -> bool {
+    let name = Path::new(canon)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Project")
+        .to_string();
+    let now = Utc::now().to_rfc3339();
+    if let Some(existing) = reg
+        .projects
+        .iter_mut()
+        .find(|p| p.path.eq_ignore_ascii_case(canon))
+    {
+        if is_recently_seen(existing) && existing.name == name {
+            return false;
+        }
+        existing.last_seen = now;
+        existing.name = name;
+    } else {
+        reg.projects.push(ProjectEntry {
+            path: canon.to_string(),
+            name,
+            added_at: now.clone(),
+            last_seen: now,
+        });
+    }
+    true
 }
 
 /// Registers (or updates `last_seen` for) a repository in the user's global project list.
@@ -97,38 +163,33 @@ pub fn register_project(repo_root: &Path) -> Result<()> {
     if is_temp_path(repo_root) {
         return Ok(());
     }
+    let Some(path) = registry_file_path() else {
+        return Ok(());
+    };
     let canon = canonical_path_string(repo_root);
-    let now = Utc::now().to_rfc3339();
-    let name = Path::new(&canon)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("Project")
-        .to_string();
 
-    let mut reg = load_registry_file();
-    if let Some(existing) = reg
-        .projects
-        .iter_mut()
-        .find(|p| p.path.eq_ignore_ascii_case(&canon))
+    // Lock-free fast path: nothing to do when the project was seen moments ago.
+    if let Ok(reg) = read_registry_at(&path)
+        && reg
+            .projects
+            .iter()
+            .any(|p| p.path.eq_ignore_ascii_case(&canon) && is_recently_seen(p))
     {
-        existing.last_seen = now;
-        existing.name = name;
-    } else {
-        reg.projects.push(ProjectEntry {
-            path: canon,
-            name,
-            added_at: now.clone(),
-            last_seen: now,
-        });
+        return Ok(());
     }
-    save_registry_file(&reg)
+    update_registry_at(&path, |reg| upsert_project(reg, &canon))
 }
 
 pub fn remove_project(repo_path: &str) -> Result<()> {
-    let mut reg = load_registry_file();
-    reg.projects
-        .retain(|p| !p.path.eq_ignore_ascii_case(repo_path));
-    save_registry_file(&reg)
+    let Some(path) = registry_file_path() else {
+        return Ok(());
+    };
+    update_registry_at(&path, |reg| {
+        let before = reg.projects.len();
+        reg.projects
+            .retain(|p| !p.path.eq_ignore_ascii_case(repo_path));
+        reg.projects.len() != before
+    })
 }
 
 /// Removes a project from the list and optionally deletes its local `.trackertop/` cache folder.
@@ -207,4 +268,50 @@ pub fn load_global_overview() -> GlobalOverview {
     overview.est_usd_saved_sonnet = sonnet;
     overview.est_usd_saved_opus = opus;
     overview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupted_registry_is_moved_aside_not_silently_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::fs::write(&path, "{\"projects\": [ {\"path\": \"C:/a\"").unwrap();
+
+        update_registry_at(&path, |reg| upsert_project(reg, "C:/work/repo")).unwrap();
+
+        let reg = read_registry_at(&path).unwrap();
+        assert_eq!(reg.projects.len(), 1);
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn concurrent_registrations_do_not_lose_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::thread::scope(|s| {
+            for i in 0..16 {
+                let path = &path;
+                s.spawn(move || {
+                    update_registry_at(path, |reg| upsert_project(reg, &format!("C:/repo{i}")))
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(read_registry_at(&path).unwrap().projects.len(), 16);
+    }
+
+    #[test]
+    fn recently_seen_project_is_not_rewritten() {
+        let mut reg = RegistryFile::default();
+        assert!(upsert_project(&mut reg, "C:/work/repo"));
+        assert!(!upsert_project(&mut reg, "C:/work/repo"));
+    }
 }

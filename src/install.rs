@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -133,11 +133,16 @@ pub fn install_agent(agent: AiAgentKind, repo_root: &Path) -> Result<Vec<String>
         AiAgentKind::Codex => {
             let home = user_home().context("cannot determine home directory")?;
             let path = home.join(".codex").join("config.toml");
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let exe = current_exe_string()?.replace('\\', "\\\\");
-            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            let exe = current_exe_string()?
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            let existing = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to read {}", path.display()));
+                }
+            };
             if !existing.contains("[mcp_servers.trackertop]") {
                 let mut updated = existing;
                 if !updated.is_empty() && !updated.ends_with('\n') {
@@ -146,27 +151,53 @@ pub fn install_agent(agent: AiAgentKind, repo_root: &Path) -> Result<Vec<String>
                 updated.push_str(&format!(
                     "\n[mcp_servers.trackertop]\ncommand = \"{exe}\"\nargs = [\"mcp\"]\n"
                 ));
-                std::fs::write(&path, updated)?;
+                crate::fsutil::backup_file(&path)?;
+                crate::fsutil::atomic_write(&path, updated.as_bytes())?;
             }
             Ok(vec![format!("Connected Codex CLI: {}", path.display())])
         }
     }
 }
 
+/// Reads a user-owned JSON config file as an object.
+/// A missing or empty file yields `{}`. A file that cannot be parsed (e.g. JSONC with
+/// comments or trailing commas) or whose root is not an object is an ERROR: TrackerTop must
+/// never replace a user's configuration it does not understand.
+pub(crate) fn read_json_config(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let body = text.trim_start_matches('\u{feff}').trim();
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    let val: Value = serde_json::from_str(body).with_context(|| {
+        format!(
+            "{} is not plain JSON (comments or trailing commas?). TrackerTop left it untouched; \
+             fix the file or add the `trackertop` MCP entry manually",
+            path.display()
+        )
+    })?;
+    if !val.is_object() {
+        bail!(
+            "{} does not contain a JSON object at its root. TrackerTop left it untouched",
+            path.display()
+        );
+    }
+    Ok(val)
+}
+
+/// Backs up the existing file (`<name>.trackertop.bak`) and writes `val` atomically.
+pub(crate) fn write_json_config(path: &Path, val: &Value) -> Result<()> {
+    crate::fsutil::backup_file(path)?;
+    crate::fsutil::atomic_write(path, serde_json::to_string_pretty(val)?.as_bytes())
+}
+
 fn merge_json_mcp_config(config_path: &Path) -> Result<()> {
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let exe_str = current_exe_string()?;
-    let mut root_val: Value = if config_path.exists() {
-        let existing = std::fs::read_to_string(config_path).unwrap_or_default();
-        serde_json::from_str(&existing).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-    if !root_val.is_object() {
-        root_val = json!({});
-    }
+    let mut root_val = read_json_config(config_path)?;
     let servers = root_val
         .as_object_mut()
         .unwrap()
@@ -180,9 +211,13 @@ fn merge_json_mcp_config(config_path: &Path) -> Result<()> {
                 "args": ["mcp"]
             }),
         );
+    } else {
+        bail!(
+            "`mcpServers` in {} is not an object. TrackerTop left it untouched",
+            config_path.display()
+        );
     }
-    std::fs::write(config_path, serde_json::to_string_pretty(&root_val)?)?;
-    Ok(())
+    write_json_config(config_path, &root_val)
 }
 
 /// Installs TrackerTop integration for Claude Code:
@@ -227,16 +262,7 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
         }
     } else {
         let mcp_json_path = repo_root.join(".mcp.json");
-        let mut root_val: Value = if mcp_json_path.exists() {
-            let existing = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
-            serde_json::from_str(&existing).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
-
-        if !root_val.is_object() {
-            root_val = json!({});
-        }
+        let mut root_val = read_json_config(&mcp_json_path)?;
         let servers = root_val
             .as_object_mut()
             .unwrap()
@@ -250,8 +276,13 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
                     "args": ["mcp", "--repo", repo_str]
                 }),
             );
+        } else {
+            bail!(
+                "`mcpServers` in {} is not an object. TrackerTop left it untouched",
+                mcp_json_path.display()
+            );
         }
-        std::fs::write(&mcp_json_path, serde_json::to_string_pretty(&root_val)?)?;
+        write_json_config(&mcp_json_path, &root_val)?;
         actions.push(format!("Wrote project MCP config: {}", mcp_json_path.display()));
     }
 
@@ -294,11 +325,12 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
     if global {
         if let Some(home) = user_home() {
             let settings_path = home.join(".claude").join("settings.json");
-            if install_claude_session_hook(&settings_path, &exe_str).is_ok() {
-                actions.push(format!(
+            match install_claude_session_hook(&settings_path, &exe_str) {
+                Ok(()) => actions.push(format!(
                     "Installed Claude Code SessionStart hook in {}",
                     settings_path.display()
-                ));
+                )),
+                Err(e) => actions.push(format!("Skipped SessionStart hook: {e:#}")),
             }
         }
     }
@@ -308,19 +340,8 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
 
 /// Safely merges a lightweight `SessionStart` hook into `~/.claude/settings.json`
 /// without overwriting any existing user settings or hooks.
-fn install_claude_session_hook(settings_path: &Path, exe_str: &str) -> Result<()> {
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut root: Value = if settings_path.exists() {
-        let text = std::fs::read_to_string(settings_path).unwrap_or_default();
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-    if !root.is_object() {
-        root = json!({});
-    }
+pub(crate) fn install_claude_session_hook(settings_path: &Path, exe_str: &str) -> Result<()> {
+    let mut root = read_json_config(settings_path)?;
     let hook_cmd = format!("\"{exe_str}\" hook-hint");
     let hooks = root
         .as_object_mut()
@@ -344,9 +365,63 @@ fn install_claude_session_hook(settings_path: &Path, exe_str: &str) -> Result<()
                         }
                     ]
                 }));
+            } else {
+                // Already installed: leave the user's file byte-for-byte untouched.
+                return Ok(());
             }
+        } else {
+            bail!("`hooks.SessionStart` in {} is not an array", settings_path.display());
         }
+    } else {
+        bail!("`hooks` in {} is not an object", settings_path.display());
     }
-    std::fs::write(settings_path, serde_json::to_string_pretty(&root)?)?;
-    Ok(())
+    write_json_config(settings_path, &root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_json_config_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        let original = "{\n  // user comment\n  \"theme\": \"dark\",\n}\n";
+        std::fs::write(&p, original).unwrap();
+
+        assert!(install_claude_session_hook(&p, "C:/tt.exe").is_err());
+        assert!(merge_json_mcp_config(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn session_hook_merge_preserves_existing_settings_and_backs_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(
+            &p,
+            r#"{"theme":"dark","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"other"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_claude_session_hook(&p, "C:/tt.exe").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert!(dir.path().join("settings.json.trackertop.bak").exists());
+
+        // Idempotent: second run does not add a duplicate
+        install_claude_session_hook(&p, "C:/tt.exe").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn missing_or_empty_config_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mcp.json");
+        assert_eq!(read_json_config(&p).unwrap(), json!({}));
+        std::fs::write(&p, "  \n").unwrap();
+        assert_eq!(read_json_config(&p).unwrap(), json!({}));
+    }
 }

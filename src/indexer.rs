@@ -3,7 +3,7 @@ use crate::model::{Edge, EdgeKind, FileRecord, RawReference, Symbol, SymbolKind}
 use crate::parser::{LanguageExtractor, LanguageRegistry, default_registry, file_symbol_id};
 use crate::registry::register_project;
 use crate::tokens::count_tokens;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,39 @@ pub struct IndexStats {
     pub elapsed_ms: u128,
 }
 
+/// Refuses to index the user's home directory or a filesystem root.
+///
+/// A globally registered MCP server has no `--repo` and indexes its working directory, so
+/// an AI agent started from `~` (or `C:\`) would otherwise walk the entire disk and drop a
+/// `.trackertop/` folder there.
+pub fn ensure_indexable_root(repo_root: &Path) -> Result<()> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    check_indexable_root(repo_root, home.as_deref())
+}
+
+fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
+    let canon = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let hint = "Open your AI agent inside a project folder, or pass `--repo <project-path>`.";
+    if canon.parent().is_none() {
+        bail!(
+            "TrackerTop refuses to index `{}` because it is a filesystem root. {hint}",
+            repo_root.display()
+        );
+    }
+    if let Some(home) = home {
+        let home_canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        if home_canon == canon {
+            bail!(
+                "TrackerTop refuses to index `{}` because it is your home directory. {hint}",
+                repo_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
 /// Only new or changed files (detected via mtime + blake3 hash) are re-parsed.
 pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
@@ -36,6 +69,7 @@ pub fn index_repository_with_registry(
     registry: &LanguageRegistry,
 ) -> Result<IndexStats> {
     let start = Instant::now();
+    ensure_indexable_root(repo_root)?;
     let _ = register_project(repo_root);
     let mut db = Database::open_for_repo(repo_root)?;
     let existing = if force {
@@ -446,4 +480,22 @@ fn pick_best_symbol<'a>(syms: &[&'a Symbol], src_file: &str, segs: &[&str]) -> O
         }
     }
     pick_nearest_symbol(syms, src_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_home_directory_and_filesystem_root() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert!(check_indexable_root(home.path(), Some(home.path())).is_err());
+        assert!(check_indexable_root(&project, Some(home.path())).is_ok());
+
+        let root = home.path().ancestors().last().unwrap();
+        assert!(check_indexable_root(root, None).is_err());
+    }
 }

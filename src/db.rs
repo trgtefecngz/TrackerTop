@@ -26,6 +26,9 @@ impl Database {
     pub fn open_path(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)
             .with_context(|| format!("failed to open sqlite db at {}", db_path.display()))?;
+        // GUI + several MCP servers (one per AI session) may hit the same index concurrently;
+        // wait for the writer instead of failing immediately with "database is locked".
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
