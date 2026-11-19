@@ -50,6 +50,32 @@ impl TrackerEngine {
         files_avoided: usize,
         start: Instant,
     ) -> Result<QueryOutput> {
+        self.finalize_inner(
+            db,
+            tool,
+            query_label,
+            body,
+            max_tokens,
+            baseline_tokens,
+            files_avoided,
+            start,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_inner(
+        &self,
+        db: &Database,
+        tool: &str,
+        query_label: &str,
+        body: String,
+        max_tokens: usize,
+        baseline_tokens: usize,
+        files_avoided: usize,
+        start: Instant,
+        record_telemetry: bool,
+    ) -> Result<QueryOutput> {
         let budget = if max_tokens == 0 { 1500 } else { max_tokens };
         // Reserve ~16 tokens for the compact savings footer
         let (trimmed, _, _) = truncate_to_tokens(&body, budget.saturating_sub(16).max(64));
@@ -68,14 +94,16 @@ impl TrackerEngine {
         let tokens_saved = baseline_tokens.saturating_sub(tokens_sent);
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        let _ = db.record_telemetry(
-            tool,
-            query_label,
-            tokens_sent,
-            baseline_tokens,
-            files_avoided,
-            latency_ms,
-        );
+        if record_telemetry {
+            let _ = db.record_telemetry(
+                tool,
+                query_label,
+                tokens_sent,
+                baseline_tokens,
+                files_avoided,
+                latency_ms,
+            );
+        }
 
         Ok(QueryOutput {
             text: final_text,
@@ -89,6 +117,15 @@ impl TrackerEngine {
 
     /// 1. Compact architectural map of the repository: languages, communities, god nodes, and key files.
     pub fn repo_map(&self, max_tokens: usize) -> Result<QueryOutput> {
+        self.repo_map_inner(max_tokens, true)
+    }
+
+    /// Read-only dry-run preview of `repo_map` for UI verification — NEVER pollutes real telemetry stats!
+    pub fn preview_repo_map(&self, max_tokens: usize) -> Result<QueryOutput> {
+        self.repo_map_inner(max_tokens, false)
+    }
+
+    fn repo_map_inner(&self, max_tokens: usize, record_telemetry: bool) -> Result<QueryOutput> {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
 
@@ -175,7 +212,7 @@ impl TrackerEngine {
         let baseline_files = file_toks.len().min(15);
         let baseline: usize = file_toks.into_iter().take(baseline_files).sum();
 
-        self.finalize(
+        self.finalize_inner(
             &db,
             "repo_map",
             "*",
@@ -184,6 +221,7 @@ impl TrackerEngine {
             baseline,
             baseline_files,
             start,
+            record_telemetry,
         )
     }
 

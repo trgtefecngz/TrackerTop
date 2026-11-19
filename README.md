@@ -23,7 +23,7 @@ TrackerTop replaces blind `grep` loops and full-file reads for AI coding agents 
 ## Quick Start
 
 ### Option A: Download Portable Windows App (No Rust Required)
-1. Download **`TrackerTop-v0.4.0-windows-x64.exe`** from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
+1. Download **`TrackerTop-v0.4.1-windows-x64.exe`** from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
 2. Double-click to open the offline native desktop app (no console window, no installation needed).
 3. Click **Connect AI Agents** (Claude Code, Cursor, Codex CLI, Windsurf, or copy universal MCP JSON) and **+ Add**.
 

@@ -115,6 +115,10 @@ pub struct TrackerTopApp {
     note_target_input: String,
     note_content_input: String,
 
+    // Smooth GPU radial aurora texture & dry-run preview state
+    backdrop_tex: Option<egui::TextureHandle>,
+    preview_result: Option<crate::context::QueryOutput>,
+
     // Graph view state
     cam_offset: Vec2,
     cam_zoom: f32,
@@ -168,6 +172,8 @@ impl TrackerTopApp {
             bg_busy: false,
             note_target_input: "project".to_string(),
             note_content_input: String::new(),
+            backdrop_tex: None,
+            preview_result: None,
             cam_offset: Vec2::ZERO,
             cam_zoom: 1.0,
             needs_fit_view: true,
@@ -195,6 +201,7 @@ impl TrackerTopApp {
         };
         self.selected_node_idx = None;
         self.dragged_node_idx = None;
+        self.preview_result = None;
         self.loaded = load_project_details(Path::new(path)).ok();
         self.recompute_graph_layout();
     }
@@ -251,9 +258,9 @@ impl TrackerTopApp {
         });
     }
 
-    fn run_sample_query(&mut self, repo_path: &str) {
+    fn run_preview_query(&mut self, repo_path: &str) {
         let engine = TrackerEngine::new(Path::new(repo_path));
-        match engine.repo_map(900) {
+        match engine.preview_repo_map(900) {
             Ok(out) => {
                 let pct = if out.baseline_tokens > 0 {
                     (out.tokens_saved as f64 / out.baseline_tokens as f64) * 100.0
@@ -261,26 +268,28 @@ impl TrackerTopApp {
                     0.0
                 };
                 self.status_banner = format!(
-                    "Test query complete: sent {} tok vs {} baseline -> saved {} tok ({:.1}%) in {} ms",
+                    "Dry-run preview (not counted in stats): {} tok vs {} baseline -> {:.1}% reduction in {} ms",
                     fmt_num(out.tokens_sent),
                     fmt_num(out.baseline_tokens),
-                    fmt_num(out.tokens_saved),
                     pct,
                     out.latency_ms
                 );
-                self.reload_overview();
-                if let Some(ref mut lp) = self.loaded {
-                    if let Ok(db) = Database::open_path(
-                        &Path::new(repo_path).join(".trackertop").join("index.db"),
-                    ) {
-                        if let Ok(stats) = db.get_token_stats(30) {
-                            lp.stats = stats;
-                        }
-                    }
-                }
+                self.preview_result = Some(out);
             }
             Err(e) => {
-                self.status_banner = format!("Query error: {e}");
+                self.status_banner = format!("Preview error: {e}");
+            }
+        }
+    }
+
+    fn reset_project_stats(&mut self, repo_path: &str) {
+        if let Ok(db) = Database::open_for_repo(Path::new(repo_path)) {
+            if db.clear_telemetry().is_ok() {
+                self.status_banner = "Reset token-savings telemetry to 0 for this project.".to_string();
+                self.reload_overview();
+                if let Some(ref mut lp) = self.loaded {
+                    lp.stats = db.get_token_stats(30).unwrap_or_default();
+                }
             }
         }
     }
@@ -340,6 +349,10 @@ impl eframe::App for TrackerTopApp {
         ctx.request_repaint_after(Duration::from_millis(if self.bg_busy { 100 } else { 750 }));
 
         apply_soft_modern_theme(ctx);
+        let bg_tex_id = self
+            .backdrop_tex
+            .get_or_insert_with(|| build_smooth_aurora_texture(ctx))
+            .id();
 
         // Top Header Bar
         egui::TopBottomPanel::top("top_bar")
@@ -708,7 +721,7 @@ impl eframe::App for TrackerTopApp {
                     .inner_margin(Margin::same(18)),
             )
             .show(ctx, |ui| {
-                paint_ambient_backdrop(ui.painter(), ui.max_rect());
+                paint_smooth_aurora(ui.painter(), ui.max_rect(), bg_tex_id);
                 match &self.selection {
                     Selection::AllProjects => self.render_all_projects(ui),
                     Selection::Project(_) => self.render_single_project(ui),
@@ -1061,7 +1074,9 @@ impl TrackerTopApp {
     }
 
     fn render_savings_tab(&mut self, ui: &mut egui::Ui) {
-        let mut run_test_for: Option<String> = None;
+        let mut run_preview_for: Option<String> = None;
+        let mut reset_stats_for: Option<String> = None;
+        let mut clear_preview = false;
         let Some(ref lp) = self.loaded else {
             return;
         };
@@ -1133,21 +1148,80 @@ impl TrackerTopApp {
                         ui.add_space(5.0);
                         ui.label(
                             RichText::new(
-                                "TrackerTop works immediately on any existing or new project. Open this folder in Claude Code (or Cursor / Codex) and ask a question — live token savings stream in automatically.",
+                                "TrackerTop works immediately on any existing or new project. Open this folder in Claude Code (or Cursor / Codex) and ask a question — real token savings will stream in automatically.",
                             )
                             .color(Color32::from_rgb(203, 213, 225)),
                         );
                         ui.add_space(10.0);
                         let test_btn = egui::Button::new(
-                            RichText::new("Run Quick Test Query (Verify Savings)")
+                            RichText::new("Preview Savings (Dry-Run)")
                                 .strong()
                                 .color(Color32::WHITE),
                         )
                         .corner_radius(CornerRadius::same(16))
                         .fill(Color32::from_rgb(16, 185, 129));
-                        if ui.add(test_btn).clicked() {
-                            run_test_for = Some(lp.path.clone());
+                        if ui
+                            .add(test_btn)
+                            .on_hover_text("Simulates an AI repo_map query without inflating your real stats counter")
+                            .clicked()
+                        {
+                            run_preview_for = Some(lp.path.clone());
                         }
+                    });
+                ui.add_space(12.0);
+            }
+
+            // Dismissible Dry-Run Preview Card (never touches real telemetry!)
+            if let Some(ref prev) = self.preview_result {
+                let pct = if prev.baseline_tokens > 0 {
+                    (prev.tokens_saved as f64 / prev.baseline_tokens as f64) * 100.0
+                } else {
+                    0.0
+                };
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 22))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(56, 189, 248, 110),
+                    ))
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(Margin::same(15))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "DRY-RUN PREVIEW (NOT COUNTED IN STATS): {} tok sent vs {} baseline -> {:.1}% saved ({} ms)",
+                                    fmt_num(prev.tokens_sent),
+                                    fmt_num(prev.baseline_tokens),
+                                    pct,
+                                    prev.latency_ms
+                                ))
+                                .strong()
+                                .small()
+                                .color(Color32::from_rgb(125, 211, 252)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add(egui::Button::new("Close").corner_radius(CornerRadius::same(12)))
+                                    .clicked()
+                                {
+                                    clear_preview = true;
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("preview_output_scroll")
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(&prev.text)
+                                        .monospace()
+                                        .small()
+                                        .color(Color32::from_rgb(203, 213, 225)),
+                                );
+                            });
                     });
                 ui.add_space(12.0);
             }
@@ -1156,29 +1230,45 @@ impl TrackerTopApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("SAVINGS BY MCP TOOL")
+                        RichText::new("SAVINGS BY MCP TOOL (REAL AI USAGE)")
                             .strong()
                             .small()
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
-                    if s.total_queries > 0 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if s.total_queries > 0 {
                             if ui
                                 .add(
-                                    egui::Button::new("Run Test Query")
-                                        .corner_radius(CornerRadius::same(14)),
+                                    egui::Button::new(
+                                        RichText::new("Reset Stats")
+                                            .small()
+                                            .color(Color32::from_rgb(252, 165, 165)),
+                                    )
+                                    .corner_radius(CornerRadius::same(14)),
                                 )
+                                .on_hover_text("Clear recorded telemetry back to 0 for this project")
                                 .clicked()
                             {
-                                run_test_for = Some(lp.path.clone());
+                                reset_stats_for = Some(lp.path.clone());
                             }
-                        });
-                    }
+                            ui.add_space(6.0);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Preview Savings")
+                                    .corner_radius(CornerRadius::same(14)),
+                            )
+                            .on_hover_text("Dry-run preview — does NOT add to your real token savings counter")
+                            .clicked()
+                        {
+                            run_preview_for = Some(lp.path.clone());
+                        }
+                    });
                 });
                 ui.add_space(8.0);
                 if s.by_tool.is_empty() {
                     ui.label(
-                        RichText::new("Waiting for the first AI query in this project...")
+                        RichText::new("Waiting for the first real AI query in this project...")
                             .color(Color32::from_rgb(130, 148, 178)),
                     );
                 } else {
@@ -1275,8 +1365,14 @@ impl TrackerTopApp {
             });
         });
 
-        if let Some(path) = run_test_for {
-            self.run_sample_query(&path);
+        if clear_preview {
+            self.preview_result = None;
+        }
+        if let Some(path) = run_preview_for {
+            self.run_preview_query(&path);
+        }
+        if let Some(path) = reset_stats_for {
+            self.reset_project_stats(&path);
         }
     }
 
@@ -1393,7 +1489,9 @@ impl TrackerTopApp {
             );
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(9, 13, 24));
-            paint_ambient_backdrop(&painter, rect);
+            if let Some(ref tex) = self.backdrop_tex {
+                paint_smooth_aurora(&painter, rect, tex.id());
+            }
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(18),
@@ -2488,34 +2586,63 @@ fn compute_bounds(
     }
 }
 
-/// Paints soft multi-stop ambient radial aurora glows for a modern atmospheric dark canvas.
-fn paint_ambient_backdrop(painter: &egui::Painter, rect: Rect) {
-    let orbs = [
-        (
-            Pos2::new(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.14),
-            rect.width().max(rect.height()) * 0.42,
-            (56u8, 189u8, 248u8),
-        ),
-        (
-            Pos2::new(rect.right() - rect.width() * 0.16, rect.bottom() - rect.height() * 0.16),
-            rect.width().max(rect.height()) * 0.46,
-            (129u8, 140u8, 248u8),
-        ),
-        (
-            Pos2::new(rect.center().x, rect.top() + rect.height() * 0.85),
-            rect.width().max(rect.height()) * 0.34,
-            (16u8, 185u8, 129u8),
-        ),
+/// Generates a silky-smooth, zero-banding 256x256 GPU-filtered radial aurora gradient texture
+/// using true exponential Gaussian falloff + subtle blue-noise-like dithering.
+fn build_smooth_aurora_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    const W: usize = 256;
+    const H: usize = 256;
+    let mut pixels = vec![Color32::TRANSPARENT; W * H];
+
+    let base = (7.0_f32, 11.0_f32, 20.0_f32);
+    let lights: [((f32, f32), f32, (f32, f32, f32), f32); 3] = [
+        ((0.16, 0.14), 0.42, (56.0, 189.0, 248.0), 0.16),  // soft cyan top-left
+        ((0.86, 0.84), 0.48, (129.0, 140.0, 248.0), 0.15), // soft indigo bottom-right
+        ((0.50, 0.92), 0.38, (16.0, 185.0, 129.0), 0.10),  // whisper emerald bottom
     ];
 
-    for (center, max_r, (r, g, b)) in orbs {
-        for step in (1..=6).rev() {
-            let frac = step as f32 / 6.0;
-            let rad = max_r * frac;
-            let alpha = ((1.0 - frac * 0.72) * 9.0) as u8;
-            painter.circle_filled(center, rad, Color32::from_rgba_unmultiplied(r, g, b, alpha));
+    for y in 0..H {
+        let ny = y as f32 / (H - 1) as f32;
+        for x in 0..W {
+            let nx = x as f32 / (W - 1) as f32;
+            let mut r = base.0;
+            let mut g = base.1;
+            let mut b = base.2;
+
+            for &((lx, ly), sigma, (cr, cg, cb), strength) in &lights {
+                let dx = nx - lx;
+                let dy = ny - ly;
+                let dist_sq = dx * dx + dy * dy;
+                let falloff = (-dist_sq / (2.0 * sigma * sigma)).exp() * strength;
+                r += (cr - base.0) * falloff;
+                g += (cg - base.1) * falloff;
+                b += (cb - base.2) * falloff;
+            }
+
+            // Tiny deterministic sub-pixel dither (+/- 0.4) to completely eliminate 8-bit banding
+            let hash = ((x.wrapping_mul(374761393) ^ y.wrapping_mul(668265263)) & 255) as f32
+                / 255.0
+                - 0.5;
+            let rr = (r + hash * 0.8).clamp(0.0, 255.0) as u8;
+            let gg = (g + hash * 0.8).clamp(0.0, 255.0) as u8;
+            let bb = (b + hash * 0.8).clamp(0.0, 255.0) as u8;
+            pixels[y * W + x] = Color32::from_rgb(rr, gg, bb);
         }
     }
+
+    let image = egui::ColorImage {
+        size: [W, H],
+        pixels,
+    };
+    ctx.load_texture("trackertop_aurora_bg", image, egui::TextureOptions::LINEAR)
+}
+
+fn paint_smooth_aurora(painter: &egui::Painter, rect: Rect, tex_id: egui::TextureId) {
+    painter.image(
+        tex_id,
+        rect,
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 fn apply_soft_modern_theme(ctx: &egui::Context) {
