@@ -2,15 +2,19 @@
 
 use crate::context::TrackerEngine;
 use crate::db::Database;
-use crate::graph::{CodeGraph, CommunitySummary, ScoredNode};
+use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
 use crate::indexer::index_repository;
-use crate::install::{install_claude_code, is_claude_global_installed};
-use crate::model::{EdgeKind, SymbolKind, TokenStatsSummary};
+use crate::install::{
+    AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed,
+};
+use crate::model::{EdgeKind, ProjectNote, SymbolKind, TokenStatsSummary};
 use crate::parser::default_registry;
-use crate::registry::{GlobalOverview, load_global_overview, register_project, remove_project};
+use crate::registry::{
+    GlobalOverview, load_global_overview, register_project, remove_project_with_cache,
+};
 use anyhow::Result;
 use eframe::egui::{
-    self, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+    self, Color32, CornerRadius, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +32,7 @@ enum ProjectTab {
     Savings,
     Graph,
     Architecture,
+    Memory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +60,7 @@ struct GraphNodeVis {
     x: f32,
     y: f32,
     radius: f32,
-    symbols: Vec<(String, String, usize, String)>, // (name, kind, line, signature)
+    symbols: Vec<(String, String, usize, String)>,
 }
 
 struct GraphIsland {
@@ -78,9 +83,11 @@ struct LoadedProject {
     total_symbols: usize,
     total_edges: usize,
     total_repo_tokens: usize,
-    lang_breakdown: Vec<(String, String, String, usize, usize)>, // (id, display, hex, files, tokens)
+    lang_breakdown: Vec<(String, String, String, usize, usize)>,
     god_nodes: Vec<ScoredNode>,
     communities: Vec<CommunitySummary>,
+    health: HealthReport,
+    notes: Vec<ProjectNote>,
     stats: TokenStatsSummary,
     nodes: Vec<GraphNodeVis>,
     edges: Vec<GraphEdgeVis>,
@@ -97,11 +104,16 @@ pub struct TrackerTopApp {
     selection: Selection,
     active_tab: ProjectTab,
     loaded: Option<LoadedProject>,
-    claude_connected: bool,
+    connected_agents: Vec<(AiAgentKind, bool)>,
+    show_agents_modal: bool,
     status_banner: String,
     last_refresh: Instant,
     bg_rx: Option<Receiver<BgMessage>>,
     bg_busy: bool,
+
+    // AI Memory form inputs
+    note_target_input: String,
+    note_content_input: String,
 
     // Graph view state
     cam_offset: Vec2,
@@ -148,11 +160,14 @@ impl TrackerTopApp {
             selection,
             active_tab: ProjectTab::Savings,
             loaded: None,
-            claude_connected: is_claude_global_installed(),
+            connected_agents: poll_agent_statuses(),
+            show_agents_modal: false,
             status_banner: "Ready — 100% offline local engine".to_string(),
             last_refresh: Instant::now(),
             bg_rx: None,
             bg_busy: false,
+            note_target_input: "project".to_string(),
+            note_content_input: String::new(),
             cam_offset: Vec2::ZERO,
             cam_zoom: 1.0,
             needs_fit_view: true,
@@ -170,7 +185,7 @@ impl TrackerTopApp {
 
     fn reload_overview(&mut self) {
         self.overview = load_global_overview();
-        self.claude_connected = is_claude_global_installed();
+        self.connected_agents = poll_agent_statuses();
     }
 
     fn reload_selected_project(&mut self) {
@@ -284,13 +299,24 @@ impl TrackerTopApp {
             }
         }
     }
+
+    fn pick_and_add_project(&mut self) {
+        if self.bg_busy {
+            return;
+        }
+        if let Some(folder) = rfd::FileDialog::new()
+            .set_title("Select Project Folder to Track")
+            .pick_folder()
+        {
+            self.start_bg_index(folder, false, true);
+        }
+    }
 }
 
 impl eframe::App for TrackerTopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background();
 
-        // Live auto-refresh every 2 seconds so Claude Code queries stream in automatically
         if self.last_refresh.elapsed() >= Duration::from_secs(2) && !self.bg_busy {
             self.last_refresh = Instant::now();
             self.reload_overview();
@@ -302,6 +328,9 @@ impl eframe::App for TrackerTopApp {
                         if let Ok(stats) = db.get_token_stats(30) {
                             lp.stats = stats;
                         }
+                        if let Ok(notes) = db.list_notes(None) {
+                            lp.notes = notes;
+                        }
                     }
                 } else {
                     self.reload_selected_project();
@@ -310,78 +339,106 @@ impl eframe::App for TrackerTopApp {
         }
         ctx.request_repaint_after(Duration::from_millis(if self.bg_busy { 100 } else { 750 }));
 
-        apply_dark_theme(ctx);
+        apply_soft_modern_theme(ctx);
 
-        // Top Bar
+        // Top Header Bar
         egui::TopBottomPanel::top("top_bar")
-            .exact_height(50.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(10, 15, 27))
+                    .inner_margin(Margin::symmetric(18, 12))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(148, 163, 184, 24),
+                    )),
+            )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new("TrackerTop")
-                            .strong()
-                            .size(18.0)
-                            .color(Color32::from_rgb(56, 189, 248)),
-                    );
-                    ui.separator();
+                    // Glowing brand badge
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 28))
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(56, 189, 248, 90),
+                        ))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::symmetric(10, 5))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("TrackerTop")
+                                    .strong()
+                                    .size(16.0)
+                                    .color(Color32::from_rgb(125, 211, 252)),
+                            );
+                        });
+
+                    ui.add_space(10.0);
 
                     match &self.selection {
                         Selection::AllProjects => {
-                            ui.label(RichText::new("All Projects — Global Overview").strong());
+                            ui.label(
+                                RichText::new("Global Workspace")
+                                    .strong()
+                                    .size(14.5)
+                                    .color(Color32::from_rgb(226, 232, 240)),
+                            );
                         }
                         Selection::Project(path) => {
                             let name = Path::new(path)
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(path);
-                            ui.label(RichText::new(name).strong().size(15.0));
+                            ui.label(RichText::new(name).strong().size(15.0).color(Color32::WHITE));
                             ui.label(
                                 RichText::new(path)
                                     .small()
-                                    .color(Color32::from_rgb(139, 155, 184)),
+                                    .color(Color32::from_rgb(130, 148, 178)),
                             );
                         }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let claude_label = if self.claude_connected {
-                            "Claude Code: Connected"
+                        let connected_count =
+                            self.connected_agents.iter().filter(|(_, ok)| *ok).count();
+                        let agents_label = if connected_count > 0 {
+                            format!("AI Agents ({connected_count} connected)")
                         } else {
-                            "Connect Claude Code (Global)"
+                            "Connect AI Agents".to_string()
                         };
-                        let btn = egui::Button::new(
-                            RichText::new(claude_label).color(if self.claude_connected {
-                                Color32::from_rgb(52, 211, 153)
+                        let agents_btn = egui::Button::new(
+                            RichText::new(agents_label).strong().color(if connected_count > 0 {
+                                Color32::from_rgb(110, 231, 183)
                             } else {
                                 Color32::WHITE
                             }),
                         )
-                        .fill(if self.claude_connected {
-                            Color32::from_rgba_unmultiplied(52, 211, 153, 28)
+                        .corner_radius(CornerRadius::same(18))
+                        .fill(if connected_count > 0 {
+                            Color32::from_rgba_unmultiplied(16, 185, 129, 34)
                         } else {
                             Color32::from_rgb(37, 99, 235)
-                        });
-                        if ui.add(btn).clicked() {
-                            let base = match &self.selection {
-                                Selection::Project(p) => PathBuf::from(p),
-                                Selection::AllProjects => {
-                                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                                }
-                            };
-                            match install_claude_code(&base, true) {
-                                Ok(lines) => {
-                                    self.claude_connected = is_claude_global_installed();
-                                    self.status_banner = lines.join(" | ");
-                                }
-                                Err(e) => {
-                                    self.status_banner = format!("Claude setup error: {e}");
-                                }
-                            }
+                        })
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if connected_count > 0 {
+                                Color32::from_rgba_unmultiplied(52, 211, 153, 110)
+                            } else {
+                                Color32::from_rgb(96, 165, 250)
+                            },
+                        ));
+                        if ui.add(agents_btn).clicked() {
+                            self.show_agents_modal = true;
                         }
 
                         if let Selection::Project(ref p) = self.selection.clone() {
+                            ui.add_space(6.0);
                             if ui
-                                .add_enabled(!self.bg_busy, egui::Button::new("Re-Index"))
+                                .add_enabled(
+                                    !self.bg_busy,
+                                    egui::Button::new("Re-Index")
+                                        .corner_radius(CornerRadius::same(16))
+                                        .fill(Color32::from_rgba_unmultiplied(30, 41, 59, 180)),
+                                )
                                 .clicked()
                             {
                                 self.start_bg_index(PathBuf::from(p), true, false);
@@ -393,7 +450,15 @@ impl eframe::App for TrackerTopApp {
 
         // Bottom Status Bar
         egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(26.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(8, 12, 22))
+                    .inner_margin(Margin::symmetric(16, 6))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(148, 163, 184, 18),
+                    )),
+            )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     if self.bg_busy {
@@ -411,7 +476,7 @@ impl eframe::App for TrackerTopApp {
                             .map(|l| l.display_name)
                             .collect();
                         ui.label(
-                            RichText::new(format!("Active Languages: {}", langs.join(", ")))
+                            RichText::new(format!("Open Core: {}", langs.join(" · ")))
                                 .small()
                                 .color(Color32::from_rgb(100, 116, 139)),
                         );
@@ -419,95 +484,142 @@ impl eframe::App for TrackerTopApp {
                 });
             });
 
-        // Left Sidebar: Multi-Project Switcher
+        // Left Sidebar: Soft Rounded Multi-Project Switcher
         egui::SidePanel::left("projects_sidebar")
             .resizable(true)
-            .default_width(245.0)
-            .min_width(200.0)
+            .default_width(260.0)
+            .min_width(215.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(10, 15, 27))
+                    .inner_margin(Margin::same(14))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(148, 163, 184, 20),
+                    )),
+            )
             .show(ctx, |ui| {
-                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("PROJECTS")
                             .strong()
                             .small()
-                            .color(Color32::from_rgb(139, 155, 184)),
+                            .color(Color32::from_rgb(130, 148, 178)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!self.bg_busy, egui::Button::new("+ Add Project"))
-                            .clicked()
-                        {
-                            if let Some(folder) = rfd::FileDialog::new()
-                                .set_title("Select Project Folder to Track")
-                                .pick_folder()
-                            {
-                                self.start_bg_index(folder, false, true);
-                            }
+                        let add_btn = egui::Button::new(
+                            RichText::new("+ Add")
+                                .strong()
+                                .color(Color32::from_rgb(125, 211, 252)),
+                        )
+                        .corner_radius(CornerRadius::same(14))
+                        .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 24))
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(56, 189, 248, 80),
+                        ));
+                        if ui.add_enabled(!self.bg_busy, add_btn).clicked() {
+                            self.pick_and_add_project();
                         }
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(10.0);
 
+                // All Projects pill
                 let all_selected = self.selection == Selection::AllProjects;
                 let all_btn = egui::Button::new(
-                    RichText::new(format!("All Projects ({})", self.overview.projects.len()))
-                        .strong(),
+                    RichText::new(format!("All Projects  ({})", self.overview.projects.len()))
+                        .strong()
+                        .color(if all_selected {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(203, 213, 225)
+                        }),
                 )
-                .min_size(Vec2::new(ui.available_width(), 32.0))
+                .min_size(Vec2::new(ui.available_width(), 38.0))
+                .corner_radius(CornerRadius::same(14))
                 .fill(if all_selected {
-                    Color32::from_rgb(24, 48, 78)
+                    Color32::from_rgba_unmultiplied(56, 189, 248, 42)
                 } else {
-                    Color32::from_rgb(18, 24, 38)
-                });
+                    Color32::from_rgba_unmultiplied(30, 41, 59, 110)
+                })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if all_selected {
+                        Color32::from_rgba_unmultiplied(56, 189, 248, 140)
+                    } else {
+                        Color32::from_rgba_unmultiplied(148, 163, 184, 24)
+                    },
+                ));
                 if ui.add(all_btn).clicked() {
                     self.selection = Selection::AllProjects;
                     self.loaded = None;
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(10.0);
 
                 let mut to_select: Option<String> = None;
-                let mut to_remove: Option<String> = None;
+                let mut to_remove: Option<(String, bool)> = None;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if self.overview.projects.is_empty() {
-                        ui.label(
-                            RichText::new(
-                                "No projects yet.\nClick '+ Add Project' or open any repo in Claude Code once connected.",
-                            )
-                            .small()
-                            .color(Color32::from_rgb(139, 155, 184)),
-                        );
+                        soft_card_frame(12).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new("No projects pinned yet.")
+                                    .strong()
+                                    .small()
+                                    .color(Color32::from_rgb(203, 213, 225)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(
+                                    "Add a folder above, or just open any repo in Claude Code — it appears here automatically.",
+                                )
+                                .small()
+                                .color(Color32::from_rgb(130, 148, 178)),
+                            );
+                        });
                     }
 
                     for snap in &self.overview.projects {
                         let is_sel = matches!(&self.selection, Selection::Project(p) if p.eq_ignore_ascii_case(&snap.entry.path));
                         let frame = egui::Frame::NONE
                             .fill(if is_sel {
-                                Color32::from_rgb(24, 48, 78)
+                                Color32::from_rgba_unmultiplied(56, 189, 248, 32)
                             } else {
-                                Color32::from_rgb(20, 27, 42)
+                                Color32::from_rgba_unmultiplied(22, 31, 49, 185)
                             })
                             .stroke(Stroke::new(
                                 1.0_f32,
                                 if is_sel {
-                                    Color32::from_rgb(56, 189, 248)
+                                    Color32::from_rgba_unmultiplied(56, 189, 248, 150)
                                 } else {
-                                    Color32::from_rgb(36, 48, 74)
+                                    Color32::from_rgba_unmultiplied(148, 163, 184, 24)
                                 },
                             ))
-                            .corner_radius(CornerRadius::same(6))
-                            .inner_margin(8.0);
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(Margin::same(11));
 
                         frame.show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
+                                let dot_col = if snap.stats.total_tokens_saved > 0 {
+                                    Color32::from_rgb(52, 211, 153)
+                                } else {
+                                    Color32::from_rgb(56, 189, 248)
+                                };
+                                let (dot_rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                ui.painter().circle_filled(dot_rect.center(), 4.0, dot_col);
+
                                 let title = ui.add(
-                                    egui::Label::new(RichText::new(&snap.entry.name).strong())
-                                        .sense(Sense::click()),
+                                    egui::Label::new(
+                                        RichText::new(&snap.entry.name)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .sense(Sense::click()),
                                 );
                                 if title.clicked() {
                                     to_select = Some(snap.entry.path.clone());
@@ -516,16 +628,24 @@ impl eframe::App for TrackerTopApp {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ui
-                                            .small_button("x")
-                                            .on_hover_text("Remove from TrackerTop list")
+                                            .add(
+                                                egui::Button::new(RichText::new("×").small())
+                                                    .corner_radius(CornerRadius::same(10))
+                                                    .fill(Color32::TRANSPARENT),
+                                            )
+                                            .on_hover_text(
+                                                "Remove from list (Shift+Click to also delete local .trackertop cache)",
+                                            )
                                             .clicked()
                                         {
-                                            to_remove = Some(snap.entry.path.clone());
+                                            let wipe = ui.input(|i| i.modifiers.shift);
+                                            to_remove = Some((snap.entry.path.clone(), wipe));
                                         }
                                     },
                                 );
                             });
 
+                            ui.add_space(3.0);
                             let subtitle = if snap.stats.total_queries > 0 {
                                 format!(
                                     "{} files · saved {} tok ({:.0}%)",
@@ -545,9 +665,9 @@ impl eframe::App for TrackerTopApp {
                                     RichText::new(subtitle)
                                         .small()
                                         .color(if snap.stats.total_tokens_saved > 0 {
-                                            Color32::from_rgb(52, 211, 153)
+                                            Color32::from_rgb(110, 231, 183)
                                         } else {
-                                            Color32::from_rgb(139, 155, 184)
+                                            Color32::from_rgb(148, 163, 184)
                                         }),
                                 )
                                 .sense(Sense::click()),
@@ -556,17 +676,22 @@ impl eframe::App for TrackerTopApp {
                                 to_select = Some(snap.entry.path.clone());
                             }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
                     }
                 });
 
-                if let Some(rem) = to_remove {
-                    let _ = remove_project(&rem);
+                if let Some((rem, wipe)) = to_remove {
+                    let _ = remove_project_with_cache(&rem, wipe);
                     if matches!(&self.selection, Selection::Project(p) if p.eq_ignore_ascii_case(&rem))
                     {
                         self.selection = Selection::AllProjects;
                         self.loaded = None;
                     }
+                    self.status_banner = if wipe {
+                        "Removed project and deleted its local .trackertop index.".to_string()
+                    } else {
+                        "Removed project from sidebar (local .trackertop cache kept; re-appears if Claude Code opens it).".to_string()
+                    };
                     self.reload_overview();
                 }
                 if let Some(sel) = to_select {
@@ -575,20 +700,147 @@ impl eframe::App for TrackerTopApp {
                 }
             });
 
-        // Main Central Panel
-        egui::CentralPanel::default().show(ctx, |ui| match &self.selection {
-            Selection::AllProjects => self.render_all_projects(ui),
-            Selection::Project(_) => self.render_single_project(ui),
-        });
+        // Main Central Panel with Ambient Radial Glow Backdrop
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(7, 11, 20))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                paint_ambient_backdrop(ui.painter(), ui.max_rect());
+                match &self.selection {
+                    Selection::AllProjects => self.render_all_projects(ui),
+                    Selection::Project(_) => self.render_single_project(ui),
+                }
+            });
+
+        if self.show_agents_modal {
+            self.render_agents_modal(ctx);
+        }
     }
 }
 
 impl TrackerTopApp {
+    fn render_agents_modal(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_agents_modal;
+        egui::Window::new("Connect AI Coding Agents")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(520.0, 420.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(15, 22, 38))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(56, 189, 248, 90),
+                    ))
+                    .corner_radius(CornerRadius::same(18))
+                    .inner_margin(Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Connect TrackerTop once globally — every repository you open in any connected AI agent is indexed and tracked automatically.",
+                    )
+                    .small()
+                    .color(Color32::from_rgb(148, 163, 184)),
+                );
+                ui.add_space(12.0);
+
+                let base = match &self.selection {
+                    Selection::Project(p) => PathBuf::from(p),
+                    Selection::AllProjects => {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    }
+                };
+
+                let mut agent_to_install: Option<AiAgentKind> = None;
+                for &(agent, connected) in &self.connected_agents {
+                    soft_card_frame(14).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(agent.display_name())
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                                ui.label(
+                                    RichText::new(agent.description())
+                                        .small()
+                                        .color(Color32::from_rgb(130, 148, 178)),
+                                );
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let label = if connected { "Connected ✓" } else { "Connect" };
+                                let btn = egui::Button::new(RichText::new(label).strong().color(
+                                    if connected {
+                                        Color32::from_rgb(110, 231, 183)
+                                    } else {
+                                        Color32::WHITE
+                                    },
+                                ))
+                                .corner_radius(CornerRadius::same(14))
+                                .fill(if connected {
+                                    Color32::from_rgba_unmultiplied(16, 185, 129, 32)
+                                } else {
+                                    Color32::from_rgb(37, 99, 235)
+                                });
+                                if ui.add(btn).clicked() {
+                                    agent_to_install = Some(agent);
+                                }
+                            });
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+
+                if let Some(agent) = agent_to_install {
+                    match install_agent(agent, &base) {
+                        Ok(lines) => {
+                            self.connected_agents = poll_agent_statuses();
+                            self.status_banner = lines.join(" | ");
+                        }
+                        Err(e) => {
+                            self.status_banner = format!("Install error: {e}");
+                        }
+                    }
+                }
+
+                ui.add_space(6.0);
+                soft_card_frame(14).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Other MCP Clients (VS Code, Zed, Cline, Antigravity)")
+                                .strong()
+                                .small(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Copy MCP JSON")
+                                        .corner_radius(CornerRadius::same(14)),
+                                )
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(generic_mcp_json_snippet());
+                                self.status_banner = "Copied universal MCP JSON to clipboard!".to_string();
+                            }
+                        });
+                    });
+                });
+            });
+        self.show_agents_modal = open;
+    }
+
     fn render_all_projects(&mut self, ui: &mut egui::Ui) {
         let ov = &self.overview;
-        ui.add_space(6.0);
         ui.columns(4, |cols| {
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[0],
                 "TRACKED PROJECTS",
                 &ov.projects.len().to_string(),
@@ -598,74 +850,144 @@ impl TrackerTopApp {
                     fmt_num(ov.total_symbols)
                 ),
                 Color32::WHITE,
+                Color32::from_rgb(129, 140, 248),
             );
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[1],
                 "TOTAL AI QUERIES",
                 &fmt_num(ov.total_queries),
                 &format!("Sent {} tok", fmt_num(ov.total_tokens_sent)),
+                Color32::from_rgb(125, 211, 252),
                 Color32::from_rgb(56, 189, 248),
             );
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[2],
                 "NET TOKENS SAVED",
                 &fmt_num(ov.total_tokens_saved),
                 &format!("{:.1}% reduction vs raw reads", ov.savings_percent),
+                Color32::from_rgb(110, 231, 183),
                 Color32::from_rgb(52, 211, 153),
             );
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[3],
                 "EST. USD SAVED",
                 &format!("${:.4}", ov.est_usd_saved_sonnet),
                 &format!("Sonnet · ${:.4} Opus", ov.est_usd_saved_opus),
-                Color32::from_rgb(52, 211, 153),
+                Color32::from_rgb(110, 231, 183),
+                Color32::from_rgb(16, 185, 129),
             );
         });
 
-        ui.add_space(14.0);
-        ui.heading("Projects Breakdown");
-        ui.add_space(6.0);
+        ui.add_space(18.0);
+
+        // Clean Empty State when 0 projects are listed (no awkward empty table headers!)
+        if ov.projects.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                soft_card_frame(20).show(ui, |ui| {
+                    ui.set_max_width(540.0);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Welcome to TrackerTop")
+                            .strong()
+                            .size(20.0)
+                            .color(Color32::WHITE),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Add any project folder to inspect its architecture and token savings, or simply open a repository in Claude Code — TrackerTop tracks it automatically in the background.",
+                        )
+                        .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(100.0);
+                        let add = egui::Button::new(
+                            RichText::new("+ Add Your First Project")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .corner_radius(CornerRadius::same(18))
+                        .fill(Color32::from_rgb(37, 99, 235));
+                        if ui.add(add).clicked() {
+                            self.pick_and_add_project();
+                        }
+                        ui.add_space(8.0);
+                        if ui
+                            .add(
+                                egui::Button::new("Connect AI Agents")
+                                    .corner_radius(CornerRadius::same(18)),
+                            )
+                            .clicked()
+                        {
+                            self.show_agents_modal = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                });
+            });
+            return;
+        }
 
         let mut open_path: Option<String> = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("global_projects_grid")
-                .striped(true)
-                .min_col_width(90.0)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| {
-                    for h in [
-                        "Project",
-                        "Files",
-                        "Repo Tokens",
-                        "Queries",
-                        "Tokens Saved",
-                        "Savings %",
-                        "Action",
-                    ] {
-                        ui.label(
-                            RichText::new(h)
-                                .strong()
-                                .color(Color32::from_rgb(148, 163, 184)),
-                        );
-                    }
-                    ui.end_row();
-
-                    for p in &ov.projects {
-                        ui.label(RichText::new(&p.entry.name).strong());
-                        ui.label(fmt_num(p.total_files));
-                        ui.label(fmt_num(p.total_repo_tokens));
-                        ui.label(fmt_num(p.stats.total_queries));
-                        ui.label(
-                            RichText::new(fmt_num(p.stats.total_tokens_saved))
-                                .color(Color32::from_rgb(52, 211, 153)),
-                        );
-                        ui.label(format!("{:.1}%", p.stats.savings_percent));
-                        if ui.button("Open").clicked() {
-                            open_path = Some(p.entry.path.clone());
+        soft_card_frame(16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("PROJECTS BREAKDOWN")
+                    .strong()
+                    .small()
+                    .color(Color32::from_rgb(148, 163, 184)),
+            );
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("global_projects_grid")
+                    .striped(true)
+                    .min_col_width(92.0)
+                    .spacing([18.0, 10.0])
+                    .show(ui, |ui| {
+                        for h in [
+                            "Project",
+                            "Files",
+                            "Repo Tokens",
+                            "Queries",
+                            "Tokens Saved",
+                            "Savings %",
+                            "",
+                        ] {
+                            ui.label(
+                                RichText::new(h)
+                                    .strong()
+                                    .small()
+                                    .color(Color32::from_rgb(130, 148, 178)),
+                            );
                         }
                         ui.end_row();
-                    }
-                });
+
+                        for p in &ov.projects {
+                            ui.label(RichText::new(&p.entry.name).strong().color(Color32::WHITE));
+                            ui.label(fmt_num(p.total_files));
+                            ui.label(fmt_num(p.total_repo_tokens));
+                            ui.label(fmt_num(p.stats.total_queries));
+                            ui.label(
+                                RichText::new(fmt_num(p.stats.total_tokens_saved))
+                                    .strong()
+                                    .color(Color32::from_rgb(110, 231, 183)),
+                            );
+                            ui.label(format!("{:.1}%", p.stats.savings_percent));
+                            if ui
+                                .add(
+                                    egui::Button::new("Open")
+                                        .corner_radius(CornerRadius::same(14)),
+                                )
+                                .clicked()
+                            {
+                                open_path = Some(p.entry.path.clone());
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
         });
 
         if let Some(p) = open_path {
@@ -675,29 +997,58 @@ impl TrackerTopApp {
     }
 
     fn render_single_project(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for (tab, label) in [
-                (ProjectTab::Savings, "Token Savings (Live)"),
-                (ProjectTab::Graph, "Code Graph"),
-                (ProjectTab::Architecture, "Architecture & Hubs"),
-            ] {
-                let active = self.active_tab == tab;
-                if ui
-                    .selectable_label(active, RichText::new(label).strong().size(14.0))
-                    .clicked()
-                {
-                    if tab == ProjectTab::Graph && self.active_tab != ProjectTab::Graph {
-                        self.needs_fit_view = true;
+        // Floating Rounded Pill Tab Bar
+        egui::Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(15, 23, 42, 200))
+            .stroke(Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(148, 163, 184, 28),
+            ))
+            .corner_radius(CornerRadius::same(20))
+            .inner_margin(Margin::symmetric(6, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (ProjectTab::Savings, "Overview & Savings"),
+                        (ProjectTab::Graph, "Code Graph"),
+                        (ProjectTab::Architecture, "Architecture & Health"),
+                        (ProjectTab::Memory, "AI Memory"),
+                    ] {
+                        let active = self.active_tab == tab;
+                        let btn = egui::Button::new(
+                            RichText::new(label).strong().size(13.5).color(if active {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(148, 163, 184)
+                            }),
+                        )
+                        .corner_radius(CornerRadius::same(16))
+                        .fill(if active {
+                            Color32::from_rgba_unmultiplied(56, 189, 248, 52)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .stroke(if active {
+                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 140))
+                        } else {
+                            Stroke::NONE
+                        });
+                        if ui.add(btn).clicked() {
+                            if tab == ProjectTab::Graph && self.active_tab != ProjectTab::Graph {
+                                self.needs_fit_view = true;
+                            }
+                            self.active_tab = tab;
+                        }
                     }
-                    self.active_tab = tab;
-                }
-            }
-        });
-        ui.separator();
+                });
+            });
+
+        ui.add_space(12.0);
 
         if self.loaded.is_none() {
-            ui.add_space(20.0);
-            ui.label("Project is not indexed yet. Click 'Re-Index' in the top bar.");
+            soft_card_frame(16).show(ui, |ui| {
+                ui.label("Project is not indexed yet. Click 'Re-Index' in the top bar.");
+            });
             return;
         }
 
@@ -705,6 +1056,7 @@ impl TrackerTopApp {
             ProjectTab::Savings => self.render_savings_tab(ui),
             ProjectTab::Graph => self.render_graph_tab(ui),
             ProjectTab::Architecture => self.render_architecture_tab(ui),
+            ProjectTab::Memory => self.render_memory_tab(ui),
         }
     }
 
@@ -715,23 +1067,24 @@ impl TrackerTopApp {
         };
         let s = &lp.stats;
 
-        ui.add_space(6.0);
         ui.columns(4, |cols| {
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[0],
                 "NET TOKENS SAVED",
                 &fmt_num(s.total_tokens_saved),
                 &format!("{:.1}% reduction", s.savings_percent),
+                Color32::from_rgb(110, 231, 183),
                 Color32::from_rgb(52, 211, 153),
             );
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[1],
                 "SENT VS BASELINE",
                 &fmt_num(s.total_tokens_sent),
                 &format!("vs {} raw baseline tok", fmt_num(s.total_baseline_tokens)),
+                Color32::from_rgb(125, 211, 252),
                 Color32::from_rgb(56, 189, 248),
             );
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[2],
                 "AI QUERIES LOGGED",
                 &fmt_num(s.total_queries),
@@ -741,27 +1094,29 @@ impl TrackerTopApp {
                     fmt_num(lp.total_repo_tokens)
                 ),
                 Color32::WHITE,
+                Color32::from_rgb(129, 140, 248),
             );
-            kpi_card(
+            glow_kpi_card(
                 &mut cols[3],
                 "EST. USD SAVED",
                 &format!("${:.4}", s.est_usd_saved_sonnet),
                 &format!("Sonnet · ${:.4} Opus", s.est_usd_saved_opus),
-                Color32::from_rgb(52, 211, 153),
+                Color32::from_rgb(110, 231, 183),
+                Color32::from_rgb(16, 185, 129),
             );
         });
 
-        ui.add_space(12.0);
+        ui.add_space(14.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             if s.total_queries == 0 {
                 egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(52, 211, 153, 18))
+                    .fill(Color32::from_rgba_unmultiplied(16, 185, 129, 22))
                     .stroke(Stroke::new(
                         1.0_f32,
                         Color32::from_rgba_unmultiplied(52, 211, 153, 95),
                     ))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(14.0)
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(Margin::same(16))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
@@ -772,29 +1127,32 @@ impl TrackerTopApp {
                                 fmt_num(lp.total_repo_tokens)
                             ))
                             .strong()
-                            .size(14.0)
-                            .color(Color32::from_rgb(52, 211, 153)),
+                            .size(14.5)
+                            .color(Color32::from_rgb(110, 231, 183)),
                         );
-                        ui.add_space(4.0);
+                        ui.add_space(5.0);
                         ui.label(
                             RichText::new(
-                                "TrackerTop works on any existing or new project immediately. Savings appear here as soon as Claude Code runs a query inside this folder — or click below to run a live test query right now.",
+                                "TrackerTop works immediately on any existing or new project. Open this folder in Claude Code (or Cursor / Codex) and ask a question — live token savings stream in automatically.",
                             )
                             .color(Color32::from_rgb(203, 213, 225)),
                         );
-                        ui.add_space(8.0);
-                        if ui
-                            .button(RichText::new("Run Quick Test Query (Verify Savings)").strong())
-                            .clicked()
-                        {
+                        ui.add_space(10.0);
+                        let test_btn = egui::Button::new(
+                            RichText::new("Run Quick Test Query (Verify Savings)")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .corner_radius(CornerRadius::same(16))
+                        .fill(Color32::from_rgb(16, 185, 129));
+                        if ui.add(test_btn).clicked() {
                             run_test_for = Some(lp.path.clone());
                         }
                     });
-                ui.add_space(10.0);
+                ui.add_space(12.0);
             }
 
-            // Savings by tool
-            card_frame().show(ui, |ui| {
+            soft_card_frame(16).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
@@ -805,17 +1163,23 @@ impl TrackerTopApp {
                     );
                     if s.total_queries > 0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Run Test Query").clicked() {
+                            if ui
+                                .add(
+                                    egui::Button::new("Run Test Query")
+                                        .corner_radius(CornerRadius::same(14)),
+                                )
+                                .clicked()
+                            {
                                 run_test_for = Some(lp.path.clone());
                             }
                         });
                     }
                 });
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 if s.by_tool.is_empty() {
                     ui.label(
                         RichText::new("Waiting for the first AI query in this project...")
-                            .color(Color32::from_rgb(139, 155, 184)),
+                            .color(Color32::from_rgb(130, 148, 178)),
                     );
                 } else {
                     for t in &s.by_tool {
@@ -832,25 +1196,26 @@ impl TrackerTopApp {
                                         fmt_num(t.tokens_saved),
                                         t.savings_percent
                                     ))
-                                    .color(Color32::from_rgb(52, 211, 153)),
+                                    .strong()
+                                    .color(Color32::from_rgb(110, 231, 183)),
                                 );
                             });
                         });
                         let frac = (t.savings_percent as f32 / 100.0).clamp(0.0, 1.0);
                         ui.add(
                             egui::ProgressBar::new(frac)
-                                .desired_height(8.0)
+                                .desired_height(9.0)
+                                .corner_radius(CornerRadius::same(5))
                                 .fill(Color32::from_rgb(52, 211, 153)),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
                     }
                 }
             });
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
 
-            // Recent queries table
-            card_frame().show(ui, |ui| {
+            soft_card_frame(16).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new("LIVE AI QUERY LOG")
@@ -858,23 +1223,25 @@ impl TrackerTopApp {
                         .small()
                         .color(Color32::from_rgb(148, 163, 184)),
                 );
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 if s.recent.is_empty() {
                     ui.label(
-                        RichText::new("Live queries from Claude Code will stream in here automatically every 2 seconds.")
-                            .color(Color32::from_rgb(139, 155, 184)),
+                        RichText::new(
+                            "Live queries from Claude Code, Cursor, or Codex stream in here every 2 seconds.",
+                        )
+                        .color(Color32::from_rgb(130, 148, 178)),
                     );
                 } else {
                     egui::Grid::new("recent_queries_grid")
                         .striped(true)
-                        .spacing([14.0, 6.0])
+                        .spacing([16.0, 8.0])
                         .show(ui, |ui| {
                             for h in ["Tool", "Query", "Sent", "Baseline", "Saved", "Latency"] {
                                 ui.label(
                                     RichText::new(h)
                                         .strong()
                                         .small()
-                                        .color(Color32::from_rgb(148, 163, 184)),
+                                        .color(Color32::from_rgb(130, 148, 178)),
                                 );
                             }
                             ui.end_row();
@@ -887,7 +1254,7 @@ impl TrackerTopApp {
                                 ui.label(
                                     RichText::new(&r.tool)
                                         .monospace()
-                                        .color(Color32::from_rgb(56, 189, 248)),
+                                        .color(Color32::from_rgb(125, 211, 252)),
                                 );
                                 ui.label(truncate_label(&r.query, 40));
                                 ui.label(fmt_num(r.tokens_sent));
@@ -898,7 +1265,7 @@ impl TrackerTopApp {
                                         fmt_num(r.tokens_saved),
                                         pct
                                     ))
-                                    .color(Color32::from_rgb(52, 211, 153)),
+                                    .color(Color32::from_rgb(110, 231, 183)),
                                 );
                                 ui.label(format!("{} ms", r.latency_ms));
                                 ui.end_row();
@@ -916,104 +1283,108 @@ impl TrackerTopApp {
     fn render_graph_tab(&mut self, ui: &mut egui::Ui) {
         let mut layout_dirty = false;
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Search:");
-            if ui
-                .add(
+        // Floating rounded toolbar
+        soft_card_frame(16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
                     egui::TextEdit::singleline(&mut self.graph_search)
-                        .desired_width(155.0)
-                        .hint_text("file or symbol..."),
-                )
-                .changed()
-            {
-                layout_dirty = true;
-            }
+                        .desired_width(165.0)
+                        .hint_text("Search file or symbol..."),
+                );
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    layout_dirty = true;
+                }
 
-            let prev_lang = self.graph_lang_filter.clone();
-            egui::ComboBox::from_id_salt("lang_filter")
-                .selected_text(if self.graph_lang_filter == "all" {
-                    "All Languages".to_string()
-                } else {
-                    default_registry().display_name_for(&self.graph_lang_filter)
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.graph_lang_filter,
-                        "all".to_string(),
-                        "All Languages",
-                    );
-                    for l in default_registry().languages() {
-                        ui.selectable_value(&mut self.graph_lang_filter, l.id, l.display_name);
-                    }
-                });
-            if self.graph_lang_filter != prev_lang {
-                layout_dirty = true;
-            }
+                let prev_lang = self.graph_lang_filter.clone();
+                egui::ComboBox::from_id_salt("lang_filter")
+                    .selected_text(if self.graph_lang_filter == "all" {
+                        "All Languages".to_string()
+                    } else {
+                        default_registry().display_name_for(&self.graph_lang_filter)
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.graph_lang_filter,
+                            "all".to_string(),
+                            "All Languages",
+                        );
+                        for l in default_registry().languages() {
+                            ui.selectable_value(&mut self.graph_lang_filter, l.id, l.display_name);
+                        }
+                    });
+                if self.graph_lang_filter != prev_lang {
+                    layout_dirty = true;
+                }
 
-            if ui
-                .checkbox(&mut self.graph_code_only, "Code Only (hide .toml/.md)")
-                .changed()
-            {
-                layout_dirty = true;
-            }
+                if ui
+                    .checkbox(&mut self.graph_code_only, "Code Only (hide .toml/.md)")
+                    .changed()
+                {
+                    layout_dirty = true;
+                }
 
-            let prev_layout = self.graph_layout_mode;
-            egui::ComboBox::from_id_salt("layout_mode")
-                .selected_text(match self.graph_layout_mode {
-                    GraphLayoutMode::Folders => "Layout: Folders",
-                    GraphLayoutMode::Clusters => "Layout: Clusters",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.graph_layout_mode,
-                        GraphLayoutMode::Folders,
-                        "Layout: Folders",
-                    );
-                    ui.selectable_value(
-                        &mut self.graph_layout_mode,
-                        GraphLayoutMode::Clusters,
-                        "Layout: Clusters",
-                    );
-                });
-            if self.graph_layout_mode != prev_layout {
-                layout_dirty = true;
-            }
+                let prev_layout = self.graph_layout_mode;
+                egui::ComboBox::from_id_salt("layout_mode")
+                    .selected_text(match self.graph_layout_mode {
+                        GraphLayoutMode::Folders => "Layout: Folders",
+                        GraphLayoutMode::Clusters => "Layout: Clusters",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.graph_layout_mode,
+                            GraphLayoutMode::Folders,
+                            "Layout: Folders",
+                        );
+                        ui.selectable_value(
+                            &mut self.graph_layout_mode,
+                            GraphLayoutMode::Clusters,
+                            "Layout: Clusters",
+                        );
+                    });
+                if self.graph_layout_mode != prev_layout {
+                    layout_dirty = true;
+                }
 
-            egui::ComboBox::from_id_salt("color_mode")
-                .selected_text(match self.graph_color_mode {
-                    GraphColorMode::Language => "Color: Language",
-                    GraphColorMode::Cluster => "Color: Cluster",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.graph_color_mode,
-                        GraphColorMode::Language,
-                        "Color: Language",
-                    );
-                    ui.selectable_value(
-                        &mut self.graph_color_mode,
-                        GraphColorMode::Cluster,
-                        "Color: Cluster",
-                    );
-                });
+                egui::ComboBox::from_id_salt("color_mode")
+                    .selected_text(match self.graph_color_mode {
+                        GraphColorMode::Language => "Color: Language",
+                        GraphColorMode::Cluster => "Color: Cluster",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.graph_color_mode,
+                            GraphColorMode::Language,
+                            "Color: Language",
+                        );
+                        ui.selectable_value(
+                            &mut self.graph_color_mode,
+                            GraphColorMode::Cluster,
+                            "Color: Cluster",
+                        );
+                    });
 
-            if ui.button("Fit View").clicked() {
-                self.needs_fit_view = true;
-            }
+                if ui
+                    .add(egui::Button::new("Fit View").corner_radius(CornerRadius::same(14)))
+                    .clicked()
+                {
+                    self.needs_fit_view = true;
+                }
+            });
         });
 
         if layout_dirty {
             self.recompute_graph_layout();
         }
-        ui.add_space(4.0);
+        ui.add_space(10.0);
 
         let avail = ui.available_size();
         let inspector_w = if self.selected_node_idx.is_some() {
-            290.0
+            300.0
         } else {
             0.0
         };
-        let canvas_w = (avail.x - inspector_w - 8.0).max(240.0);
+        let canvas_w = (avail.x - inspector_w - 10.0).max(240.0);
 
         ui.horizontal_top(|ui| {
             let (rect, resp) = ui.allocate_exact_size(
@@ -1021,11 +1392,15 @@ impl TrackerTopApp {
                 Sense::click_and_drag(),
             );
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, CornerRadius::same(8), Color32::from_rgb(10, 14, 24));
+            painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(9, 13, 24));
+            paint_ambient_backdrop(&painter, rect);
             painter.rect_stroke(
                 rect,
-                CornerRadius::same(8),
-                Stroke::new(1.0_f32, Color32::from_rgb(36, 48, 74)),
+                CornerRadius::same(18),
+                Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(148, 163, 184, 34),
+                ),
                 StrokeKind::Inside,
             );
 
@@ -1040,13 +1415,13 @@ impl TrackerTopApp {
                     self.graph_code_only,
                 );
 
-                // Auto-fit all visible islands neatly into the viewport
                 if self.needs_fit_view {
-                    let (min_x, max_x, min_y, max_y) = compute_bounds(&lp.nodes, &lp.islands, &visible);
+                    let (min_x, max_x, min_y, max_y) =
+                        compute_bounds(&lp.nodes, &lp.islands, &visible);
                     let span_x = (max_x - min_x).max(160.0);
                     let span_y = (max_y - min_y).max(160.0);
-                    let fit_x = (rect.width() - 60.0) / span_x;
-                    let fit_y = (rect.height() - 60.0) / span_y;
+                    let fit_x = (rect.width() - 68.0) / span_x;
+                    let fit_y = (rect.height() - 68.0) / span_y;
                     self.cam_zoom = fit_x.min(fit_y).clamp(0.12, 2.2);
                     self.cam_offset = Vec2::new(-(min_x + max_x) * 0.5, -(min_y + max_y) * 0.5);
                     self.needs_fit_view = false;
@@ -1059,7 +1434,6 @@ impl TrackerTopApp {
                     )
                 };
 
-                // Smooth scroll zoom centered on canvas
                 if resp.hovered() {
                     let scroll = ui.input(|i| i.raw_scroll_delta.y);
                     if scroll.abs() > 0.1 {
@@ -1068,7 +1442,6 @@ impl TrackerTopApp {
                     }
                 }
 
-                // Hit test pointer
                 let pointer_pos = resp.hover_pos().or_else(|| resp.interact_pointer_pos());
                 let hovered_node = pointer_pos.and_then(|pos| {
                     lp.nodes.iter().enumerate().rev().find_map(|(idx, n)| {
@@ -1109,7 +1482,6 @@ impl TrackerTopApp {
                     self.selected_node_idx = hovered_node;
                 }
 
-                // Focus neighborhood (Obsidian-style dim when hovering/selecting)
                 let focus_idx = hovered_node.or(self.selected_node_idx);
                 let mut focused_set: HashSet<usize> = HashSet::new();
                 if let Some(fi) = focus_idx {
@@ -1126,7 +1498,7 @@ impl TrackerTopApp {
                     }
                 }
 
-                // 1. Draw translucent island backgrounds & clean group headers
+                // 1. Soft radial island halos & headers
                 for isl in &lp.islands {
                     let sp = to_screen(isl.center_x, isl.center_y, self.cam_offset, self.cam_zoom);
                     let sr = isl.radius * self.cam_zoom;
@@ -1134,56 +1506,80 @@ impl TrackerTopApp {
                         continue;
                     }
                     let base_col = cluster_color(isl.color_idx);
-                    let fill = Color32::from_rgba_unmultiplied(
-                        base_col.r(),
-                        base_col.g(),
-                        base_col.b(),
-                        14,
+                    painter.circle_filled(
+                        sp,
+                        sr * 1.06,
+                        Color32::from_rgba_unmultiplied(
+                            base_col.r(),
+                            base_col.g(),
+                            base_col.b(),
+                            7,
+                        ),
                     );
-                    let border = Color32::from_rgba_unmultiplied(
-                        base_col.r(),
-                        base_col.g(),
-                        base_col.b(),
-                        52,
+                    painter.circle_filled(
+                        sp,
+                        sr,
+                        Color32::from_rgba_unmultiplied(
+                            base_col.r(),
+                            base_col.g(),
+                            base_col.b(),
+                            15,
+                        ),
                     );
-                    painter.circle_filled(sp, sr, fill);
-                    painter.circle_stroke(sp, sr, Stroke::new(1.0_f32, border));
+                    painter.circle_stroke(
+                        sp,
+                        sr,
+                        Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(
+                                base_col.r(),
+                                base_col.g(),
+                                base_col.b(),
+                                56,
+                            ),
+                        ),
+                    );
 
-                    // Draw island title above circle
                     if sr >= 14.0 {
                         let title_text = format!("{} ({})", isl.title, isl.count);
                         painter.text(
-                            Pos2::new(sp.x, sp.y - sr - 9.0),
+                            Pos2::new(sp.x, sp.y - sr - 10.0),
                             egui::Align2::CENTER_CENTER,
                             title_text,
                             egui::FontId::proportional(11.5),
-                            Color32::from_rgba_unmultiplied(203, 213, 225, 220),
+                            Color32::from_rgba_unmultiplied(215, 224, 238, 228),
                         );
                     }
                 }
 
-                // 2. Draw edges (subtle when unfocused; bright cyan for focused node's dependencies)
+                // 2. Edges
                 for e in &lp.edges {
                     if !visible[e.src] || !visible[e.tgt] {
                         continue;
                     }
                     let is_hl = focus_idx.is_some_and(|fi| e.src == fi || e.tgt == fi);
                     if focus_idx.is_some() && !is_hl {
-                        continue; // Keep focus mode ultra-clean
+                        continue;
                     }
                     let a = &lp.nodes[e.src];
                     let b = &lp.nodes[e.tgt];
                     let p1 = to_screen(a.x, a.y, self.cam_offset, self.cam_zoom);
                     let p2 = to_screen(b.x, b.y, self.cam_offset, self.cam_zoom);
                     let stroke = if is_hl {
-                        Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 220))
+                        Stroke::new(
+                            1.8_f32,
+                            Color32::from_rgba_unmultiplied(56, 189, 248, 225),
+                        )
                     } else {
-                        Stroke::new(0.9_f32, Color32::from_rgba_unmultiplied(148, 163, 184, 34))
+                        Stroke::new(
+                            0.9_f32,
+                            Color32::from_rgba_unmultiplied(148, 163, 184, 34),
+                        )
                     };
                     painter.line_segment([p1, p2], stroke);
                 }
 
-                // 3. Draw nodes
+                // 3. Nodes with soft outer glow on hover/focus
                 for (idx, n) in lp.nodes.iter().enumerate() {
                     if !visible[idx] {
                         continue;
@@ -1198,11 +1594,18 @@ impl TrackerTopApp {
                     };
                     let dimmed = focus_idx.is_some() && !focused_set.contains(&idx);
                     let color = if dimmed {
-                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 45)
+                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 42)
                     } else {
                         base
                     };
                     let r = (n.radius * self.cam_zoom).clamp(3.0, 26.0);
+                    if !dimmed {
+                        painter.circle_filled(
+                            sp,
+                            r + 4.0,
+                            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 26),
+                        );
+                    }
                     painter.circle_filled(sp, r, color);
 
                     if Some(idx) == self.selected_node_idx || Some(idx) == hovered_node {
@@ -1216,10 +1619,9 @@ impl TrackerTopApp {
                     }
                 }
 
-                // 4. Smart Collision-Free Labels (highest importance first — ZERO overlapping text!)
-                let mut label_order: Vec<usize> = (0..lp.nodes.len())
-                    .filter(|&i| visible[i])
-                    .collect();
+                // 4. Collision-free labels
+                let mut label_order: Vec<usize> =
+                    (0..lp.nodes.len()).filter(|&i| visible[i]).collect();
                 label_order.sort_by(|&a, &b| {
                     let prio = |i: usize| -> i32 {
                         if Some(i) == hovered_node {
@@ -1262,21 +1664,18 @@ impl TrackerTopApp {
                     let est_w = (n.label.len() as f32 * 6.4 + 10.0).min(170.0);
                     let est_h = 15.0;
                     let label_center = Pos2::new(sp.x, sp.y + r + 9.0);
-                    let label_rect =
-                        Rect::from_center_size(label_center, Vec2::new(est_w, est_h));
+                    let label_rect = Rect::from_center_size(label_center, Vec2::new(est_w, est_h));
 
-                    // Strict collision avoidance unless hovered/selected
                     if !is_special && occupied_labels.iter().any(|o| o.intersects(label_rect)) {
                         continue;
                     }
                     occupied_labels.push(label_rect.expand(2.0));
 
-                    // Crisp dark pill behind focused/selected labels for instant legibility
                     if is_special {
                         painter.rect_filled(
-                            label_rect.expand2(Vec2::new(3.0, 1.0)),
-                            CornerRadius::same(3),
-                            Color32::from_rgba_unmultiplied(10, 14, 24, 220),
+                            label_rect.expand2(Vec2::new(4.0, 2.0)),
+                            CornerRadius::same(6),
+                            Color32::from_rgba_unmultiplied(10, 14, 24, 225),
                         );
                     }
                     painter.text(
@@ -1292,7 +1691,7 @@ impl TrackerTopApp {
                     );
                 }
 
-                // 5. Floating Hover Tooltip in top-left of canvas
+                // 5. Floating rounded tooltip
                 if let Some(hi) = hovered_node {
                     let n = &lp.nodes[hi];
                     let tip_text = format!(
@@ -1304,22 +1703,25 @@ impl TrackerTopApp {
                         n.degree
                     );
                     let tip_rect = Rect::from_min_size(
-                        Pos2::new(rect.left() + 10.0, rect.top() + 10.0),
-                        Vec2::new((tip_text.len() as f32 * 6.5 + 18.0).min(rect.width() - 20.0), 26.0),
+                        Pos2::new(rect.left() + 12.0, rect.top() + 12.0),
+                        Vec2::new(
+                            (tip_text.len() as f32 * 6.5 + 22.0).min(rect.width() - 24.0),
+                            28.0,
+                        ),
                     );
                     painter.rect_filled(
                         tip_rect,
-                        CornerRadius::same(6),
-                        Color32::from_rgba_unmultiplied(18, 24, 38, 235),
+                        CornerRadius::same(12),
+                        Color32::from_rgba_unmultiplied(15, 23, 42, 235),
                     );
                     painter.rect_stroke(
                         tip_rect,
-                        CornerRadius::same(6),
-                        Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248)),
+                        CornerRadius::same(12),
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 150)),
                         StrokeKind::Inside,
                     );
                     painter.text(
-                        Pos2::new(tip_rect.left() + 9.0, tip_rect.center().y),
+                        Pos2::new(tip_rect.left() + 11.0, tip_rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         tip_text,
                         egui::FontId::proportional(11.5),
@@ -1327,33 +1729,44 @@ impl TrackerTopApp {
                     );
                 }
 
-                // Bottom-left mini legend
                 let vis_count = visible.iter().filter(|&&v| v).count();
                 painter.text(
-                    Pos2::new(rect.left() + 10.0, rect.bottom() - 12.0),
+                    Pos2::new(rect.left() + 14.0, rect.bottom() - 14.0),
                     egui::Align2::LEFT_CENTER,
                     format!(
-                        "Showing {vis_count}/{} files in {} groups · Scroll to zoom · Drag background to pan · Click node to inspect",
+                        "{vis_count}/{} files in {} groups · Scroll to zoom · Drag to pan · Click node to inspect",
                         lp.nodes.len(),
                         lp.islands.len()
                     ),
                     egui::FontId::proportional(11.0),
-                    Color32::from_rgb(139, 155, 184),
+                    Color32::from_rgb(130, 148, 178),
                 );
             }
 
-            // Right: Symbol Inspector when a node is selected
+            // Right: Floating Rounded Inspector Drawer
             if let (Some(idx), Some(lp)) = (self.selected_node_idx, &self.loaded) {
                 if let Some(node) = lp.nodes.get(idx) {
+                    ui.add_space(8.0);
                     ui.allocate_ui(Vec2::new(inspector_w, (avail.y - 6.0).max(200.0)), |ui| {
-                        card_frame().show(ui, |ui| {
+                        soft_card_frame(16).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&node.label).strong().size(14.0));
+                                ui.label(
+                                    RichText::new(&node.label)
+                                        .strong()
+                                        .size(14.5)
+                                        .color(Color32::WHITE),
+                                );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("x").clicked() {
+                                        if ui
+                                            .add(
+                                                egui::Button::new("×")
+                                                    .corner_radius(CornerRadius::same(10)),
+                                            )
+                                            .clicked()
+                                        {
                                             self.selected_node_idx = None;
                                         }
                                     },
@@ -1362,7 +1775,7 @@ impl TrackerTopApp {
                             ui.label(
                                 RichText::new(&node.id)
                                     .small()
-                                    .color(Color32::from_rgb(139, 155, 184)),
+                                    .color(Color32::from_rgb(130, 148, 178)),
                             );
                             ui.label(
                                 RichText::new(format!(
@@ -1373,7 +1786,7 @@ impl TrackerTopApp {
                                     node.degree
                                 ))
                                 .small()
-                                .color(Color32::from_rgb(56, 189, 248)),
+                                .color(Color32::from_rgb(125, 211, 252)),
                             );
                             ui.separator();
                             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1383,13 +1796,13 @@ impl TrackerTopApp {
                                             RichText::new(format!("[{kind}]"))
                                                 .monospace()
                                                 .small()
-                                                .color(Color32::from_rgb(56, 189, 248)),
+                                                .color(Color32::from_rgb(125, 211, 252)),
                                         );
                                         ui.label(RichText::new(name).strong().small());
                                         ui.label(
                                             RichText::new(format!("L{line}"))
                                                 .small()
-                                                .color(Color32::from_rgb(139, 155, 184)),
+                                                .color(Color32::from_rgb(130, 148, 178)),
                                         );
                                     });
                                     ui.label(
@@ -1398,7 +1811,7 @@ impl TrackerTopApp {
                                             .small()
                                             .color(Color32::from_rgb(148, 163, 184)),
                                     );
-                                    ui.add_space(4.0);
+                                    ui.add_space(5.0);
                                 }
                             });
                         });
@@ -1414,36 +1827,103 @@ impl TrackerTopApp {
         };
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} files · {} symbols · {} graph edges · {} total tokens",
-                    fmt_num(lp.total_files),
-                    fmt_num(lp.total_symbols),
-                    fmt_num(lp.total_edges),
-                    fmt_num(lp.total_repo_tokens)
-                ))
-                .color(Color32::from_rgb(148, 163, 184)),
-            );
-            ui.add_space(6.0);
+            // Code Health Summary Row
+            ui.columns(3, |cols| {
+                let bloat_col = if lp.health.bloated_files.is_empty() {
+                    Color32::from_rgb(110, 231, 183)
+                } else {
+                    Color32::from_rgb(251, 191, 36)
+                };
+                glow_kpi_card(
+                    &mut cols[0],
+                    "TOKEN BLOAT FILES (>=3.5K TOK)",
+                    &lp.health.bloated_files.len().to_string(),
+                    "Large files strain LLM context",
+                    bloat_col,
+                    bloat_col,
+                );
+                let cyc_col = if lp.health.circular_groups.is_empty() {
+                    Color32::from_rgb(110, 231, 183)
+                } else {
+                    Color32::from_rgb(248, 113, 113)
+                };
+                glow_kpi_card(
+                    &mut cols[1],
+                    "CIRCULAR DEPENDENCY CYCLES",
+                    &lp.health.circular_groups.len().to_string(),
+                    "Strongly connected file loops",
+                    cyc_col,
+                    cyc_col,
+                );
+                glow_kpi_card(
+                    &mut cols[2],
+                    "ORPHAN CODE FILES",
+                    &lp.health.orphan_files.len().to_string(),
+                    "Zero incoming graph references",
+                    Color32::from_rgb(125, 211, 252),
+                    Color32::from_rgb(56, 189, 248),
+                );
+            });
 
-            card_frame().show(ui, |ui| {
+            ui.add_space(12.0);
+
+            if !lp.health.bloated_files.is_empty() || !lp.health.circular_groups.is_empty() {
+                soft_card_frame(16).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("CODE HEALTH DIAGNOSTICS")
+                            .strong()
+                            .small()
+                            .color(Color32::from_rgb(251, 191, 36)),
+                    );
+                    ui.add_space(6.0);
+                    for (p, toks, lines) in lp.health.bloated_files.iter().take(6) {
+                        ui.label(
+                            RichText::new(format!(
+                                "Bloat: {p} — {} tokens ({lines} lines) — consider splitting",
+                                fmt_num(*toks)
+                            ))
+                            .small()
+                            .color(Color32::from_rgb(253, 224, 71)),
+                        );
+                    }
+                    for cyc in lp.health.circular_groups.iter().take(4) {
+                        ui.label(
+                            RichText::new(format!("Cycle: {}", cyc.join(" <-> ")))
+                                .small()
+                                .color(Color32::from_rgb(252, 165, 165)),
+                        );
+                    }
+                });
+                ui.add_space(12.0);
+            }
+
+            // Language breakdown pills
+            soft_card_frame(16).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("LANGUAGE BREAKDOWN")
-                        .strong()
-                        .small()
-                        .color(Color32::from_rgb(148, 163, 184)),
+                    RichText::new(format!(
+                        "LANGUAGE BREAKDOWN  ({} files · {} symbols · {} edges)",
+                        fmt_num(lp.total_files),
+                        fmt_num(lp.total_symbols),
+                        fmt_num(lp.total_edges)
+                    ))
+                    .strong()
+                    .small()
+                    .color(Color32::from_rgb(148, 163, 184)),
                 );
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     for (_, display, hex, files, toks) in &lp.lang_breakdown {
                         let col = parse_hex_color(hex);
                         egui::Frame::NONE
-                            .fill(Color32::from_rgb(18, 24, 38))
-                            .stroke(Stroke::new(1.0_f32, col))
-                            .corner_radius(CornerRadius::same(6))
-                            .inner_margin(8.0)
+                            .fill(Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 20))
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 100),
+                            ))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(Margin::symmetric(12, 8))
                             .show(ui, |ui| {
                                 ui.label(RichText::new(display).strong().color(col));
                                 ui.label(
@@ -1455,9 +1935,10 @@ impl TrackerTopApp {
                 });
             });
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
 
-            card_frame().show(ui, |ui| {
+            // God nodes
+            soft_card_frame(16).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new("ARCHITECTURAL HUBS (GOD NODES)")
@@ -1465,17 +1946,17 @@ impl TrackerTopApp {
                         .small()
                         .color(Color32::from_rgb(148, 163, 184)),
                 );
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 egui::Grid::new("god_nodes_grid")
                     .striped(true)
-                    .spacing([14.0, 6.0])
+                    .spacing([14.0, 7.0])
                     .show(ui, |ui| {
                         for h in ["Symbol", "Kind", "File", "In", "Out", "Score"] {
                             ui.label(
                                 RichText::new(h)
                                     .strong()
                                     .small()
-                                    .color(Color32::from_rgb(148, 163, 184)),
+                                    .color(Color32::from_rgb(130, 148, 178)),
                             );
                         }
                         ui.end_row();
@@ -1483,7 +1964,7 @@ impl TrackerTopApp {
                             ui.label(RichText::new(&g.name).monospace().strong());
                             ui.label(
                                 RichText::new(g.kind.as_str())
-                                    .color(Color32::from_rgb(56, 189, 248)),
+                                    .color(Color32::from_rgb(125, 211, 252)),
                             );
                             ui.label(&g.file_path);
                             ui.label(g.in_degree.to_string());
@@ -1494,9 +1975,10 @@ impl TrackerTopApp {
                     });
             });
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
 
-            card_frame().show(ui, |ui| {
+            // Communities
+            soft_card_frame(16).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new("MODULE CLUSTERS")
@@ -1504,7 +1986,7 @@ impl TrackerTopApp {
                         .small()
                         .color(Color32::from_rgb(148, 163, 184)),
                 );
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 for c in &lp.communities {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
@@ -1520,7 +2002,7 @@ impl TrackerTopApp {
                                 fmt_num(c.total_tokens)
                             ))
                             .small()
-                            .color(Color32::from_rgb(139, 155, 184)),
+                            .color(Color32::from_rgb(130, 148, 178)),
                         );
                     });
                     if !c.top_hubs.is_empty() {
@@ -1535,14 +2017,135 @@ impl TrackerTopApp {
             });
         });
     }
+
+    fn render_memory_tab(&mut self, ui: &mut egui::Ui) {
+        let mut add_note_req: Option<(String, String, String)> = None;
+        let mut del_note_req: Option<(String, i64)> = None;
+
+        let Some(ref lp) = self.loaded else {
+            return;
+        };
+        let repo_path = lp.path.clone();
+
+        soft_card_frame(16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("PERSISTENT AI MEMORY (AUTO-INJECTED ON READS)")
+                    .strong()
+                    .small()
+                    .color(Color32::from_rgb(125, 211, 252)),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Notes saved here (or by AI agents via `remember`) are automatically attached whenever any AI reads that symbol or opens `repo_map`.",
+                )
+                .small()
+                .color(Color32::from_rgb(148, 163, 184)),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label("Target:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.note_target_input)
+                        .desired_width(160.0)
+                        .hint_text("project, file, or symbol"),
+                );
+                ui.label("Note:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.note_content_input)
+                        .desired_width((ui.available_width() - 110.0).max(180.0))
+                        .hint_text("e.g. Coordinate system is Y-up; shader bindings 0-2 are reserved"),
+                );
+                let save_btn = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE))
+                    .corner_radius(CornerRadius::same(14))
+                    .fill(Color32::from_rgb(37, 99, 235));
+                if ui.add(save_btn).clicked() && !self.note_content_input.trim().is_empty() {
+                    add_note_req = Some((
+                        repo_path.clone(),
+                        self.note_target_input.clone(),
+                        self.note_content_input.clone(),
+                    ));
+                }
+            });
+        });
+
+        ui.add_space(12.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if lp.notes.is_empty() {
+                soft_card_frame(16).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("No memory notes saved yet for this project.")
+                            .color(Color32::from_rgb(130, 148, 178)),
+                    );
+                });
+            } else {
+                for note in &lp.notes {
+                    soft_card_frame(14).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            egui::Frame::NONE
+                                .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 28))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(Margin::symmetric(8, 3))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(&note.target)
+                                            .monospace()
+                                            .small()
+                                            .strong()
+                                            .color(Color32::from_rgb(125, 211, 252)),
+                                    );
+                                });
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(&note.content).color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new("Delete")
+                                            .corner_radius(CornerRadius::same(12)),
+                                    )
+                                    .clicked()
+                                {
+                                    del_note_req = Some((repo_path.clone(), note.id));
+                                }
+                            });
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+        });
+
+        if let Some((rp, target, content)) = add_note_req {
+            if let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
+                let _ = db.add_note(&target, &content);
+                self.note_content_input.clear();
+                self.status_banner = format!("Saved memory note for `{target}`");
+                if let Some(ref mut lp_mut) = self.loaded {
+                    lp_mut.notes = db.list_notes(None).unwrap_or_default();
+                }
+            }
+        }
+        if let Some((rp, id)) = del_note_req {
+            if let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
+                let _ = db.delete_note(id);
+                if let Some(ref mut lp_mut) = self.loaded {
+                    lp_mut.notes = db.list_notes(None).unwrap_or_default();
+                }
+            }
+        }
+    }
 }
 
 pub fn run_desktop_app(initial_repo: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("TrackerTop — AI Codebase Graph & Token Savings")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([880.0, 560.0]),
+            .with_inner_size([1300.0, 820.0])
+            .with_min_inner_size([900.0, 580.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1553,10 +2156,19 @@ pub fn run_desktop_app(initial_repo: Option<PathBuf>) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
 
+fn poll_agent_statuses() -> Vec<(AiAgentKind, bool)> {
+    AiAgentKind::all()
+        .into_iter()
+        .map(|a| (a, is_agent_installed(a)))
+        .collect()
+}
+
 fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
     let db = Database::open_for_repo(repo_root)?;
     let cg = CodeGraph::load(&db)?;
     let stats = db.get_token_stats(30)?;
+    let notes = db.list_notes(None)?;
+    let health = cg.health_report();
     let reg = default_registry();
 
     let mut file_ranks: HashMap<String, f64> = HashMap::new();
@@ -1669,6 +2281,8 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         lang_breakdown,
         god_nodes: cg.god_nodes(15, false),
         communities: cg.communities(),
+        health,
+        notes,
         stats,
         nodes,
         edges,
@@ -1676,7 +2290,6 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
     })
 }
 
-/// Extracts a clean 2-level folder bucket so large repos divide into readable architectural islands.
 fn folder_bucket(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     match parts.len() {
@@ -1713,8 +2326,6 @@ fn compute_visible_mask(
         .collect()
 }
 
-/// Arranges visible nodes into clean, non-overlapping islands arranged on a balanced grid.
-/// Inside each island, nodes sit in concentric rings sorted by importance (hubs in center, leaves outside).
 fn arrange_structured_islands(
     nodes: &mut [GraphNodeVis],
     visible: &[bool],
@@ -1732,11 +2343,9 @@ fn arrange_structured_islands(
         groups.entry(key).or_default().push(idx);
     }
 
-    // Sort groups largest-first so the layout feels balanced
     let mut group_list: Vec<(String, Vec<usize>)> = groups.into_iter().collect();
     group_list.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
-    // Precompute each island's local coordinates and bounding radius (guaranteed zero node overlap)
     struct LocalIsland {
         title: String,
         indices: Vec<usize>,
@@ -1747,7 +2356,6 @@ fn arrange_structured_islands(
 
     let mut local_islands = Vec::with_capacity(group_list.len());
     for (g_idx, (title, mut indices)) in group_list.into_iter().enumerate() {
-        // Place highest-degree / highest-rank hubs at the center of each island
         indices.sort_by(|&a, &b| {
             nodes[b]
                 .degree
@@ -1762,10 +2370,8 @@ fn arrange_structured_islands(
             local_pos.push((0.0, 0.0));
             max_extent = nodes[indices[0]].radius + 26.0;
         } else {
-            // Concentric non-overlapping rings with generous spacing
             let mut placed = 0usize;
             let mut ring_radius = 0.0_f32;
-
             while placed < indices.len() {
                 if placed == 0 {
                     local_pos.push((0.0, 0.0));
@@ -1778,8 +2384,8 @@ fn arrange_structured_islands(
                     let count = (indices.len() - placed).min(cap);
                     let angle_offset = (g_idx as f32) * 0.37;
                     for k in 0..count {
-                        let angle = angle_offset
-                            + (k as f32 / count as f32) * std::f32::consts::TAU;
+                        let angle =
+                            angle_offset + (k as f32 / count as f32) * std::f32::consts::TAU;
                         let x = angle.cos() * ring_radius;
                         let y = angle.sin() * ring_radius;
                         let nr = nodes[indices[placed + k]].radius;
@@ -1801,7 +2407,6 @@ fn arrange_structured_islands(
         });
     }
 
-    // Place islands into clean non-overlapping rows with generous margins
     let total_islands = local_islands.len().max(1);
     let cols = (total_islands as f32).sqrt().ceil().max(1.0) as usize;
     let gap = 58.0_f32;
@@ -1883,38 +2488,106 @@ fn compute_bounds(
     }
 }
 
-fn apply_dark_theme(ctx: &egui::Context) {
+/// Paints soft multi-stop ambient radial aurora glows for a modern atmospheric dark canvas.
+fn paint_ambient_backdrop(painter: &egui::Painter, rect: Rect) {
+    let orbs = [
+        (
+            Pos2::new(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.14),
+            rect.width().max(rect.height()) * 0.42,
+            (56u8, 189u8, 248u8),
+        ),
+        (
+            Pos2::new(rect.right() - rect.width() * 0.16, rect.bottom() - rect.height() * 0.16),
+            rect.width().max(rect.height()) * 0.46,
+            (129u8, 140u8, 248u8),
+        ),
+        (
+            Pos2::new(rect.center().x, rect.top() + rect.height() * 0.85),
+            rect.width().max(rect.height()) * 0.34,
+            (16u8, 185u8, 129u8),
+        ),
+    ];
+
+    for (center, max_r, (r, g, b)) in orbs {
+        for step in (1..=6).rev() {
+            let frac = step as f32 / 6.0;
+            let rad = max_r * frac;
+            let alpha = ((1.0 - frac * 0.72) * 9.0) as u8;
+            painter.circle_filled(center, rad, Color32::from_rgba_unmultiplied(r, g, b, alpha));
+        }
+    }
+}
+
+fn apply_soft_modern_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+    style.spacing.button_padding = Vec2::new(13.0, 6.0);
+
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(13, 18, 30);
-    visuals.window_fill = Color32::from_rgb(18, 24, 38);
-    visuals.extreme_bg_color = Color32::from_rgb(10, 14, 24);
-    ctx.set_visuals(visuals);
+    visuals.panel_fill = Color32::from_rgb(9, 13, 24);
+    visuals.window_fill = Color32::from_rgb(15, 22, 38);
+    visuals.extreme_bg_color = Color32::from_rgb(11, 17, 30);
+    visuals.window_corner_radius = CornerRadius::same(16);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(12);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(12);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(12);
+    visuals.widgets.active.corner_radius = CornerRadius::same(12);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgba_unmultiplied(30, 41, 59, 185);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgba_unmultiplied(51, 65, 85, 215);
+    visuals.widgets.active.bg_fill = Color32::from_rgba_unmultiplied(56, 189, 248, 80);
+    visuals.widgets.inactive.bg_stroke =
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(148, 163, 184, 34));
+    visuals.widgets.hovered.bg_stroke =
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 120));
+
+    style.visuals = visuals;
+    ctx.set_style(style);
 }
 
-fn card_frame() -> egui::Frame {
+fn soft_card_frame(radius: u8) -> egui::Frame {
     egui::Frame::NONE
-        .fill(Color32::from_rgb(20, 27, 42))
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(36, 48, 74)))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(12.0)
+        .fill(Color32::from_rgba_unmultiplied(17, 24, 41, 220))
+        .stroke(Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(148, 163, 184, 30),
+        ))
+        .corner_radius(CornerRadius::same(radius))
+        .inner_margin(Margin::same(15))
 }
 
-fn kpi_card(ui: &mut egui::Ui, label: &str, value: &str, sub: &str, color: Color32) {
-    card_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new(label)
-                .small()
-                .color(Color32::from_rgb(139, 155, 184)),
-        );
-        ui.add_space(2.0);
-        ui.label(RichText::new(value).strong().size(22.0).color(color));
-        ui.label(
-            RichText::new(sub)
-                .small()
-                .color(Color32::from_rgb(139, 155, 184)),
-        );
-    });
+fn glow_kpi_card(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    sub: &str,
+    text_col: Color32,
+    accent: Color32,
+) {
+    egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(17, 24, 41, 228))
+        .stroke(Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 68),
+        ))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(Margin::same(15))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(label)
+                    .small()
+                    .strong()
+                    .color(Color32::from_rgb(130, 148, 178)),
+            );
+            ui.add_space(4.0);
+            ui.label(RichText::new(value).strong().size(24.0).color(text_col));
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(sub)
+                    .small()
+                    .color(Color32::from_rgb(148, 163, 184)),
+            );
+        });
 }
 
 fn parse_hex_color(hex: &str) -> Color32 {

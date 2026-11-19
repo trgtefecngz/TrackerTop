@@ -23,9 +23,9 @@ TrackerTop replaces blind `grep` loops and full-file reads for AI coding agents 
 ## Quick Start
 
 ### Option A: Download Portable Windows App (No Rust Required)
-1. Download **`TrackerTop-v0.3.0-windows-x64.exe`** from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
+1. Download **`TrackerTop-v0.4.0-windows-x64.exe`** from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
 2. Double-click to open the offline native desktop app (no console window, no installation needed).
-3. Click **Connect Claude Code (Global)** and **+ Add Project**.
+3. Click **Connect AI Agents** (Claude Code, Cursor, Codex CLI, Windsurf, or copy universal MCP JSON) and **+ Add**.
 
 ### Option B: Build from Source
 ```bash
@@ -51,18 +51,23 @@ cargo build --release
 
 ---
 
-## MCP Tools Exposed to AI Agents
+## MCP Tools Exposed to AI Agents (15 Tools)
 
 | Tool | Purpose |
 |---|---|
-| `repo_map` | Compact architectural overview: languages, God Nodes (PageRank hubs), and module clusters |
+| `repo_map` | Compact architectural overview: languages, God Nodes, module clusters, and saved project notes |
 | `task_context` | Flagship single-shot packer: exact code for core targets + 1-hop dependency signatures inside `max_tokens` |
+| `smart_grep` | Graph-aware text search (replaces raw grep) — tags every match with its enclosing function/struct/shader |
 | `file_outline` | Signatures and line ranges only (~85% fewer tokens than reading the whole file) |
-| `read_symbol` | Exact source lines for one symbol + 1-hop caller/callee signatures |
+| `read_symbol` | Exact source lines for one symbol + 1-hop caller/callee signatures + attached AI memory notes |
+| `read_symbols_batch` | Reads 2–8 symbols in a single round-trip within a shared token budget |
 | `find_symbol` | Hybrid lexical + PageRank search across all registered languages |
 | `call_graph` | Directed N-hop callers and callees around any symbol |
 | `impact_analysis` | Blast radius before refactoring: direct dependents, transitive dependents, and linked tests |
+| `diff_impact` | Git-powered blast radius for uncommitted / latest changes + git co-changing files + tests |
+| `health_check` | Token-bloat warnings (>=3.5K tok), circular dependency cycles, and potential orphan code files |
 | `shortest_path` | Shortest dependency path connecting two symbols or files |
+| `remember` / `recall` | Persistent AI architectural memory auto-injected into future sessions |
 | `token_stats` | Real cumulative tokens saved and estimated USD cost reduction |
 
 ---

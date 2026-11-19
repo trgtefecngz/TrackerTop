@@ -1,5 +1,5 @@
 use crate::model::{
-    Edge, EdgeKind, FileRecord, Symbol, SymbolKind, TelemetryEntry, TokenStatsSummary,
+    Edge, EdgeKind, FileRecord, ProjectNote, Symbol, SymbolKind, TelemetryEntry, TokenStatsSummary,
     ToolSavingsBreakdown,
 };
 use crate::tokens::estimate_usd_saved;
@@ -100,11 +100,19 @@ impl Database {
                 latency_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_raw_refs_file ON raw_refs(file_path);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+            CREATE INDEX IF NOT EXISTS idx_notes_target ON notes(target);
             ",
         )?;
         Ok(())
@@ -444,6 +452,67 @@ impl Database {
 
     pub fn clear_telemetry(&self) -> Result<()> {
         self.conn.execute("DELETE FROM telemetry", [])?;
+        Ok(())
+    }
+
+    pub fn add_note(&self, target: &str, content: &str) -> Result<i64> {
+        let ts = Utc::now().to_rfc3339();
+        let clean_target = if target.trim().is_empty() {
+            "project"
+        } else {
+            target.trim()
+        };
+        self.conn.execute(
+            "INSERT INTO notes (target, content, created_at) VALUES (?1, ?2, ?3)",
+            params![clean_target, content.trim(), ts],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_notes(&self, filter: Option<&str>) -> Result<Vec<ProjectNote>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, target, content, created_at FROM notes ORDER BY id DESC LIMIT 100",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProjectNote {
+                    id: r.get(0)?,
+                    target: r.get(1)?,
+                    content: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if let Some(q) = filter {
+            let ql = q.trim().to_ascii_lowercase();
+            if !ql.is_empty() {
+                return Ok(rows
+                    .into_iter()
+                    .filter(|n| {
+                        n.target.to_ascii_lowercase().contains(&ql)
+                            || n.content.to_ascii_lowercase().contains(&ql)
+                    })
+                    .collect());
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn find_notes_for_targets(&self, targets: &[&str]) -> Result<Vec<ProjectNote>> {
+        let all = self.list_notes(None)?;
+        let lower_targets: Vec<String> = targets.iter().map(|t| t.to_ascii_lowercase()).collect();
+        Ok(all
+            .into_iter()
+            .filter(|n| {
+                let nt = n.target.to_ascii_lowercase();
+                lower_targets.iter().any(|t| nt == *t || t.contains(&nt) || nt.contains(t))
+            })
+            .collect())
+    }
+
+    pub fn delete_note(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
         Ok(())
     }
 }

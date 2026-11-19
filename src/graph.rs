@@ -37,6 +37,13 @@ pub struct ImpactReport {
     pub affected_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthReport {
+    pub bloated_files: Vec<(String, usize, usize)>, // (path, tokens, lines)
+    pub circular_groups: Vec<Vec<String>>,          // strongly connected file cycles (>= 2 files)
+    pub orphan_files: Vec<String>,                  // code files with 0 incoming non-containment edges
+}
+
 pub struct CodeGraph {
     pub files: HashMap<String, FileRecord>,
     pub symbols: HashMap<String, Symbol>,
@@ -351,6 +358,93 @@ impl CodeGraph {
             .filter_map(|idx| self.symbols.get(&self.graph[idx]))
             .collect();
         Some(syms)
+    }
+
+    /// Computes AI-focused repository health diagnostics:
+    /// - Bloated files (> 3,500 tokens) that hurt LLM context efficiency
+    /// - Circular file dependency cycles (via Tarjan SCC)
+    /// - Orphan code files with 0 incoming references
+    pub fn health_report(&self) -> HealthReport {
+        // 1. Token-bloat files
+        let mut bloated_files: Vec<(String, usize, usize)> = self
+            .files
+            .values()
+            .filter(|f| f.token_count >= 3500)
+            .map(|f| (f.path.clone(), f.token_count, f.line_count))
+            .collect();
+        bloated_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // 2. Build directed file-level dependency graph (excluding CoChanges & Contains)
+        let mut file_graph: DiGraph<String, ()> = DiGraph::new();
+        let mut path_to_idx: HashMap<String, NodeIndex> = HashMap::new();
+        let mut sorted_paths: Vec<String> = self.files.keys().cloned().collect();
+        sorted_paths.sort();
+        for p in &sorted_paths {
+            let idx = file_graph.add_node(p.clone());
+            path_to_idx.insert(p.clone(), idx);
+        }
+        let mut seen_file_edges: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
+        let mut has_incoming: HashSet<String> = HashSet::new();
+
+        for e in &self.edges {
+            if matches!(e.kind, EdgeKind::Contains | EdgeKind::CoChanges) {
+                continue;
+            }
+            let (Some(src), Some(tgt)) =
+                (self.symbols.get(&e.source_id), self.symbols.get(&e.target_id))
+            else {
+                continue;
+            };
+            if src.file_path == tgt.file_path {
+                continue;
+            }
+            has_incoming.insert(tgt.file_path.clone());
+            if let (Some(&si), Some(&ti)) =
+                (path_to_idx.get(&src.file_path), path_to_idx.get(&tgt.file_path))
+            {
+                if seen_file_edges.insert((si, ti)) {
+                    file_graph.add_edge(si, ti, ());
+                }
+            }
+        }
+
+        // Strongly connected components of size >= 2 are real circular dependency cycles
+        let mut circular_groups: Vec<Vec<String>> = petgraph::algo::tarjan_scc(&file_graph)
+            .into_iter()
+            .filter(|scc| scc.len() >= 2)
+            .map(|scc| {
+                let mut names: Vec<String> =
+                    scc.into_iter().map(|i| file_graph[i].clone()).collect();
+                names.sort();
+                names
+            })
+            .collect();
+        circular_groups.sort_by(|a, b| b.len().cmp(&a.len()));
+
+        // 3. Orphan code files (excluding obvious entry points, tests, docs, configs)
+        let mut orphan_files: Vec<String> = self
+            .files
+            .values()
+            .filter(|f| !matches!(f.language.as_str(), "markdown" | "toml"))
+            .filter(|f| !has_incoming.contains(&f.path))
+            .filter(|f| {
+                let base = f.path.rsplit('/').next().unwrap_or(&f.path);
+                !matches!(
+                    base,
+                    "main.rs" | "lib.rs" | "mod.rs" | "build.rs" | "index.html"
+                ) && !f.path.starts_with("tests/")
+                    && !f.path.starts_with("examples/")
+                    && !f.path.contains("/tests/")
+            })
+            .map(|f| f.path.clone())
+            .collect();
+        orphan_files.sort();
+
+        HealthReport {
+            bloated_files,
+            circular_groups,
+            orphan_files,
+        }
     }
 }
 

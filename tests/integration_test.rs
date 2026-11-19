@@ -257,3 +257,63 @@ fn open_language_registry_accepts_custom_community_language() {
     assert_eq!(stats.total_files, 1);
     assert_eq!(stats.total_symbols, 2); // file + greet_world
 }
+
+#[test]
+fn v04_smart_grep_batch_memory_health_and_rust_wgsl_bridge() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("shaders")).unwrap();
+    std::fs::write(
+        root.join("shaders/sky.wgsl"),
+        r#"
+@fragment
+fn fs_sky() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.2, 0.5, 0.9, 1.0);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/renderer.rs"),
+        r#"
+pub fn load_sky_shader() -> &'static str {
+    include_str!("../shaders/sky.wgsl")
+}
+
+pub fn render_frame() -> &'static str {
+    let tag = "SKY_RENDER_PASS";
+    let _ = load_sky_shader();
+    tag
+}
+"#,
+    )
+    .unwrap();
+
+    index_repository(root, false).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    // 1. Rust <-> WGSL asset bridge should connect renderer.rs -> shaders/sky.wgsl
+    let path_res = engine.shortest_path("src/renderer.rs", "shaders/sky.wgsl", 600).unwrap();
+    assert!(path_res.text.contains("sky.wgsl"));
+
+    // 2. smart_grep should tag enclosing symbol `render_frame`
+    let grep_res = engine.smart_grep("SKY_RENDER_PASS", None, 800).unwrap();
+    assert!(grep_res.text.contains("render_frame"));
+    assert!(grep_res.text.contains("SKY_RENDER_PASS"));
+
+    // 3. Persistent AI memory auto-injects into read_symbol
+    engine
+        .remember("render_frame", "Must run after shadow pass")
+        .unwrap();
+    let batch_res = engine
+        .read_symbols_batch(&["render_frame".to_string(), "fs_sky".to_string()], false, 1200)
+        .unwrap();
+    assert!(batch_res.text.contains("Must run after shadow pass"));
+    assert!(batch_res.text.contains("fs_sky"));
+
+    // 4. Health check runs cleanly
+    let health = engine.health_check(800).unwrap();
+    assert!(health.text.contains("# CODE HEALTH CHECK"));
+}

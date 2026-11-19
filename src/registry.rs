@@ -131,6 +131,18 @@ pub fn remove_project(repo_path: &str) -> Result<()> {
     save_registry_file(&reg)
 }
 
+/// Removes a project from the list and optionally deletes its local `.trackertop/` cache folder.
+pub fn remove_project_with_cache(repo_path: &str, delete_cache: bool) -> Result<()> {
+    remove_project(repo_path)?;
+    if delete_cache {
+        let cache_dir = Path::new(repo_path).join(".trackertop");
+        if cache_dir.exists() {
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+    Ok(())
+}
+
 pub fn list_projects() -> Vec<ProjectEntry> {
     let mut reg = load_registry_file();
     reg.projects.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));

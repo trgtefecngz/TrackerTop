@@ -44,6 +44,9 @@ impl LanguageExtractor for RustExtractor {
         let bytes = source.as_bytes();
 
         walk_items(root, file_path, bytes, &file_id, None, &mut out);
+        // Bridge Rust string literals to local shaders/assets (.wgsl, .html, .toml, .ps1)
+        let mut seen_assets = HashSet::new();
+        collect_asset_string_refs(root, bytes, &file_id, &mut seen_assets, &mut out);
         Ok(out)
     }
 }
@@ -572,4 +575,49 @@ fn is_builtin_rust_type(name: &str) -> bool {
             | "Ord"
             | "PartialOrd"
     )
+}
+
+/// Bridges Rust string literals (e.g. `include_str!("shaders/sky.wgsl")`, `"assets/stone.toml"`)
+/// directly to local shader/web/config/script files in the graph.
+fn collect_asset_string_refs(
+    node: Node,
+    bytes: &[u8],
+    file_id: &str,
+    seen: &mut HashSet<String>,
+    out: &mut ParsedFile,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(child.kind(), "string_literal" | "raw_string_literal") {
+            let raw = node_text(child, bytes).trim();
+            let unquoted = raw
+                .trim_start_matches('r')
+                .trim_matches('#')
+                .trim_matches('"')
+                .trim();
+            if unquoted.len() >= 5
+                && unquoted.len() <= 160
+                && !unquoted.contains('\n')
+                && !unquoted.contains(' ')
+                && (unquoted.ends_with(".wgsl")
+                    || unquoted.ends_with(".html")
+                    || unquoted.ends_with(".htm")
+                    || unquoted.ends_with(".toml")
+                    || unquoted.ends_with(".ps1")
+                    || unquoted.ends_with(".psm1"))
+            {
+                let norm = unquoted.replace('\\', "/").trim_start_matches("./").to_string();
+                if seen.insert(norm.clone()) {
+                    out.refs.push(RawReference {
+                        source_symbol_id: file_id.to_string(),
+                        target_name: norm,
+                        kind: EdgeKind::Imports,
+                        line: child.start_position().row + 1,
+                    });
+                }
+            }
+        } else {
+            collect_asset_string_refs(child, bytes, file_id, seen, out);
+        }
+    }
 }

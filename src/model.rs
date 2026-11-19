@@ -106,6 +106,7 @@ pub enum EdgeKind {
     UsesType,
     Tests,
     References,
+    CoChanges,
 }
 
 impl EdgeKind {
@@ -118,6 +119,7 @@ impl EdgeKind {
             Self::UsesType => "USES_TYPE",
             Self::Tests => "TESTS",
             Self::References => "REFERENCES",
+            Self::CoChanges => "CO_CHANGES",
         }
     }
 
@@ -129,6 +131,7 @@ impl EdgeKind {
             "IMPLEMENTS" => Self::Implements,
             "USES_TYPE" => Self::UsesType,
             "TESTS" => Self::Tests,
+            "CO_CHANGES" => Self::CoChanges,
             _ => Self::References,
         }
     }
@@ -217,4 +220,13 @@ pub struct ToolSavingsBreakdown {
     pub baseline_tokens: usize,
     pub tokens_saved: usize,
     pub savings_percent: f64,
+}
+
+/// Persistent AI/developer architectural memory note stored per repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectNote {
+    pub id: i64,
+    pub target: String, // "project", file path, or symbol name
+    pub content: String,
+    pub created_at: String,
 }

@@ -142,7 +142,9 @@ pub fn index_repository_with_registry(
     let all_symbols = db.load_all_symbols()?;
     let total_edges = if changed {
         let all_refs = db.load_all_raw_refs()?;
-        let resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
+        let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
+        let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
+        resolved.extend(crate::git::extract_cochange_edges(repo_root, &indexed_paths));
         let count = resolved.len();
         db.replace_edges(&resolved)?;
         count
@@ -371,7 +373,7 @@ fn resolve_edges(
                     }
                 }
             }
-            EdgeKind::Contains => {}
+            EdgeKind::Contains | EdgeKind::CoChanges => {}
         }
 
         let weight = match rref.kind {
@@ -382,6 +384,7 @@ fn resolve_edges(
             EdgeKind::UsesType => 0.9,
             EdgeKind::References => 0.6,
             EdgeKind::Contains => 1.0,
+            EdgeKind::CoChanges => 1.1,
         };
 
         for tgt in resolved_targets {

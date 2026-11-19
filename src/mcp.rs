@@ -65,7 +65,7 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
                 "name": "trackertop",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph for Rust, HTML, WGSL, and PowerShell. Prefer task_context, repo_map, file_outline, read_symbol, and impact_analysis BEFORE running broad grep or reading full files to save 80-95% tokens."
+            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -87,7 +87,10 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
     }
 }
 
-fn dispatch_tool_call(engine: &TrackerEngine, params: &Value) -> std::result::Result<Value, (i32, String)> {
+fn dispatch_tool_call(
+    engine: &TrackerEngine,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -124,6 +127,33 @@ fn dispatch_tool_call(engine: &TrackerEngine, params: &Value) -> std::result::Re
                 .read_symbol(symbol, include_deps, max_tokens)
                 .map(|q| q.text)
         }
+        "read_symbols_batch" => {
+            let symbols: Vec<String> = args
+                .get("symbols")
+                .and_then(Value::as_array)
+                .ok_or((-32602, "Missing required array argument `symbols`".to_string()))?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            let include_deps = args
+                .get("include_deps")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            engine
+                .read_symbols_batch(&symbols, include_deps, max_tokens)
+                .map(|q| q.text)
+        }
+        "smart_grep" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "Missing required argument `pattern`".to_string()))?;
+            let file_filter = args.get("file_filter").and_then(Value::as_str);
+            engine
+                .smart_grep(pattern, file_filter, max_tokens)
+                .map(|q| q.text)
+        }
         "find_symbol" => {
             let query = args
                 .get("query")
@@ -150,6 +180,8 @@ fn dispatch_tool_call(engine: &TrackerEngine, params: &Value) -> std::result::Re
                 .impact_analysis(symbol, depth, max_tokens)
                 .map(|q| q.text)
         }
+        "diff_impact" => engine.diff_impact(max_tokens).map(|q| q.text),
+        "health_check" => engine.health_check(max_tokens).map(|q| q.text),
         "task_context" => {
             let task = args
                 .get("task")
@@ -167,6 +199,18 @@ fn dispatch_tool_call(engine: &TrackerEngine, params: &Value) -> std::result::Re
                 .and_then(Value::as_str)
                 .ok_or((-32602, "Missing required argument `to`".to_string()))?;
             engine.shortest_path(from, to, max_tokens).map(|q| q.text)
+        }
+        "remember" => {
+            let target = args.get("target").and_then(Value::as_str).unwrap_or("project");
+            let note = args
+                .get("note")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "Missing required argument `note`".to_string()))?;
+            engine.remember(target, note)
+        }
+        "recall" => {
+            let query = args.get("query").and_then(Value::as_str);
+            engine.recall(query)
         }
         "token_stats" => engine.token_stats().map(|s| {
             format!(
@@ -198,7 +242,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "repo_map",
-            "description": "Start here in any unfamiliar repo. Returns a compact architectural map: language breakdown, top architectural hubs (God Nodes), and module clusters within a strict token budget.",
+            "description": "Start here in any unfamiliar repo. Returns a compact architectural map: language breakdown, top architectural hubs (God Nodes), module clusters, and saved project memory notes within a strict token budget.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -219,6 +263,19 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "smart_grep",
+            "description": "Graph-aware text search (replaces raw grep). Finds string/error/binding matches across indexed files and tags every matching line with its enclosing function, struct, or shader symbol.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Substring to search for (case-insensitive)" },
+                    "file_filter": { "type": "string", "description": "Optional path substring filter (e.g. 'shaders/' or '.rs')" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1200)" }
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
             "name": "file_outline",
             "description": "Returns only symbol signatures and line ranges for a file instead of reading the entire file (saves ~85% tokens).",
             "inputSchema": {
@@ -232,7 +289,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_symbol",
-            "description": "Surgically reads ONLY the exact lines of one function, struct, shader entry point, or PowerShell function plus 1-hop callee/caller signatures.",
+            "description": "Surgically reads ONLY the exact lines of one function, struct, shader entry point, or PowerShell function plus 1-hop callee/caller signatures and attached memory notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -244,8 +301,21 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "read_symbols_batch",
+            "description": "Reads 2-8 symbols in a single round-trip within a shared token budget (much faster and cheaper than multiple read_symbol calls).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbols": { "type": "array", "items": { "type": "string" }, "description": "List of symbol names to read" },
+                    "include_deps": { "type": "boolean", "description": "Include 1-hop callee signatures (default false)" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 2200)" }
+                },
+                "required": ["symbols"]
+            }
+        },
+        {
             "name": "find_symbol",
-            "description": "Hybrid lexical + PageRank search across Rust, HTML, WGSL, PowerShell, and Docs symbols.",
+            "description": "Hybrid lexical + PageRank search across all registered languages.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -283,6 +353,26 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "diff_impact",
+            "description": "Git-powered blast radius for current uncommitted changes (or latest commit): lists dependent files, frequently co-changing files from git history, and linked tests to re-run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1200)" }
+                }
+            }
+        },
+        {
+            "name": "health_check",
+            "description": "Code health & AI-friendliness diagnostics: finds token-bloated files (>=3500 tok), circular dependency cycles, and potential orphan code files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1000)" }
+                }
+            }
+        },
+        {
             "name": "shortest_path",
             "description": "Finds the shortest dependency/call path connecting two symbols or files.",
             "inputSchema": {
@@ -293,6 +383,28 @@ fn tool_definitions() -> Value {
                     "max_tokens": { "type": "integer", "description": "Token budget cap (default 600)" }
                 },
                 "required": ["from", "to"]
+            }
+        },
+        {
+            "name": "remember",
+            "description": "Saves a persistent architectural note attached to a symbol, file path, or 'project'. Automatically surfaced in future sessions when reading that target.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Symbol name, file path, or 'project'" },
+                    "note": { "type": "string", "description": "Concise architectural rule, gotcha, or invariant" }
+                },
+                "required": ["note"]
+            }
+        },
+        {
+            "name": "recall",
+            "description": "Recalls saved persistent architectural memory notes for this repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Optional filter keyword" }
+                }
             }
         },
         {

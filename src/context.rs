@@ -159,6 +159,16 @@ impl TrackerEngine {
             ));
         }
 
+        // Include persistent project-level AI memory notes if any exist
+        if let Ok(notes) = db.find_notes_for_targets(&["project"]) {
+            if !notes.is_empty() {
+                out.push_str("\n## Saved Project Memory\n");
+                for n in notes.into_iter().take(6) {
+                    out.push_str(&format!("- [{}] {}\n", n.target, n.content));
+                }
+            }
+        }
+
         // Baseline: exploring a repo typically reads up to 15 largest/hub files (or full repo if small)
         let mut file_toks: Vec<usize> = cg.files.values().map(|f| f.token_count).collect();
         file_toks.sort_by(|a, b| b.cmp(a));
@@ -290,6 +300,11 @@ impl TrackerEngine {
         );
         if !sym.doc_summary.is_empty() {
             out.push_str(&format!("Doc: {}\n", sym.doc_summary));
+        }
+        if let Ok(notes) = db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path]) {
+            for n in notes.into_iter().take(4) {
+                out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
+            }
         }
         out.push_str("```\n");
         for (i, line) in lines[s_idx..e_idx].iter().enumerate() {
@@ -793,6 +808,376 @@ impl TrackerEngine {
             touched_files.len(),
             start,
         )
+    }
+
+    /// 9. Graph-aware text search: finds literal/case-insensitive matches across indexed files
+    /// and tags every matching line with its enclosing symbol (`fn`, `struct`, shader, etc.).
+    pub fn smart_grep(
+        &self,
+        pattern: &str,
+        file_filter: Option<&str>,
+        max_tokens: usize,
+    ) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let (db, cg) = self.load_fresh()?;
+        let pat_lower = pattern.trim().to_ascii_lowercase();
+        if pat_lower.is_empty() {
+            return self.finalize(
+                &db,
+                "smart_grep",
+                pattern,
+                "Empty search pattern.".to_string(),
+                max_tokens,
+                0,
+                0,
+                start,
+            );
+        }
+
+        let filter_l = file_filter.map(|f| f.trim().to_ascii_lowercase());
+        let mut sorted_files: Vec<&String> = cg.files.keys().collect();
+        sorted_files.sort();
+
+        let mut out = format!("# SMART GREP `{pattern}`\n");
+        let mut total_hits = 0usize;
+        let mut matched_files = Vec::new();
+
+        for rel_path in sorted_files {
+            if let Some(ref flt) = filter_l {
+                if !flt.is_empty() && !rel_path.to_ascii_lowercase().contains(flt) {
+                    continue;
+                }
+            }
+            let abs = self.repo_root.join(rel_path);
+            let Ok(content) = std::fs::read_to_string(&abs) else {
+                continue;
+            };
+            if !content.to_ascii_lowercase().contains(&pat_lower) {
+                continue;
+            }
+
+            let file_syms: Vec<&Symbol> = cg
+                .symbols_by_file
+                .get(rel_path)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| cg.symbols.get(id))
+                        .filter(|s| s.kind != SymbolKind::File && s.kind != SymbolKind::Impl)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut file_hits = Vec::new();
+            for (idx, line) in content.lines().enumerate() {
+                if line.to_ascii_lowercase().contains(&pat_lower) {
+                    let line_no = idx + 1;
+                    // Find tightest enclosing symbol
+                    let owner = file_syms
+                        .iter()
+                        .filter(|s| s.start_line <= line_no && line_no <= s.end_line)
+                        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
+                        .map(|s| format!("{} [{}]", s.qualified_name, s.kind.as_str()))
+                        .unwrap_or_else(|| "top-level".to_string());
+                    file_hits.push((line_no, owner, line.trim().to_string()));
+                    if file_hits.len() >= 12 {
+                        break;
+                    }
+                }
+            }
+
+            if !file_hits.is_empty() {
+                matched_files.push(rel_path.clone());
+                out.push_str(&format!("\n## {rel_path}\n"));
+                for (ln, owner, txt) in file_hits {
+                    total_hits += 1;
+                    let snippet = if txt.chars().count() > 110 {
+                        let s: String = txt.chars().take(107).collect();
+                        format!("{s}...")
+                    } else {
+                        txt
+                    };
+                    out.push_str(&format!("- L{ln} ({owner}): `{snippet}`\n"));
+                }
+                if total_hits >= 50 {
+                    break;
+                }
+            }
+        }
+
+        if total_hits == 0 {
+            out.push_str("No matches found.\n");
+        }
+
+        let baseline: usize = matched_files
+            .iter()
+            .filter_map(|p| cg.files.get(p))
+            .map(|f| f.token_count)
+            .sum();
+
+        self.finalize(
+            &db,
+            "smart_grep",
+            pattern,
+            out,
+            if max_tokens == 0 { 1200 } else { max_tokens },
+            baseline,
+            matched_files.len(),
+            start,
+        )
+    }
+
+    /// 10. Reads multiple symbols in a single MCP round-trip strictly within `max_tokens`.
+    pub fn read_symbols_batch(
+        &self,
+        symbol_queries: &[String],
+        include_deps: bool,
+        max_tokens: usize,
+    ) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let (db, cg) = self.load_fresh()?;
+        let budget = if max_tokens == 0 { 2200 } else { max_tokens };
+
+        let mut out = format!("# BATCH READ ({} requested)\n", symbol_queries.len());
+        let mut touched_files = HashSet::new();
+
+        for q in symbol_queries.iter().take(10) {
+            let Some(sym) = cg.resolve_symbol(q) else {
+                out.push_str(&format!("\n## `{q}` — NOT FOUND\n"));
+                continue;
+            };
+            touched_files.insert(sym.file_path.clone());
+            let abs = self.repo_root.join(&sym.file_path);
+            let content = std::fs::read_to_string(&abs).unwrap_or_default();
+            let lines: Vec<&str> = content.lines().collect();
+            let s_idx = sym.start_line.saturating_sub(1).min(lines.len());
+            let e_idx = sym.end_line.min(lines.len());
+
+            out.push_str(&format!(
+                "\n## {} [{}] ({}:L{}-{})\n",
+                sym.qualified_name,
+                sym.kind.as_str(),
+                sym.file_path,
+                sym.start_line,
+                sym.end_line
+            ));
+            if let Ok(notes) =
+                db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path])
+            {
+                for n in notes.into_iter().take(2) {
+                    out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
+                }
+            }
+            out.push_str("```\n");
+            for (i, line) in lines[s_idx..e_idx].iter().enumerate() {
+                out.push_str(&format!("{:>4} | {line}\n", sym.start_line + i));
+            }
+            out.push_str("```\n");
+
+            if include_deps {
+                let (_, callees) = cg.neighborhood(&sym.id, 1);
+                for (_, kind, dep) in callees.into_iter().take(5) {
+                    touched_files.insert(dep.file_path.clone());
+                    out.push_str(&format!(
+                        "- [{}] {} ({}:L{}) `{}`\n",
+                        kind.as_str(),
+                        dep.qualified_name,
+                        dep.file_path,
+                        dep.start_line,
+                        dep.signature
+                    ));
+                }
+            }
+        }
+
+        let baseline: usize = touched_files
+            .iter()
+            .filter_map(|p| cg.files.get(p))
+            .map(|f| f.token_count)
+            .sum();
+
+        self.finalize(
+            &db,
+            "read_symbols_batch",
+            &symbol_queries.join(", "),
+            out,
+            budget,
+            baseline,
+            touched_files.len(),
+            start,
+        )
+    }
+
+    /// 11. Git-powered diff blast radius: maps uncommitted (or latest commit) changed files
+    /// to dependent files, git co-changing files, and linked tests to re-run.
+    pub fn diff_impact(&self, max_tokens: usize) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let (db, cg) = self.load_fresh()?;
+        let (scope_label, changed_files) = crate::git::changed_files_for_diff(&self.repo_root);
+
+        if changed_files.is_empty() {
+            return self.finalize(
+                &db,
+                "diff_impact",
+                &scope_label,
+                format!("# DIFF IMPACT ({scope_label})\nNo modified files detected."),
+                max_tokens,
+                0,
+                0,
+                start,
+            );
+        }
+
+        let mut out = format!(
+            "# DIFF IMPACT ({scope_label} — {} modified files)\n",
+            changed_files.len()
+        );
+        let mut affected_files: HashSet<String> = HashSet::new();
+        let mut cochange_suggestions: HashSet<String> = HashSet::new();
+        let mut tests_to_run: HashSet<String> = HashSet::new();
+
+        for path in &changed_files {
+            affected_files.insert(path.clone());
+            out.push_str(&format!("- Modified: `{path}`\n"));
+            if let Some(sym_ids) = cg.symbols_by_file.get(path) {
+                for sid in sym_ids {
+                    if let Some(imp) = cg.impact_analysis(sid, 2) {
+                        for af in imp.affected_files {
+                            affected_files.insert(af);
+                        }
+                        for t in imp.related_tests {
+                            tests_to_run.insert(format!("{} ({}:L{})", t.name, t.file_path, t.start_line));
+                        }
+                    }
+                    // Check CO_CHANGES neighbors
+                    let (_, outgoing) = cg.neighborhood(sid, 1);
+                    for (_, kind, nbr) in outgoing {
+                        if kind == crate::model::EdgeKind::CoChanges
+                            && !changed_files.contains(&nbr.file_path)
+                        {
+                            cochange_suggestions.insert(nbr.file_path.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut dep_files: Vec<String> = affected_files
+            .iter()
+            .filter(|f| !changed_files.contains(*f))
+            .cloned()
+            .collect();
+        dep_files.sort();
+
+        if !dep_files.is_empty() {
+            out.push_str(&format!("\n## Impacted Dependent Files ({})\n", dep_files.len()));
+            for f in dep_files.iter().take(20) {
+                out.push_str(&format!("- `{f}`\n"));
+            }
+        }
+
+        if !cochange_suggestions.is_empty() {
+            let mut co: Vec<String> = cochange_suggestions.into_iter().collect();
+            co.sort();
+            out.push_str("\n## Git Co-Change Alert (Often Modified Together)\n");
+            for f in co.iter().take(12) {
+                out.push_str(&format!("- `{f}` (check if it needs a matching update)\n"));
+            }
+        }
+
+        if !tests_to_run.is_empty() {
+            let mut ts: Vec<String> = tests_to_run.into_iter().collect();
+            ts.sort();
+            out.push_str("\n## Linked Tests to Re-run\n");
+            for t in ts {
+                out.push_str(&format!("- {t}\n"));
+            }
+        }
+
+        let baseline: usize = affected_files
+            .iter()
+            .filter_map(|p| cg.files.get(p))
+            .map(|f| f.token_count)
+            .sum();
+
+        self.finalize(
+            &db,
+            "diff_impact",
+            &scope_label,
+            out,
+            if max_tokens == 0 { 1200 } else { max_tokens },
+            baseline,
+            affected_files.len(),
+            start,
+        )
+    }
+
+    /// 12. Repository health diagnostics: token-bloat files, circular dependencies, orphan files.
+    pub fn health_check(&self, max_tokens: usize) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let (db, cg) = self.load_fresh()?;
+        let hr = cg.health_report();
+
+        let mut out = format!(
+            "# CODE HEALTH CHECK\nBloated files (>=3500 tok): {} | Circular clusters: {} | Orphan code files: {}\n",
+            hr.bloated_files.len(),
+            hr.circular_groups.len(),
+            hr.orphan_files.len()
+        );
+
+        if !hr.bloated_files.is_empty() {
+            out.push_str("\n## Token Bloat Warnings (Consider Splitting for Better AI Accuracy)\n");
+            for (p, toks, lines) in hr.bloated_files.iter().take(15) {
+                out.push_str(&format!("- `{p}` — {toks} tok ({lines} lines)\n"));
+            }
+        }
+        if !hr.circular_groups.is_empty() {
+            out.push_str("\n## Circular Dependency Cycles\n");
+            for cyc in hr.circular_groups.iter().take(10) {
+                out.push_str(&format!("- Cycle ({} files): {}\n", cyc.len(), cyc.join(" <-> ")));
+            }
+        }
+        if !hr.orphan_files.is_empty() {
+            out.push_str("\n## Potential Orphan / Unreferenced Code Files\n");
+            for p in hr.orphan_files.iter().take(20) {
+                out.push_str(&format!("- `{p}`\n"));
+            }
+        }
+
+        let baseline: usize = cg.files.values().map(|f| f.token_count).sum::<usize>().min(40_000);
+        self.finalize(
+            &db,
+            "health_check",
+            "*",
+            out,
+            if max_tokens == 0 { 1000 } else { max_tokens },
+            baseline,
+            cg.files.len(),
+            start,
+        )
+    }
+
+    /// 13. Persists an architectural memory note attached to a symbol, file, or `"project"`.
+    pub fn remember(&self, target: &str, note: &str) -> Result<String> {
+        let db = Database::open_for_repo(&self.repo_root)?;
+        let id = db.add_note(target, note)?;
+        Ok(format!(
+            "Saved memory note #{id} for `{}` — future sessions will see it automatically.",
+            if target.trim().is_empty() { "project" } else { target.trim() }
+        ))
+    }
+
+    /// 14. Recalls saved architectural memory notes.
+    pub fn recall(&self, query: Option<&str>) -> Result<String> {
+        let db = Database::open_for_repo(&self.repo_root)?;
+        let notes = db.list_notes(query)?;
+        if notes.is_empty() {
+            return Ok("No saved memory notes yet. Use `remember(target, note)` to store architectural facts.".to_string());
+        }
+        let mut out = format!("# SAVED MEMORY NOTES ({})\n", notes.len());
+        for n in notes {
+            out.push_str(&format!("- #{} [{}]: {}\n", n.id, n.target, n.content));
+        }
+        Ok(out)
     }
 
     /// 8. Token-savings telemetry summary.

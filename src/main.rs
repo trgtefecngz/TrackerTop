@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use trackertop::context::TrackerEngine;
 use trackertop::db::Database;
 use trackertop::indexer::index_repository;
-use trackertop::install::install_claude_code;
+use trackertop::install::{AiAgentKind, install_agent, install_claude_code};
 use trackertop::mcp::run_mcp_server;
 use trackertop::parser::default_registry;
 use trackertop::registry::load_global_overview;
@@ -156,6 +156,24 @@ enum QueryAction {
         #[arg(long, default_value_t = 600)]
         max_tokens: usize,
     },
+    /// Graph-aware text search tagging every match with its enclosing symbol
+    Grep {
+        pattern: String,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 1200)]
+        max_tokens: usize,
+    },
+    /// Git diff blast radius + co-changing files + linked tests
+    Diff {
+        #[arg(long, default_value_t = 1200)]
+        max_tokens: usize,
+    },
+    /// Code health diagnostics (token bloat, circular cycles, orphans)
+    Health {
+        #[arg(long, default_value_t = 1000)]
+        max_tokens: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -231,6 +249,13 @@ fn main() -> Result<()> {
                     to,
                     max_tokens,
                 } => engine.shortest_path(&from, &to, max_tokens)?,
+                QueryAction::Grep {
+                    pattern,
+                    filter,
+                    max_tokens,
+                } => engine.smart_grep(&pattern, filter.as_deref(), max_tokens)?,
+                QueryAction::Diff { max_tokens } => engine.diff_impact(max_tokens)?,
+                QueryAction::Health { max_tokens } => engine.health_check(max_tokens)?,
             };
             println!("{}", res.text);
         }
@@ -311,11 +336,16 @@ fn main() -> Result<()> {
             println!("Generated Markdown summary: {}", md_path.display());
         }
         Commands::Install { target, global } => {
-            if !target.eq_ignore_ascii_case("claude") {
-                anyhow::bail!("Unsupported install target `{target}`. Supported: claude");
-            }
-            let actions = install_claude_code(&repo_root, global)?;
-            println!("TrackerTop Claude Code integration complete:");
+            let actions = match target.to_ascii_lowercase().as_str() {
+                "claude" => install_claude_code(&repo_root, global)?,
+                "cursor" => install_agent(AiAgentKind::Cursor, &repo_root)?,
+                "codex" => install_agent(AiAgentKind::Codex, &repo_root)?,
+                "windsurf" => install_agent(AiAgentKind::Windsurf, &repo_root)?,
+                _ => anyhow::bail!(
+                    "Unsupported install target `{target}`. Supported: claude, cursor, codex, windsurf"
+                ),
+            };
+            println!("TrackerTop {target} integration complete:");
             for a in actions {
                 println!("  - {a}");
             }
