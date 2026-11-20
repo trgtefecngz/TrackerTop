@@ -1258,3 +1258,60 @@ fn nested_graph_accounts_for_every_edge_on_a_real_index() {
         }
     }
 }
+
+/// Qualified Rust calls must resolve to the named type or module, never to an unrelated
+/// symbol that merely shares the last segment (`Stroke::new` is not `App::new`, and
+/// `std::fs::read` is not this project's `util::read`). Missing an edge is better than a
+/// wrong one.
+#[test]
+fn qualified_rust_calls_never_bind_to_a_namesake() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "mod app;\nmod util;\n").unwrap();
+    std::fs::write(
+        root.join("src/util.rs"),
+        "pub fn helper() {}\npub fn read() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app.rs"),
+        r#"pub struct App;
+impl App {
+    pub fn new() -> Self { App }
+    pub fn build() -> Self { Self::new() }
+}
+pub fn make_app() -> App { App::new() }
+pub fn external_ctor() { let _s = Stroke::new(1.0); }
+pub fn std_read() { let _ = std::fs::read("x"); }
+pub fn module_call() { util::helper(); crate::util::helper(); }
+pub fn variant() { let _ = Kind::New(1); }
+"#,
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+
+    let calls: Vec<(String, String)> = edge_set(root)
+        .into_iter()
+        .filter(|(_, _, k)| k == "CALLS")
+        .map(|(s, t, _)| (s, t))
+        .collect();
+    let from = |f: &str| -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|(s, _)| s.contains(&format!("::{f}#")))
+            .map(|(_, t)| t.as_str())
+            .collect()
+    };
+
+    assert_eq!(from("make_app").len(), 1, "{calls:?}");
+    assert!(from("make_app")[0].contains("::App::new#"), "{calls:?}");
+    assert_eq!(from("App::build").len(), 1, "{calls:?}");
+    assert!(from("App::build")[0].contains("::App::new#"), "{calls:?}");
+    assert!(from("external_ctor").is_empty(), "{calls:?}");
+    assert!(from("std_read").is_empty(), "{calls:?}");
+    assert!(from("variant").is_empty(), "{calls:?}");
+    let module = from("module_call");
+    assert_eq!(module.len(), 1, "{calls:?}");
+    assert!(module[0].contains("src/util.rs::helper#"), "{calls:?}");
+}

@@ -36,6 +36,13 @@ v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 - Every note is also written as Markdown in `.trackertop/notes/`. If the index database is deleted or rebuilt, the notes are restored from those files.
 - The existing notes table is migrated in place; old notes become kind `note`.
 
+### Fixed: false call edges in Rust
+- A qualified call such as `Stroke::new(...)` was resolved by its last segment alone, so it was tied to any `new` in the project. In this repository, `TrackerTopApp::new` showed 18 callers instead of 2, and `impact_analysis` reported the wrong blast radius.
+  - `Type::f` now resolves only to that exact type's function, and `Self::f` to the surrounding impl's type.
+  - `module::f` resolves only inside that module.
+  - Calls into external types and crates (`std::fs::read`), enum variants and trait paths get no edge. A missing edge is better than a wrong one.
+- Turbofish generics (`Vec::<u8>::new`) no longer cut the callee name short.
+
 ### Fixed: memory notes
 - A note surfaced for any target that merely contained its text, so a note on `run` appeared on `run_checks` and `src/runner.rs`. Targets now match exactly or by whole `::` or path segments.
 - Only the newest 100 notes were ever searched, so older notes silently stopped appearing. There is no cap now.
