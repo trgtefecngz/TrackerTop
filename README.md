@@ -32,14 +32,15 @@ Measured offline on a real **342-file, 443,561-token** multi-language game repos
 ```powershell
 irm https://raw.githubusercontent.com/trgtefecngz/TrackerTop/main/scripts/install.ps1 | iex
 ```
-*(Downloads the latest portable `.exe`, adds it to User PATH, creates a Desktop shortcut, and launches TrackerTop.)*
+*(Downloads the latest portable `.exe`, verifies its SHA256 checksum, adds it to User PATH, creates a Desktop shortcut, and launches TrackerTop.)*
 
 **macOS / Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/trgtefecngz/TrackerTop/main/scripts/install.sh | bash
 ```
+*(Detects Apple Silicon / Intel Mac / Linux x64, verifies the SHA256 checksum, and installs to `~/.local/bin`.)*
 
-**Or download directly:** grab `TrackerTop-v0.5.0-windows-x64.exe` / `TrackerTop-v0.5.0-macos-arm64` from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest).
+**Or download directly:** grab `TrackerTop-<version>-windows-x64.exe`, `TrackerTop-<version>-macos-arm64`, `TrackerTop-<version>-macos-x64` or `trackertop-<version>-linux-x64-headless` from [GitHub Releases](https://github.com/trgtefecngz/TrackerTop/releases/latest). Each binary has a matching `.sha256` file.
 
 ### Option B: Build from Source
 ```bash
