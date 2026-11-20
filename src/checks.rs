@@ -265,7 +265,58 @@ fn resolve_program(program: &str) -> String {
     }
 }
 
-/// Runs `cmd` in `root` without a shell, killing it after `timeout`.
+/// Reads a pipe in chunks into a shared buffer, so whatever arrived is available even if
+/// the reader never reaches EOF (a grandchild process still holding the pipe).
+fn spawn_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&buf);
+    let handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    (buf, handle)
+}
+
+/// Kills the process and everything it started (test runners spawn test binaries).
+fn kill_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // The child leads its own process group (see `run_command`)
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+/// Runs `cmd` in `root` without a shell. After `timeout` the whole process tree is killed
+/// and the output collected so far is returned, marked as timed out.
 pub fn run_command(
     root: &Path,
     cmd: &CheckCommand,
@@ -274,7 +325,8 @@ pub fn run_command(
 ) -> Result<CheckRun> {
     let display = cmd.display(extra);
     let started = Instant::now();
-    let mut child = Command::new(resolve_program(&cmd.program))
+    let mut command = Command::new(resolve_program(&cmd.program));
+    command
         .args(cmd.argv(extra))
         .current_dir(root)
         .stdin(Stdio::null())
@@ -283,27 +335,28 @@ pub fn run_command(
         .env("CARGO_TERM_COLOR", "never")
         .env("NO_COLOR", "1")
         .env("FORCE_COLOR", "0")
-        .env("CI", "1")
-        .spawn()
-        .with_context(|| {
-            format!(
-                "could not start `{display}` (is `{}` installed?)",
-                cmd.program
-            )
-        })?;
+        .env("CI", "1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "could not start `{display}` (is `{}` installed?)",
+            cmd.program
+        )
+    })?;
 
-    let mut stdout = child.stdout.take().context("no stdout pipe")?;
-    let mut stderr = child.stderr.take().context("no stderr pipe")?;
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
+    let stdout = child.stdout.take().context("no stdout pipe")?;
+    let stderr = child.stderr.take().context("no stderr pipe")?;
+    let (out_buf, out_reader) = spawn_reader(stdout);
+    let (err_buf, err_reader) = spawn_reader(stderr);
 
     let mut timed_out = false;
     let status = loop {
@@ -312,13 +365,25 @@ pub fn run_command(
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            let _ = child.kill();
+            kill_tree(&mut child);
             break child.wait().ok();
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let out = out_reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
+    // Give the readers a moment to drain; never block forever on a pipe a surviving
+    // grandchild still holds open.
+    let drain_deadline = Instant::now() + Duration::from_secs(3);
+    while !(out_reader.is_finished() && err_reader.is_finished()) && Instant::now() < drain_deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let take = |b: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
+        b.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+    let out = take(&out_buf);
+    let err = take(&err_buf);
     let mut output = String::from_utf8_lossy(&out).into_owned();
     if !err.is_empty() {
         if !output.is_empty() && !output.ends_with('\n') {
@@ -968,5 +1033,48 @@ error: test failed, to rerun pass `--lib`
         let missing = CheckCommand::new(CheckKind::Build, "no-such-program-xyz", &[], "test", true);
         let err = run_command(tmp.path(), &missing, &[], Duration::from_secs(5)).unwrap_err();
         assert!(format!("{err:#}").contains("could not start"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// A command that outlives the timeout is killed (with its children) and reported as
+    /// TIMEOUT instead of blocking the caller.
+    #[test]
+    fn timeout_kills_the_process_and_returns_promptly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sleeper = if cfg!(windows) {
+            CheckCommand::new(
+                CheckKind::Test,
+                // cmd starts ping as a child: killing only cmd would leave ping holding
+                // the output pipe open for 30 s
+                "cmd",
+                &["/C", "echo started & ping -n 30 127.0.0.1 >NUL"],
+                "test",
+                true,
+            )
+        } else {
+            CheckCommand::new(
+                CheckKind::Test,
+                "sh",
+                &["-c", "echo started; sleep 30 & wait"],
+                "test",
+                true,
+            )
+        };
+        let started = Instant::now();
+        let r = run_command(tmp.path(), &sleeper, &[], Duration::from_secs(3)).unwrap();
+        assert!(r.timed_out, "{r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = render(&sleeper, &r, &summarize(&r.output));
+        assert!(text.contains("RESULT: TIMEOUT"), "{text}");
+        assert!(text.contains("PARTIAL"), "{text}");
+        assert!(text.contains("started"), "partial output is kept: {text}");
     }
 }
