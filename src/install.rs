@@ -18,7 +18,11 @@ To save 80-95% context tokens and keep answers accurate, follow this order:
 3. **Never read whole large files blindly:** Call `file_outline(path="...")`, `read_symbol(symbol="...")`, or `read_symbols_batch(symbols=[...])` for multi-symbol inspection in a single round-trip.
 4. **Search strings with graph awareness:** Call `smart_grep(pattern="...")` instead of raw `grep` — every match is tagged with its enclosing function/struct/shader.
 5. **Before/after editing:** Call `impact_analysis(symbol="...")` or `diff_impact` to see direct dependents, git co-changing files, and linked tests.
-6. **Persist discoveries:** Call `remember(target="...", note="...")` when you learn an important architectural rule so future sessions automatically see it.
+6. **Know the bar:** Call `project_playbook` once to learn the build/test/lint commands and what CI runs.
+7. **Verify cheaply:** Call `run_checks(kind="test"|"lint"|"all")` instead of running tests or linters in a shell: you get only the failing tests and errors with file:line.
+8. **Catch up after changes:** Call `changes_since(since="HEAD")` to see what changed (by symbol) instead of re-reading files.
+9. **Persist discoveries:** Call `remember(target="...", note="...")` for rules, and `remember(..., kind="decision"|"dismissed", reason="...")` for decisions and rejected review leads, so later sessions do not re-investigate them.
+10. **Trust the coverage lines:** answers say when lists are cut, when a file is NOT INDEXED (read it directly) vs NOT FOUND, and when spans come from a heuristic extractor.
 "#;
 
 const CLAUDE_MD_SECTION: &str = r#"
@@ -26,6 +30,7 @@ const CLAUDE_MD_SECTION: &str = r#"
 
 This project has **TrackerTop** configured as an MCP server (`trackertop`).
 - Prefer `task_context`, `repo_map`, `smart_grep`, `file_outline`, `read_symbol`, `read_symbols_batch`, `impact_analysis`, `diff_impact`, and `remember`/`recall` **before** raw grep or full-file reads.
+- Use `project_playbook` to learn the build/test commands, `run_checks` instead of running tests/lint in a shell, and `changes_since` to catch up after edits.
 - Every TrackerTop call is strictly token-budgeted and logs real token savings (`trackertop stats`).
 "#;
 

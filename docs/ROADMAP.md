@@ -1,14 +1,14 @@
 # Roadmap
 
-## v0.7: agent productivity (in progress, `feat/v0.7-agent-tools`)
+## v0.7: agent productivity (milestones 1-3 done, awaiting review on `feat/v0.7-agent-tools`)
 
 TrackerTop is a tool for the AI agent itself. v0.7 makes an agent's work cheaper and more correct: fewer wasted tool calls, fewer wrong turns, and never a silently incomplete answer.
 
 | # | Deliverable | Status |
 |---|---|---|
 | 1 | Correctness foundation: tree-sitter TS/TSX/JS extractor; every tool output states its coverage (capped lists say how much is hidden, "not indexed" vs "not found", heuristic extractors flagged); smart_grep proven against a plain scan | Done |
-| 2 | Agent tools: `run_checks` (compact test/lint/build summary that never hides a failure), `changes_since` (what changed since an index generation or git ref), `project_playbook` (build/test/lint commands, detected vs guessed), decision memory (Markdown notes under `.trackertop/notes/`, decisions and dismissed review leads surfaced on read) | Next |
-| 3 | Honest metrics: telemetry tagged by source (MCP client, CLI, UI, tests); conservative baseline next to the upper bound, savings as a range; optional log of what the agent asked for | Planned |
+| 2 | Agent tools: `run_checks` (compact test/lint/build summary that never hides a failure), `changes_since` (what changed since an index generation or git ref), `project_playbook` (build/test/lint commands, detected vs guessed), decision memory (Markdown notes under `.trackertop/notes/`, decisions and dismissed review leads surfaced on read) | Done |
+| 3 | Honest metrics: telemetry tagged by source (MCP client, CLI, UI, tests); conservative baseline next to the upper bound, savings as a range; log of what the agent asked for | Done |
 | 4 | Nested ("matryoshka") Code Graph view: project → communities → files → symbols | Lowest priority |
 
 The graph-grounded PR review moves to v0.8.

@@ -2,7 +2,7 @@
 
 All notable changes to TrackerTop are documented here.
 
-## [Unreleased]
+## [0.7.0] - unreleased (awaiting review)
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
