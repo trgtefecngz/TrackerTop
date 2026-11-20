@@ -39,41 +39,44 @@ pub fn ensure_indexable_root(repo_root: &Path) -> Result<()> {
 
 fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
     let canon = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    // Show `C:\Users\me`, not the Windows-internal `\\?\C:\Users\me`.
+    let shown = display_path(&canon);
     let hint = "Open your AI agent inside a project folder, or pass `--repo <project-path>`.";
-    if canon.parent().is_none() {
-        bail!(
-            "TrackerTop refuses to index `{}` because it is a filesystem root. {hint}",
-            repo_root.display()
-        );
-    }
+    let Some(parent) = canon.parent() else {
+        bail!("TrackerTop refuses to index `{shown}` because it is a filesystem root. {hint}");
+    };
     if let Some(home) = home {
         let home_canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
         if home_canon == canon {
             bail!(
-                "TrackerTop refuses to index `{}` because it is your home directory. {hint}",
-                repo_root.display()
+                "TrackerTop refuses to index `{shown}` because it is your home directory. {hint}"
             );
         }
         // Catch-all user folders where terminals are often opened by accident. Only the folder
         // itself is refused (projects *inside* Desktop etc. are fine), and only when it is not
-        // a git repository on its own.
-        if !canon.join(".git").exists() {
-            for base in [home_canon.clone(), home_canon.join("OneDrive")] {
-                for name in ["Desktop", "Downloads", "Documents"] {
-                    let candidate = base.join(name);
-                    let candidate = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-                    if candidate == canon {
-                        bail!(
-                            "TrackerTop refuses to index `{}` because it is your {name} folder, \
-                             not a project. {hint}",
-                            repo_root.display()
-                        );
-                    }
-                }
+        // a git repository on its own. Name comparison only: no extra filesystem calls on the
+        // hot path (this runs on every DB open).
+        let under_home = parent == home_canon || parent == home_canon.join("OneDrive");
+        if under_home && let Some(dir_name) = canon.file_name().and_then(|n| n.to_str()) {
+            let user_folder = ["Desktop", "Downloads", "Documents"]
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(dir_name));
+            if let Some(name) = user_folder
+                && !canon.join(".git").exists()
+            {
+                bail!(
+                    "TrackerTop refuses to index `{shown}` because it is your {name} folder, \
+                     not a project. {hint}"
+                );
             }
         }
     }
     Ok(())
+}
+
+fn display_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
 /// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
