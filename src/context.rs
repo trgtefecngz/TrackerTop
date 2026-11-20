@@ -377,6 +377,20 @@ impl TrackerEngine {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
 
+        if let Some((path, from, to)) = parse_line_range(symbol_query) {
+            let text = self.read_line_range(&cg, &path, from, to);
+            return self.finalize(
+                &db,
+                "read_symbol",
+                symbol_query,
+                text,
+                max_tokens,
+                cg.files.get(&path).map_or(0, |f| f.token_count),
+                1,
+                start,
+            );
+        }
+
         let Some(sym) = cg.resolve_symbol(symbol_query) else {
             return self.finalize(
                 &db,
@@ -1795,6 +1809,19 @@ fn review_delta(
     s
 }
 
+/// `path:Lstart-end`, `path:start-end` or `path:Lline` -> (path, start, end), 1-based.
+fn parse_line_range(query: &str) -> Option<(String, usize, usize)> {
+    let (path, range) = query.trim().rsplit_once(':')?;
+    let range = range.strip_prefix('L').unwrap_or(range);
+    let (a, b) = range.split_once('-').unwrap_or((range, range));
+    let b = b.strip_prefix('L').unwrap_or(b);
+    let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    if a == 0 || b < a || path.is_empty() {
+        return None;
+    }
+    Some((path.trim().replace('\\', "/"), a, b))
+}
+
 /// One line telling the agent that a list was cut, so a partial list never looks complete.
 fn more_note(total: usize, shown: usize, what: &str) -> String {
     if total > shown {
@@ -1852,6 +1879,53 @@ impl TrackerEngine {
 
     /// Explains a symbol lookup miss with the index's coverage, so "no such symbol in the
     /// index" is never read as "no such symbol in the repository".
+    /// Lines `from..=to` of an indexed file, numbered, with the innermost symbol around them.
+    fn read_line_range(&self, cg: &CodeGraph, path: &str, from: usize, to: usize) -> String {
+        let Some(rec) = cg.files.get(path) else {
+            return format!(
+                "NOT INDEXED: `{path}` is not in the index (missing, git-ignored, or a file \
+                 type TrackerTop does not index: {}). Pass a path relative to the project \
+                 root, e.g. `src/lib.rs:L10-40`.\n",
+                indexed_extensions()
+            );
+        };
+        let content = std::fs::read_to_string(self.repo_root.join(path)).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        if from > total {
+            return format!("OUT OF RANGE: {path} has {total} lines; asked for L{from}-{to}.\n");
+        }
+        let end = to.min(total);
+        let mut out = format!("# LINES {path}:L{from}-{end}");
+        let around = cg
+            .symbols_by_file
+            .get(&rec.path)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| cg.symbols.get(id))
+            .filter(|s| s.kind != SymbolKind::File && s.start_line <= from && s.end_line >= end)
+            .min_by_key(|s| s.end_line - s.start_line);
+        if let Some(s) = around {
+            out.push_str(&format!(
+                " (inside {} [{}] L{}-{})",
+                s.qualified_name,
+                s.kind.as_str(),
+                s.start_line,
+                s.end_line
+            ));
+        }
+        out.push('\n');
+        if end < to {
+            out.push_str(&format!("(clamped: the file has {total} lines)\n"));
+        }
+        out.push_str("```\n");
+        for (i, line) in lines[from - 1..end].iter().enumerate() {
+            out.push_str(&format!("{:>4} | {line}\n", from + i));
+        }
+        out.push_str("```\n");
+        out
+    }
+
     fn symbol_miss(cg: &CodeGraph, query: &str) -> String {
         format!(
             "NOT FOUND IN INDEX: no symbol matches `{query}` ({} symbols in {} indexed files; \

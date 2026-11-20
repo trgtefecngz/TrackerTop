@@ -338,7 +338,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "symbol": { "type": "string", "description": "Symbol name, qualified name, or ID" },
+                    "symbol": { "type": "string", "description": "Symbol name, qualified name, ID or `path::name`; or a line range `path:Lstart-end` to read lines no symbol covers (an impl tail, test helpers)" },
                     "include_deps": { "type": "boolean", "description": "Include 1-hop callee/caller signatures (default true)" },
                     "max_tokens": { "type": "integer", "description": "Token budget cap (default 1400)" }
                 },

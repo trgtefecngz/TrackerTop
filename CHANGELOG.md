@@ -27,6 +27,9 @@ All notable changes to TrackerTop are documented here.
 ### Fixed: symbol lookups never guess silently
 - `read_symbol`, `read_symbols_batch`, `call_graph` and `impact_analysis` used to fall back to the best fuzzy match without saying so. For example, `src/review/rules.rs::tests` returned an unrelated test. Lookups now try an exact symbol id, `path::name`, an exact qualified name, then an exact name, in that order. When several symbols share the name, the answer says **AMBIGUOUS** and lists them; a fuzzy match is labelled as the closest match.
 
+### Added: line ranges in `read_symbol`
+- `read_symbol("src/lib.rs:L120-160")` reads a line range that no symbol covers, such as an impl tail or a test module's helpers, and names the innermost symbol around it. A range past the end of the file is clamped and says so; one that starts past the end, or a file that is not indexed, gets an explicit error.
+
 ### Fixed: stale graph after upgrading TrackerTop
 - The index records which extractor revision parsed it. An index written by another TrackerTop version is re-parsed in full on its next run. Before, files whose content had not changed kept the references an older extractor produced, so call-edge fixes never reached them: on this repository, `TrackerEngine::finalize_inner` showed 0 callers instead of 19.
 

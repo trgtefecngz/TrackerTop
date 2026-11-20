@@ -2049,3 +2049,47 @@ fn orphan_ignores_functions_reached_outside_the_call_graph() {
         .collect();
     assert!(orphans.is_empty(), "{orphans:?}");
 }
+
+/// `read_symbol("path:Lstart-end")` reads a line range (an impl tail, a test module's
+/// helpers) and names the innermost symbol around it; a bad range fails loudly.
+#[test]
+fn read_symbol_reads_a_line_range() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub struct S;\nimpl S {\n    pub fn a(&self) -> i32 {\n        1\n    }\n\n    const TAIL: i32 = 7;\n}\n",
+    )
+    .unwrap();
+    let engine = TrackerEngine::new(root);
+    let out = engine
+        .read_symbol("src/lib.rs:L6-8", false, 1_000)
+        .unwrap()
+        .text;
+    assert!(out.contains("# LINES src/lib.rs:L6-8"), "{out}");
+    assert!(out.contains("   7 |     const TAIL: i32 = 7;"), "{out}");
+    assert!(!out.contains("pub fn a"), "{out}");
+    assert!(out.contains("inside impl S"), "{out}");
+
+    let out = engine
+        .read_symbol("src/lib.rs:L7-99", false, 1_000)
+        .unwrap()
+        .text;
+    assert!(out.contains("# LINES src/lib.rs:L7-8"), "{out}");
+    assert!(out.contains("clamped: the file has 8 lines"), "{out}");
+
+    let out = engine
+        .read_symbol("src/lib.rs:L20-30", false, 1_000)
+        .unwrap()
+        .text;
+    assert!(
+        out.contains("OUT OF RANGE: src/lib.rs has 8 lines"),
+        "{out}"
+    );
+    let out = engine
+        .read_symbol("src/nope.rs:L1-3", false, 1_000)
+        .unwrap()
+        .text;
+    assert!(out.contains("NOT INDEXED"), "{out}");
+}
