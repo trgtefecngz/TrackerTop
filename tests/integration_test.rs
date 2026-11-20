@@ -450,7 +450,7 @@ fn graph_cache_never_serves_stale_symbols() {
         !e.read_symbol(name, false, 0)
             .unwrap()
             .text
-            .contains("Symbol not found")
+            .contains("NOT FOUND IN INDEX")
     };
 
     assert!(found(&engine, "alpha_fn"));
@@ -676,7 +676,7 @@ fn same_second_same_size_edit_is_not_missed() {
             .read_symbol("omega_v2", false, 0)
             .unwrap()
             .text
-            .contains("Symbol not found")
+            .contains("NOT FOUND IN INDEX")
     );
 }
 
@@ -720,4 +720,633 @@ fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// Ground truth for smart_grep: an independent scan of every file on disk whose type the
+/// registry indexes, splitting on '\n' and dropping a trailing '\r' (no `str::lines`).
+fn naive_grep(root: &std::path::Path, pattern: &str) -> Vec<(String, usize)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                if !p.file_name().unwrap().to_string_lossy().starts_with('.') {
+                    walk(&p, out);
+                }
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    let pat = pattern.to_lowercase();
+    let registry = trackertop::parser::default_registry();
+    let mut hits = Vec::new();
+    for f in files {
+        if registry.extractor_for_path(&f).is_none() {
+            continue;
+        }
+        let rel = f
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&f).unwrap();
+        for (i, raw) in text.split('\n').enumerate() {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if line.to_lowercase().contains(&pat) {
+                hits.push((rel.clone(), i + 1));
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+#[test]
+fn smart_grep_matches_a_plain_scan_and_states_its_coverage() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src/ui")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "// Needle in a comment\r\npub fn find_needle() -> &'static str {\r\n    \"NEEDLE (in a string)\"\r\n}\r\nfn other() { let needle = needle_twice(needle); }\r\n",
+    )
+    .unwrap();
+    let many: String = (0..20)
+        .map(|i| format!("export const needle{i} = () => {i};\n"))
+        .collect();
+    std::fs::write(root.join("src/b.ts"), many).unwrap();
+    std::fs::write(
+        root.join("src/ui/c.tsx"),
+        "export function Banner() {\n  return <p>ÇÖĞÜŞ a.b (needle)</p>;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("NOTES.unindexed"),
+        "needle in docs, not indexed\n",
+    )
+    .unwrap();
+
+    index_repository(root, true).unwrap();
+    let db = trackertop::db::Database::open_for_repo(root).unwrap();
+    let graph = trackertop::graph::CodeGraph::load(&db).unwrap();
+    let indexed: Vec<&String> = graph.files.keys().collect();
+
+    for pattern in [
+        "needle",
+        "NEEDLE",
+        "çöğüş",
+        "a.b",
+        "(",
+        "static str",
+        "zzz-absent",
+    ] {
+        let scan = trackertop::context::grep_scan(root, &indexed, pattern, None);
+        let mut got: Vec<(String, usize)> = scan
+            .files
+            .iter()
+            .flat_map(|f| f.lines.iter().map(move |(n, _)| (f.path.clone(), *n)))
+            .collect();
+        got.sort();
+        assert_eq!(got, naive_grep(root, pattern), "pattern {pattern:?}");
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files_searched, 3, "pattern {pattern:?}");
+    }
+
+    // Rendered output: caps are announced and totals match the ground truth.
+    let engine = TrackerEngine::new(root);
+    let out = engine.smart_grep("needle", None, 20_000).unwrap().text;
+    let truth = naive_grep(root, "needle").len();
+    assert!(
+        out.contains(&format!("{truth} matching lines in 3 files")),
+        "{out}"
+    );
+    assert!(
+        out.contains("(showing 12 of 20 matches in this file; 8 more not shown)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Not searched: files outside the index"),
+        "{out}"
+    );
+    let absent = engine.smart_grep("zzz-absent", None, 2_000).unwrap().text;
+    assert!(absent.contains("No matches found in the searched files."));
+    assert!(absent.contains("0 matching lines in 0 files"), "{absent}");
+    let filtered = engine
+        .smart_grep("needle", Some("src/ui"), 2_000)
+        .unwrap()
+        .text;
+    assert!(
+        filtered.contains("(2 more excluded by file_filter)"),
+        "{filtered}"
+    );
+}
+
+#[test]
+fn lookups_distinguish_not_indexed_from_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+    std::fs::write(root.join("data.unindexed"), "# readme\n").unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let readme = engine.file_outline("data.unindexed", 800).unwrap().text;
+    assert!(
+        readme.contains("NOT INDEXED: `data.unindexed` exists"),
+        "{readme}"
+    );
+    let missing = engine.file_outline("src/nope.rs", 800).unwrap().text;
+    assert!(
+        missing.contains("NOT FOUND: no file `src/nope.rs`"),
+        "{missing}"
+    );
+    let sym = engine.read_symbol("absent_fn", true, 800).unwrap().text;
+    assert!(sym.contains("NOT FOUND IN INDEX"), "{sym}");
+    assert!(sym.contains("1 indexed files"), "{sym}");
+    let batch = engine
+        .read_symbols_batch(
+            &["present".to_string(), "absent_fn".to_string()],
+            false,
+            2_000,
+        )
+        .unwrap()
+        .text;
+    assert!(batch.contains("pub fn present"), "{batch}");
+    assert!(
+        batch.contains("NOT FOUND IN INDEX: no symbol matches `absent_fn`"),
+        "{batch}"
+    );
+}
+
+#[test]
+fn outlines_state_whether_spans_come_from_a_syntax_tree() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn precise() {}\n").unwrap();
+    std::fs::write(root.join("src/a.ts"), "export function tsFn() {}\n").unwrap();
+    std::fs::write(
+        root.join("run.ps1"),
+        "function Invoke-Thing {\n  Write-Host 1\n}\n",
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+    for path in ["src/lib.rs", "src/a.ts"] {
+        let out = engine.file_outline(path, 800).unwrap().text;
+        assert!(out.contains("; tree-sitter)"), "{out}");
+    }
+    let ps = engine.file_outline("run.ps1", 800).unwrap().text;
+    assert!(ps.contains("heuristic extractor"), "{ps}");
+    let sym = engine.read_symbol("Invoke-Thing", false, 800).unwrap().text;
+    assert!(sym.contains("Span: heuristic extractor"), "{sym}");
+    let precise = engine.read_symbol("precise", false, 800).unwrap().text;
+    assert!(!precise.contains("Span:"), "{precise}");
+}
+
+#[test]
+fn run_checks_summarizes_a_real_cargo_test_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"rc_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn passes() { assert_eq!(super::add(1, 2), 3); }\n    #[test]\n    fn fails() { assert_eq!(super::add(2, 2), 5); }\n}\n",
+    )
+    .unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let out = engine.run_checks("test", None, 600, 4_000).unwrap().text;
+    assert!(out.contains("RESULT: FAILED (exit 101)"), "{out}");
+    assert!(out.contains("1 passed, 1 failed"), "{out}");
+    assert!(out.contains("- tests::fails"), "{out}");
+    assert!(out.contains("lib.rs:8:"), "{out}");
+    assert!(!out.contains("- tests::passes"), "{out}");
+
+    let filtered = engine
+        .run_checks("test", Some("passes"), 600, 4_000)
+        .unwrap()
+        .text;
+    assert!(filtered.contains("RESULT: PASSED"), "{filtered}");
+    assert!(filtered.contains("`cargo test passes`"), "{filtered}");
+
+    // Ambiguous extra args and unknown kinds are errors, not empty results.
+    assert!(engine.run_checks("all", Some("x"), 60, 1_000).is_err());
+    let resp = handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+                "params":{"name":"run_checks","arguments":{"kind":"bogus"}}}),
+    )
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+}
+
+#[test]
+fn run_checks_says_when_no_command_is_detected() {
+    let tmp = TempDir::new().unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    let out = engine.run_checks("test", None, 60, 1_000).unwrap().text;
+    assert!(out.contains("test: NOT DETECTED"), "{out}");
+}
+
+fn git_in(root: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn changes_since_maps_working_tree_diffs_to_symbols() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n\npub fn gamma() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/keep.rs"), "pub fn keep() {}\n").unwrap();
+    git_in(root, &["init", "-q"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "init"]);
+
+    // beta edited, gamma deleted, delta added; one untracked file
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    20 + 2\n}\n\npub fn delta() -> i32 {\n    4\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/fresh.rs"), "pub fn fresh() {}\n").unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let out = engine.changes_since("HEAD", &[], &[], 4_000).unwrap().text;
+    assert!(out.contains("## src/lib.rs (modified"), "{out}");
+    assert!(out.contains("Touched: beta [fn] L5-7"), "{out}");
+    assert!(out.contains("Added symbols: delta"), "{out}");
+    assert!(out.contains("Removed symbols: gamma"), "{out}");
+    assert!(out.contains("+    20 + 2"), "{out}");
+    assert!(out.contains("-    2"), "{out}");
+    assert!(
+        out.contains("## Untracked new files (1)\n- src/fresh.rs"),
+        "{out}"
+    );
+    assert!(!out.contains("keep.rs"), "{out}");
+    assert!(!out.contains(".trackertop"), "{out}");
+
+    let beta = engine
+        .changes_since("HEAD", &[], &["beta".to_string()], 4_000)
+        .unwrap()
+        .text;
+    assert!(beta.contains("+    20 + 2"), "{beta}");
+    assert!(!beta.contains("delta"), "only hunks touching beta: {beta}");
+    let alpha = engine
+        .changes_since("HEAD", &[], &["alpha".to_string()], 4_000)
+        .unwrap()
+        .text;
+    assert!(
+        alpha.contains("No changes touch the requested symbols"),
+        "{alpha}"
+    );
+    let gone = engine
+        .changes_since("HEAD", &[], &["gamma".to_string()], 4_000)
+        .unwrap()
+        .text;
+    assert!(gone.contains("SYMBOL `gamma` NOT FOUND IN INDEX"), "{gone}");
+
+    let scoped = engine
+        .changes_since("HEAD", &["src/keep.rs".to_string()], &[], 4_000)
+        .unwrap()
+        .text;
+    assert!(
+        scoped.contains("No changes since that commit in the requested scope"),
+        "{scoped}"
+    );
+
+    let bad = engine
+        .changes_since("no-such-ref", &[], &[], 1_000)
+        .unwrap_err();
+    assert!(
+        format!("{bad:#}").contains("does not name a commit"),
+        "{bad:#}"
+    );
+    let plain = TempDir::new().unwrap();
+    let err = TrackerEngine::new(plain.path())
+        .changes_since("HEAD", &[], &[], 1_000)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a git repository"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn project_playbook_is_served_over_mcp() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run"},"engines":{"node":">=20"}}"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("CLAUDE.md"), "rules\n").unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    let resp = handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{"name":"project_playbook","arguments":{}}}),
+    )
+    .unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("READ FIRST (instructions for agents): CLAUDE.md"),
+        "{text}"
+    );
+    assert!(
+        text.contains("test: `npm run test` [detected from package.json scripts.test]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Node >=20 [detected from package.json engines.node]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn decisions_and_dismissed_leads_surface_when_code_is_read() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn run() {}\n\npub fn run_checks() {}\n",
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let saved = engine
+        .remember_kind(
+            "run",
+            "keep run() synchronous",
+            "decision",
+            "callers hold a lock",
+        )
+        .unwrap();
+    assert!(saved.contains("Saved decision #"), "{saved}");
+    engine
+        .remember_kind(
+            "src/lib.rs",
+            "possible race in run_checks",
+            "dismissed",
+            "single-threaded by design, verified",
+        )
+        .unwrap();
+    assert!(engine.remember_kind("run", "x", "decision", "").is_err());
+
+    let run = engine.read_symbol("run", false, 2_000).unwrap().text;
+    assert!(
+        run.contains("Decision #1 [run]: keep run() synchronous (why: callers hold a lock)"),
+        "{run}"
+    );
+    let checks = engine.read_symbol("run_checks", false, 2_000).unwrap().text;
+    assert!(
+        !checks.contains("keep run() synchronous"),
+        "note on `run` leaked: {checks}"
+    );
+    assert!(
+        checks.contains("Dismissed lead #2 [src/lib.rs]: possible race in run_checks"),
+        "{checks}"
+    );
+    let outline = engine.file_outline("src/lib.rs", 2_000).unwrap().text;
+    assert!(outline.contains("Decision #1 [run]"), "{outline}");
+    assert!(outline.contains("Dismissed lead #2"), "{outline}");
+
+    let recalled = engine.recall(Some("dismissed")).unwrap();
+    assert!(recalled.contains("# SAVED MEMORY NOTES (1)"), "{recalled}");
+    assert!(root.join(".trackertop/notes/00001-decision.md").is_file());
+}
+
+#[test]
+fn mcp_calls_are_tagged_with_the_client_name() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "pub fn tagged() {}\n").unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"clientInfo":{"name":"claude-code\n<script>","version":"1"}}}),
+    )
+    .unwrap();
+    handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"read_symbol","arguments":{"symbol":"tagged"}}}),
+    )
+    .unwrap();
+    let stats = engine.token_stats().unwrap();
+    assert_eq!(stats.total_queries, 1);
+    assert_eq!(stats.recent[0].source, "mcp:claude-codescript");
+    assert_eq!(stats.recent[0].tool, "read_symbol");
+
+    // A CLI engine on the same repo is recorded separately, not as agent usage
+    let cli = TrackerEngine::new(tmp.path());
+    cli.read_symbol("tagged", false, 500).unwrap();
+    let stats = cli.token_stats().unwrap();
+    assert_eq!(stats.total_queries, 1);
+    assert!(
+        stats
+            .by_source
+            .iter()
+            .any(|s| s.source == "cli" && s.queries == 1)
+    );
+}
+
+/// The matryoshka view must account for every symbol edge at every level of a real index:
+/// each edge touching a scope is drawn (inside an aggregated edge), hidden or external,
+/// checked against an independent count from the raw edge list.
+#[test]
+fn nested_graph_accounts_for_every_edge_on_a_real_index() {
+    use std::collections::HashSet;
+    use trackertop::db::Database;
+    use trackertop::graph::CodeGraph;
+    use trackertop::model::EdgeKind;
+    use trackertop::nested::{NestedGraph, NestedLevel, NestedView};
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_call_graph_repo(root, 3);
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::write(
+        root.join("tools/cli.rs"),
+        "pub fn main_tool() -> u8 { crate::root() + crate::b::leaf() }\n",
+    )
+    .unwrap();
+    index_repository(root, false).unwrap();
+    let db = Database::open_for_repo(root).unwrap();
+    let cg = CodeGraph::load(&db).unwrap();
+    let ng = NestedGraph::new(&cg);
+
+    let resolved: Vec<(String, String)> = cg
+        .edges
+        .iter()
+        .filter(|e| e.kind != EdgeKind::Contains)
+        .filter_map(|e| {
+            let s = cg.symbols.get(&e.source_id)?;
+            let t = cg.symbols.get(&e.target_id)?;
+            Some((s.file_path.clone(), t.file_path.clone()))
+        })
+        .collect();
+    assert!(
+        !resolved.is_empty(),
+        "fixture must produce cross-symbol edges"
+    );
+    let accounted = |v: &NestedView| {
+        v.edges.iter().map(|e| e.weight).sum::<usize>() + v.hidden_edges + v.external_edges
+    };
+
+    let project = ng.view(&NestedLevel::Project).unwrap();
+    assert_eq!(accounted(&project), resolved.len());
+    assert_eq!(project.truncated, 0);
+    let total_files: usize = project.nodes.iter().map(|n| n.child_count).sum();
+    assert_eq!(
+        total_files,
+        cg.files.len(),
+        "every file sits in exactly one community"
+    );
+
+    for c in &project.nodes {
+        let level = c.drill.clone().unwrap();
+        let cv = ng.view(&level).unwrap();
+        let files: HashSet<String> = cv
+            .nodes
+            .iter()
+            .map(|n| n.id.trim_start_matches("f:").to_string())
+            .collect();
+        let touching = resolved
+            .iter()
+            .filter(|(a, b)| files.contains(a) || files.contains(b))
+            .count();
+        assert_eq!(accounted(&cv), touching, "community {}", c.id);
+        for f in &cv.nodes {
+            let fv = ng.view(f.drill.as_ref().unwrap()).unwrap();
+            let path = f.id.trim_start_matches("f:");
+            let touching = resolved
+                .iter()
+                .filter(|(a, b)| a == path || b == path)
+                .count();
+            assert_eq!(accounted(&fv), touching, "file {path}");
+            for s in &fv.nodes {
+                let loc = s.location.as_deref().unwrap();
+                assert!(loc.starts_with(&format!("{path}:")), "{loc}");
+            }
+        }
+    }
+}
+
+/// Qualified Rust calls must resolve to the named type or module, never to an unrelated
+/// symbol that merely shares the last segment (`Stroke::new` is not `App::new`, and
+/// `std::fs::read` is not this project's `util::read`). Missing an edge is better than a
+/// wrong one.
+#[test]
+fn qualified_rust_calls_never_bind_to_a_namesake() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "mod app;\nmod util;\n").unwrap();
+    std::fs::write(
+        root.join("src/util.rs"),
+        "pub fn helper() {}\npub fn read() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app.rs"),
+        r#"pub struct App;
+impl App {
+    pub fn new() -> Self { App }
+    pub fn build() -> Self { Self::new() }
+}
+pub fn make_app() -> App { App::new() }
+pub fn external_ctor() { let _s = Stroke::new(1.0); }
+pub fn std_read() { let _ = std::fs::read("x"); }
+pub fn module_call() { util::helper(); crate::util::helper(); }
+pub fn variant() { let _ = Kind::New(1); }
+"#,
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+
+    let calls: Vec<(String, String)> = edge_set(root)
+        .into_iter()
+        .filter(|(_, _, k)| k == "CALLS")
+        .map(|(s, t, _)| (s, t))
+        .collect();
+    let from = |f: &str| -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|(s, _)| s.contains(&format!("::{f}#")))
+            .map(|(_, t)| t.as_str())
+            .collect()
+    };
+
+    assert_eq!(from("make_app").len(), 1, "{calls:?}");
+    assert!(from("make_app")[0].contains("::App::new#"), "{calls:?}");
+    assert_eq!(from("App::build").len(), 1, "{calls:?}");
+    assert!(from("App::build")[0].contains("::App::new#"), "{calls:?}");
+    assert!(from("external_ctor").is_empty(), "{calls:?}");
+    assert!(from("std_read").is_empty(), "{calls:?}");
+    assert!(from("variant").is_empty(), "{calls:?}");
+    let module = from("module_call");
+    assert_eq!(module.len(), 1, "{calls:?}");
+    assert!(module[0].contains("src/util.rs::helper#"), "{calls:?}");
+}
+
+/// A project indexed from a subdirectory of a git repository (a monorepo package) must see
+/// its own changes with project-relative paths, and nothing from sibling packages.
+#[test]
+fn changes_since_works_when_the_project_is_a_git_subdirectory() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    let app = repo.join("packages/app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("packages/other")).unwrap();
+    std::fs::write(
+        app.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn gamma() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("packages/other/x.rs"), "pub fn x() {}\n").unwrap();
+    git_in(repo, &["init", "-q"]);
+    git_in(repo, &["add", "."]);
+    git_in(repo, &["commit", "-q", "-m", "init"]);
+
+    std::fs::write(
+        app.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    10\n}\n\npub fn delta() -> i32 {\n    4\n}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("packages/other/x.rs"), "pub fn x() { }\n").unwrap();
+    let engine = TrackerEngine::new(&app);
+
+    let out = engine.changes_since("HEAD", &[], &[], 4_000).unwrap().text;
+    assert!(out.contains("## src/lib.rs (modified"), "{out}");
+    assert!(out.contains("Touched: alpha [fn] L1-3"), "{out}");
+    assert!(out.contains("Added symbols: delta"), "{out}");
+    assert!(out.contains("Removed symbols: gamma"), "{out}");
+    assert!(!out.contains("other/x.rs"), "{out}");
 }

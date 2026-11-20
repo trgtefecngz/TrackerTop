@@ -513,8 +513,21 @@ fn resolve_edges(
             | EdgeKind::Implements
             | EdgeKind::UsesType
             | EdgeKind::References => {
+                // A qualified Rust call (`Type::f`, `module::f`) binds only inside that type or
+                // module. Falling back to the bare name would tie `Stroke::new` (an external
+                // type) to whatever `new` this project defines: no edge beats a wrong edge.
+                let rust_qualified = src_file.ends_with(".rs")
+                    && matches!(rref.kind, EdgeKind::Calls | EdgeKind::Tests)
+                    && target.contains("::");
+                if rust_qualified {
+                    if let Some(best) =
+                        resolve_qualified_rust_call(target, src_file, &by_qname, &by_name)
+                    {
+                        resolved_targets.push(best.id.clone());
+                    }
+                }
                 // Direct file path reference (e.g., from Markdown `src/graph.rs`)
-                if let Some(fid) = file_by_path.get(target) {
+                else if let Some(fid) = file_by_path.get(target) {
                     resolved_targets.push(fid.clone());
                 } else if let Some(syms) = by_qname.get(target) {
                     if let Some(best) = pick_nearest_symbol(syms, src_file) {
@@ -588,7 +601,45 @@ fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
+/// Resolves a Rust callee kept qualified by the extractor (see `extract_callable_name`):
+/// - `Type::f` (capitalised qualifier) needs a symbol whose qualified name is exactly `Type::f`;
+/// - `module::f` needs a symbol `f` defined in that module: a file `module.rs`, `module/mod.rs`
+///   or a file directly inside `module/`.
+///
+/// Anything else (an external type, `std::fs::read`, an enum variant, a trait call such as
+/// `Default::default`) resolves to nothing.
+fn resolve_qualified_rust_call<'a>(
+    target: &str,
+    src_file: &str,
+    by_qname: &HashMap<String, Vec<&'a Symbol>>,
+    by_name: &HashMap<String, Vec<&'a Symbol>>,
+) -> Option<&'a Symbol> {
+    let (qualifier, func) = target.rsplit_once("::")?;
+    if qualifier.chars().next().is_some_and(char::is_uppercase) {
+        return pick_nearest_symbol(by_qname.get(target)?, src_file);
+    }
+    let in_module: Vec<&Symbol> = by_name
+        .get(func)?
+        .iter()
+        .copied()
+        .filter(|s| file_is_module(&s.file_path, qualifier))
+        .collect();
+    pick_nearest_symbol(&in_module, src_file)
+}
+
+/// Whether `path` is the source of Rust module `module` (`.../module.rs`, `.../module/mod.rs`)
+/// or a file directly inside its directory (`.../module/x.rs`).
+fn file_is_module(path: &str, module: &str) -> bool {
+    let mut parts = path.rsplit('/');
+    let file = parts.next().unwrap_or("");
+    let dir = parts.next().unwrap_or("");
+    file.strip_suffix(".rs") == Some(module) || dir == module
+}
+
 fn pick_nearest_symbol<'a>(syms: &[&'a Symbol], src_file: &str) -> Option<&'a Symbol> {
+    if syms.is_empty() {
+        return None;
+    }
     if syms.len() == 1 {
         return Some(syms[0]);
     }

@@ -2,6 +2,92 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [0.7.0] - 2026-11-20
+
+v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
+
+### Added: nested graph view (desktop app)
+- The Code Graph tab has a new layout, **Nested**. It shows one level at a time: project → communities → files → symbols. Click a node to drill in; use the breadcrumbs to go back up.
+- Edges are aggregated per level. A line between two communities stands for the number of symbol-level dependencies between them.
+- A coverage line states what is not drawn:
+  - edges that leave the current scope;
+  - edges inside a single node;
+  - children cut by the 400-node cap.
+- Group ids are stable across re-indexes. A community is named by its first file path, not by a number that shifts when files are added.
+- Fixed: a community's label could differ between runs on ties, because it depended on hash-map order. It is now deterministic.
+
+### Changed: honest metrics
+- Every telemetry row records who made the call:
+  - `mcp:<client name>`, taken from the MCP `initialize` request (for example `mcp:claude-code`);
+  - `cli` or `ui`;
+  - a custom tag from `TRACKERTOP_TELEMETRY_SOURCE`, such as `benchmark`;
+  - `legacy` for rows recorded before 0.7.
+  The telemetry table is migrated in place.
+- Statistics count real AI-agent usage (MCP calls) by default, in `token_stats`, `trackertop stats`, the report, the project list and the desktop app. Calls from the CLI, UI, tests, benchmarks and legacy rows are listed per source and not mixed in.
+- Savings are shown as a range:
+  - **conservative**: targeted reads of at most 1,500 tokens from at most 5 touched files, never less than what was sent;
+  - **upper bound**: the previous figure, every touched file read whole.
+  The conservative figure is computed from stored columns, so it covers old rows too.
+- `token_stats` and `trackertop stats` end with the latest requests (tool and query), so you can see what the agent asked for.
+
+### Added: decision memory
+- `remember` takes a `kind` (`note`, `decision` or `dismissed`, the last for a review lead that was checked and rejected) and a `reason`, which is required for decisions and dismissed leads.
+- Notes are shown, labelled with kind and reason, wherever the related code is read: `read_symbol`, `read_symbols_batch`, `file_outline` (notes on the file or any of its symbols) and `repo_map`. Settled questions are not investigated again.
+- Every note is also written as Markdown in `.trackertop/notes/`. If the index database is deleted or rebuilt, the notes are restored from those files.
+- The existing notes table is migrated in place; old notes become kind `note`.
+
+### Fixed: pre-release review
+- A note on a type's member (`Store::load`) was shown when reading any symbol with the same bare name (`Config::load`), so a dismissed lead on one could silence the other. Member notes now match only their own symbol; module-qualified notes (`registry::load`) still match the free function.
+- `changes_since` in a project that is a subfolder of a git repository (a monorepo package) mapped no hunks, because git reported paths from the repository top level. Diffs and old file versions are now read relative to the project.
+- `run_checks`:
+  - `cargo test -- --show-output` no longer reports passing tests as failures.
+  - Jest's `● Validation Warning:` and `● Deprecation Warning:` headings are no longer counted as failing tests.
+  - A test binary that crashes (signal, stack overflow) is reported even when other failures were recognized.
+- Notes restored from `.trackertop/notes/` keep their text when it contains a `Reason:` paragraph, and files re-saved with Windows line endings are no longer skipped.
+
+### Fixed: false call edges in Rust
+- A qualified call such as `Stroke::new(...)` was resolved by its last segment alone, so it was tied to any `new` in the project. In this repository, `TrackerTopApp::new` showed 18 callers instead of 2, and `impact_analysis` reported the wrong blast radius.
+  - `Type::f` now resolves only to that exact type's function, and `Self::f` to the surrounding impl's type.
+  - `module::f` resolves only inside that module.
+  - Calls into external types and crates (`std::fs::read`), enum variants and trait paths get no edge. A missing edge is better than a wrong one.
+- Turbofish generics (`Vec::<u8>::new`) no longer cut the callee name short.
+
+### Fixed: memory notes
+- A note surfaced for any target that merely contained its text, so a note on `run` appeared on `run_checks` and `src/runner.rs`. Targets now match exactly or by whole `::` or path segments.
+- Only the newest 100 notes were ever searched, so older notes silently stopped appearing. There is no cap now.
+
+### Added: `project_playbook`
+- New MCP tool to call once at the start of work.
+- It lists how to build, test, lint and format the project, and what CI actually runs (shell plumbing and release workflows are left out).
+- It also lists toolchain versions (edition and MSRV, Node, Go, Python), format/lint configs, Makefile/justfile targets, and the agent instruction files to read first (`CLAUDE.md`, `AGENTS.md`, …).
+- Each item is marked as detected or guessed. An ecosystem default that CI runs is marked as confirmed.
+
+### Added: `changes_since`
+- New MCP tool: what changed in the working tree (staged, unstaged, untracked) since a git ref, `HEAD` by default.
+  - For each file: the touched symbols with their current line spans, the symbols added or removed since the ref (the old version is parsed with the same extractor), and only the changed lines.
+  - Can be limited to paths, or to hunks that touch given symbols.
+  - Errors on an invalid ref or outside a git repository.
+
+### Added: `run_checks`
+- New MCP tool. It runs the project's own test, lint, build or format command and returns a compact summary instead of the log: pass/fail counts, only the failing test names with their assertion lines and `file:line`, and compiler/linter errors with locations.
+- Commands come from `Cargo.toml`, `package.json` scripts (npm, pnpm, yarn or bun), `go.mod` and pytest/ruff config, each marked as detected or guessed. They run without a shell and are stopped by a timeout.
+- Recognized output: cargo/rustc/clippy/rustfmt, Jest, Vitest, pytest, `go test`.
+- A failure is never hidden:
+  - a failed run with nothing recognized becomes an **UNRECOGNIZED FAILURE** and includes the output tail;
+  - exit code 0 with failures in the log is not reported as passed;
+  - timeouts are marked PARTIAL.
+
+### Changed: TypeScript / JavaScript extraction uses tree-sitter
+- `.ts`, `.tsx` and `.js`/`.jsx`/`.mjs`/`.cjs` are parsed with the tree-sitter TypeScript, TSX and JavaScript grammars. Strings, template literals, regex literals, comments and JSX can no longer shift where a symbol ends.
+- New: class fields holding arrow functions become methods, interface `extends` edges, dynamic `import("./x")`, `it.only`/`test.skip`, tests nested in `describe`. Calls inside strings and comments are no longer edges.
+- An `it(`/`test(` call left unterminated by a syntax error is recorded as its first line only.
+
+### Changed: tool answers state their coverage
+- Lists that are cut to fit say so: `(showing 10 of 37 callers; 27 more not shown)`. `read_symbols_batch` names the queries beyond its 10-per-call limit instead of dropping them.
+- Lookups distinguish **NOT INDEXED** (the file exists, but its type is not indexed or it is ignored) from **NOT FOUND**; symbol misses report the index's coverage and suggest `smart_grep`.
+- `smart_grep` ends with a coverage line: files searched, matching lines in total vs shown, `file_filter` exclusions, unreadable files, and the fact that non-indexed files are not searched. Case folding is now Unicode-aware.
+- `file_outline` names the extractor (`tree-sitter` or heuristic); `read_symbol` warns when spans come from a heuristic extractor.
+
 ## [0.6.0] - 2026-11-20
 
 A reliability and safety release. There are no new MCP tools; everything that already existed now behaves correctly with several agents at once, on unusual file systems, and with configs the installer did not create.
@@ -53,5 +139,6 @@ A reliability and safety release. There are no new MCP tools; everything that al
 
 Global Edition: TypeScript/JavaScript, Python and Go extractors, custom app icon, Claude Code SessionStart hook, macOS release CI, one-line installers.
 
+[0.7.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.7.0
 [0.6.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.6.0
 [0.5.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.5.0

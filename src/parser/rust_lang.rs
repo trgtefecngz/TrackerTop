@@ -23,6 +23,10 @@ impl LanguageExtractor for RustExtractor {
         &["rs"]
     }
 
+    fn is_syntax_tree(&self) -> bool {
+        true
+    }
+
     fn color_hex(&self) -> &'static str {
         "#fb923c"
     }
@@ -308,7 +312,18 @@ fn walk_items(
                     } else {
                         EdgeKind::Calls
                     };
-                    collect_calls(node, bytes, &sym_id, call_kind, &mut seen_calls, out);
+                    // `Self::f()` names the impl's type. Inside a trait, `impl_type` is the
+                    // trait's symbol id (it contains `::`), so `Self` stays unknown there.
+                    let self_ty = impl_type.filter(|t| !t.contains("::"));
+                    collect_calls(
+                        node,
+                        bytes,
+                        &sym_id,
+                        call_kind,
+                        self_ty,
+                        &mut seen_calls,
+                        out,
+                    );
                     collect_type_refs(node, bytes, &sym_id, &mut seen_types, out);
                 }
             }
@@ -322,6 +337,7 @@ fn collect_calls(
     bytes: &[u8],
     source_id: &str,
     edge_kind: EdgeKind,
+    self_ty: Option<&str>,
     seen: &mut HashSet<String>,
     out: &mut ParsedFile,
 ) {
@@ -331,7 +347,7 @@ fn collect_calls(
             "call_expression" => {
                 if let Some(func) = child.child_by_field_name("function") {
                     let raw = node_text(func, bytes).trim();
-                    let target = extract_callable_name(raw);
+                    let target = extract_callable_name(raw, self_ty);
                     if is_interesting_call(&target) && seen.insert(target.clone()) {
                         out.refs.push(RawReference {
                             source_symbol_id: source_id.to_string(),
@@ -357,7 +373,7 @@ fn collect_calls(
             }
             _ => {}
         }
-        collect_calls(child, bytes, source_id, edge_kind, seen, out);
+        collect_calls(child, bytes, source_id, edge_kind, self_ty, seen, out);
     }
 }
 
@@ -393,25 +409,57 @@ fn clean_rust_type_name(raw: &str) -> String {
     base.rsplit("::").next().unwrap_or(base).trim().to_string()
 }
 
-fn extract_callable_name(raw: &str) -> String {
-    // Handle `foo.bar`, `Type::method`, `a::b::func`
-    if let Some(dot) = raw.rfind('.') {
-        return raw[dot + 1..]
-            .split("::<")
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+/// Callee name of a call expression, keeping the one qualifier that says which symbol it is.
+/// The resolver binds a qualified name only inside that type or module, never by bare name:
+/// - `x.foo()` -> `foo` (a method on a value; the receiver's type is unknown)
+/// - `Type::f()`, `a::Type::f()`, `Vec::<u8>::f()` -> `Type::f`; `Self::f()` -> `<impl type>::f`
+/// - `module::f()`, `a::module::f()` -> `module::f`
+/// - `crate::f()`, `super::f()`, `self::f()`, `f()` -> `f`
+fn extract_callable_name(raw: &str, self_ty: Option<&str>) -> String {
+    let clean = strip_turbofish(raw);
+    if let Some(dot) = clean.rfind('.') {
+        return clean[dot + 1..].trim().to_string();
     }
-    let clean = raw.split("::<").next().unwrap_or(raw).trim();
-    if let Some(parts) = clean.rsplit_once("::") {
-        let left = parts.0.rsplit("::").next().unwrap_or(parts.0);
-        if left.chars().next().is_some_and(|c| c.is_uppercase()) {
-            return format!("{left}::{}", parts.1);
-        }
-        return parts.1.to_string();
+    let clean = clean.trim();
+    if let Some((path, func)) = clean.rsplit_once("::") {
+        let left = path.rsplit("::").next().unwrap_or(path).trim();
+        return match left {
+            "Self" => match self_ty {
+                Some(ty) => format!("{ty}::{func}"),
+                None => format!("Self::{func}"),
+            },
+            "crate" | "super" | "self" | "" => func.to_string(),
+            _ => format!("{left}::{func}"),
+        };
     }
     clean.to_string()
+}
+
+/// Removes `::<...>` generic arguments (nested brackets included) from a path.
+fn strip_turbofish(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find("::<") {
+        out.push_str(&rest[..i]);
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (j, c) in rest[i + 2..].char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 2 + j + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse_rust_use_targets(use_stmt: &str) -> Vec<String> {
@@ -622,5 +670,41 @@ fn collect_asset_string_refs(
         } else {
             collect_asset_string_refs(child, bytes, file_id, seen, out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_callable_name, strip_turbofish};
+
+    #[test]
+    fn callee_names_keep_the_qualifier_that_identifies_them() {
+        let cases = [
+            ("foo", None, "foo"),
+            ("self.state.update", None, "update"),
+            ("Stroke::new", None, "Stroke::new"),
+            ("egui::Stroke::new", None, "Stroke::new"),
+            ("Vec::<u8>::with_capacity", None, "Vec::with_capacity"),
+            ("HashMap::<String, Vec<u8>>::new", None, "HashMap::new"),
+            ("parse::<u32>", None, "parse"),
+            ("x.collect::<Vec<_>>", None, "collect"),
+            ("Self::new", Some("App"), "App::new"),
+            ("Self::new", None, "Self::new"),
+            ("std::fs::read", None, "fs::read"),
+            ("util::helper", None, "util::helper"),
+            ("crate::util::helper", None, "util::helper"),
+            ("crate::helper", None, "helper"),
+            ("super::helper", None, "helper"),
+            ("self::helper", None, "helper"),
+        ];
+        for (raw, self_ty, want) in cases {
+            assert_eq!(extract_callable_name(raw, self_ty), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn turbofish_is_removed_with_nested_brackets() {
+        assert_eq!(strip_turbofish("a::<B<C<D>>>::f"), "a::f");
+        assert_eq!(strip_turbofish("plain::path"), "plain::path");
     }
 }

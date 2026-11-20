@@ -10,6 +10,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// All protocol frames go to stdout; diagnostics must only ever go to stderr.
 pub fn run_mcp_server(repo_root: &Path) -> Result<()> {
     let engine = TrackerEngine::new(repo_root);
+    engine.set_source("mcp:unknown"); // refined by the client name on `initialize`
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -55,6 +56,23 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
     // Notifications (no `id`) must not receive a JSON-RPC response
     let id = id?;
 
+    if method == "initialize" {
+        // Tag telemetry with the calling agent so real usage is separable from CLI/tests
+        let client: String = params
+            .pointer("/clientInfo/name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+            .take(40)
+            .collect();
+        let client = client.trim();
+        engine.set_source(&format!(
+            "mcp:{}",
+            if client.is_empty() { "unknown" } else { client }
+        ));
+    }
+
     let result = match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -65,7 +83,7 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
                 "name": "trackertop",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens."
+            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens. Call project_playbook once at the start, run_checks instead of running tests/lint in a shell, changes_since to catch up after edits, and remember(kind=decision|dismissed, reason=...) to record settled questions. Every answer states its coverage (truncation, NOT INDEXED vs NOT FOUND)."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -128,7 +146,10 @@ fn dispatch_tool_call(
             let symbols: Vec<String> = args
                 .get("symbols")
                 .and_then(Value::as_array)
-                .ok_or((-32602, "Missing required array argument `symbols`".to_string()))?
+                .ok_or((
+                    -32602,
+                    "Missing required array argument `symbols`".to_string(),
+                ))?
                 .iter()
                 .filter_map(Value::as_str)
                 .map(ToString::to_string)
@@ -198,29 +219,52 @@ fn dispatch_tool_call(
             engine.shortest_path(from, to, max_tokens).map(|q| q.text)
         }
         "remember" => {
-            let target = args.get("target").and_then(Value::as_str).unwrap_or("project");
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or("project");
             let note = args
                 .get("note")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "Missing required argument `note`".to_string()))?;
-            engine.remember(target, note)
+            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("note");
+            let reason = args.get("reason").and_then(Value::as_str).unwrap_or("");
+            engine.remember_kind(target, note, kind, reason)
         }
         "recall" => {
             let query = args.get("query").and_then(Value::as_str);
             engine.recall(query)
         }
-        "token_stats" => engine.token_stats().map(|s| {
-            format!(
-                "# TRACKERTOP TOKEN SAVINGS\nQueries: {}\nTokens sent: {}\nBaseline avoided: {}\nNet saved: {} tok ({:.1}%)\nEst. USD saved: ${:.4} (Sonnet) / ${:.4} (Opus)",
-                s.total_queries,
-                s.total_tokens_sent,
-                s.total_baseline_tokens,
-                s.total_tokens_saved,
-                s.savings_percent,
-                s.est_usd_saved_sonnet,
-                s.est_usd_saved_opus
-            )
-        }),
+        "run_checks" => {
+            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("test");
+            let extra = args.get("extra_args").and_then(Value::as_str);
+            let timeout = args
+                .get("timeout_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(600);
+            engine
+                .run_checks(kind, extra, timeout, max_tokens)
+                .map(|q| q.text)
+        }
+        "changes_since" => {
+            let since = args.get("since").and_then(Value::as_str).unwrap_or("HEAD");
+            let list = |key: &str| -> Vec<String> {
+                args.get(key)
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            engine
+                .changes_since(since, &list("paths"), &list("symbols"), max_tokens)
+                .map(|q| q.text)
+        }
+        "project_playbook" => engine.project_playbook(max_tokens).map(|q| q.text),
+        "token_stats" => engine.token_stats().map(|s| s.summary_text(5)),
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
     };
 
@@ -384,12 +428,14 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "remember",
-            "description": "Saves a persistent architectural note attached to a symbol, file path, or 'project'. Automatically surfaced in future sessions when reading that target.",
+            "description": "Saves a persistent note attached to a symbol, file path, or 'project': an architectural rule (kind=note), a decision and why it was made (kind=decision), or a review lead / suspected bug that was checked and rejected (kind=dismissed). Shown automatically whenever that symbol or file is read in later sessions (read_symbol, read_symbols_batch, file_outline), so settled questions are not re-investigated. Also kept as Markdown in .trackertop/notes/.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Symbol name, file path, or 'project'" },
-                    "note": { "type": "string", "description": "Concise architectural rule, gotcha, or invariant" }
+                    "target": { "type": "string", "description": "Symbol name, qualified name, file path, or 'project'" },
+                    "note": { "type": "string", "description": "Concise rule, gotcha, decision, or the dismissed lead" },
+                    "kind": { "type": "string", "enum": ["note", "decision", "dismissed"], "description": "note (default), decision, or dismissed" },
+                    "reason": { "type": "string", "description": "Why (required for decision and dismissed)" }
                 },
                 "required": ["note"]
             }
@@ -401,6 +447,42 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Optional filter keyword" }
+                }
+            }
+        },
+        {
+            "name": "run_checks",
+            "description": "Run the project's tests, lint, build or format check and get a compact summary instead of the full log: pass/fail counts, ONLY the failing test names with their assertion/error lines and file:line, and compiler/linter errors with locations. Use this instead of running `cargo test`, `npm test`, `pytest`, `go test`, clippy or eslint in a shell. Commands are detected from Cargo.toml, package.json scripts, go.mod and pytest/ruff config (marked detected vs guessed). It never hides a failure: a failed run whose output it cannot parse is reported as UNRECOGNIZED FAILURE with the output tail, and timeouts are marked PARTIAL.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "test (default), lint, build, format, or all (format + lint + test)" },
+                    "extra_args": { "type": "string", "description": "Extra arguments for the single matching command, e.g. a test name filter `parser::` or `-p mycrate` (split on whitespace, no shell)" },
+                    "timeout_secs": { "type": "integer", "description": "Kill the command after this many seconds (default 600, max 3600)" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1500); failing names are listed before details" }
+                }
+            }
+        },
+        {
+            "name": "changes_since",
+            "description": "What changed since a git ref (default HEAD = your uncommitted work), including staged, unstaged and untracked files, mapped onto symbols. For each changed file it shows the touched symbols with current line spans, symbols added/removed since the ref, and only the changed lines. Use it to catch up after edits (yours, the user's, a merge or a checkout) instead of re-reading whole files; pass `symbols` to see only hunks touching those symbols. Invalid refs and non-git directories are errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "string", "description": "Git ref to compare against: HEAD (default), HEAD~3, a branch, tag or commit" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative files or directories to limit the diff to" },
+                    "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional symbols: show only hunks that touch them" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 2000)" }
+                }
+            }
+        },
+        {
+            "name": "project_playbook",
+            "description": "Call once at the start of work in a repo: how to build, test, lint and format it, and what CI runs (the bar a change must pass), the toolchain versions, format/lint configs, task-runner targets and agent instruction files to read first (CLAUDE.md, AGENTS.md, ...). Every item is marked detected (declared by the project) or guessed (ecosystem default). Saves opening Cargo.toml, package.json, workflows and configs one by one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1200)" }
                 }
             }
         },

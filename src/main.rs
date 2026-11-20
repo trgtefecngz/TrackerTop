@@ -276,18 +276,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             let s = db.get_token_stats(10)?;
-            println!("=== TrackerTop Token Savings ===");
-            println!("Queries logged   : {}", s.total_queries);
-            println!("Tokens sent      : {}", s.total_tokens_sent);
-            println!("Baseline avoided : {}", s.total_baseline_tokens);
-            println!(
-                "Net tokens saved : {} ({:.1}%)",
-                s.total_tokens_saved, s.savings_percent
-            );
-            println!(
-                "Est. USD saved   : ${:.4} (Sonnet) | ${:.4} (Opus)",
-                s.est_usd_saved_sonnet, s.est_usd_saved_opus
-            );
+            print!("{}", s.summary_text(10));
             if !s.by_tool.is_empty() {
                 println!("\nBy Tool:");
                 for t in &s.by_tool {

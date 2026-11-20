@@ -36,6 +36,23 @@ pub trait LanguageExtractor: Send + Sync {
     fn color_hex(&self) -> &'static str;
     /// Deterministically extract symbols and references from a single file.
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile>;
+    /// Whether symbol spans come from a real parser (tree-sitter) rather than line
+    /// heuristics. Tools tell the agent when spans may be approximate.
+    fn is_syntax_tree(&self) -> bool {
+        false
+    }
+}
+
+impl LanguageRegistry {
+    /// Short extractor-quality label for tool output, e.g. `tree-sitter` or
+    /// `heuristic extractor: spans may be approximate`.
+    pub fn extractor_quality(&self, id: &str) -> &'static str {
+        match self.extractor_by_id(id) {
+            Some(e) if e.is_syntax_tree() => "tree-sitter",
+            Some(_) => "heuristic extractor: spans may be approximate, verify before editing",
+            None => "no extractor",
+        }
+    }
 }
 
 /// Runtime registry of pluggable `LanguageExtractor` implementations.

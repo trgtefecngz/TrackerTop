@@ -6,6 +6,7 @@ use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
 use crate::indexer::index_repository;
 use crate::install::{AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed};
 use crate::model::{EdgeKind, ProjectNote, SymbolKind, TokenStatsSummary};
+use crate::nested::{NestedGraph, NestedKind, NestedLevel, NestedView};
 use crate::parser::default_registry;
 use crate::registry::{
     GlobalOverview, load_global_overview, register_project, remove_project_with_cache,
@@ -37,6 +38,8 @@ enum ProjectTab {
 enum GraphLayoutMode {
     Folders,
     Clusters,
+    /// Matryoshka drill-down: project → communities → files → symbols (`crate::nested`).
+    Nested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,8 @@ struct LoadedProject {
     nodes: Vec<GraphNodeVis>,
     edges: Vec<GraphEdgeVis>,
     islands: Vec<GraphIsland>,
+    /// Kept for the nested (matryoshka) view, which aggregates edges per level on demand.
+    graph: CodeGraph,
 }
 
 struct BgMessage {
@@ -128,6 +133,12 @@ pub struct TrackerTopApp {
     graph_color_mode: GraphColorMode,
     selected_node_idx: Option<usize>,
     dragged_node_idx: Option<usize>,
+
+    // Nested (matryoshka) view state: the level being shown and its cached view, keyed by
+    // (project path, level). An error (e.g. a group vanished after re-indexing) is shown,
+    // never an empty canvas.
+    nested_level: NestedLevel,
+    nested_cache: Option<((String, NestedLevel), Result<NestedView, String>)>,
 }
 
 impl TrackerTopApp {
@@ -182,6 +193,8 @@ impl TrackerTopApp {
             graph_color_mode: GraphColorMode::Language,
             selected_node_idx: None,
             dragged_node_idx: None,
+            nested_level: NestedLevel::Project,
+            nested_cache: None,
         };
         app.reload_selected_project();
         app
@@ -200,6 +213,12 @@ impl TrackerTopApp {
         self.selected_node_idx = None;
         self.dragged_node_idx = None;
         self.preview_result = None;
+        self.nested_cache = None;
+        // A nested level belongs to one project: switching projects starts at its root.
+        // A re-index of the same project keeps the level (a stale one shows an error).
+        if self.loaded.as_ref().map(|lp| lp.path.as_str()) != Some(path.as_str()) {
+            self.nested_level = NestedLevel::Project;
+        }
         self.loaded = load_project_details(Path::new(path)).ok();
         self.recompute_graph_layout();
     }
@@ -252,6 +271,7 @@ impl TrackerTopApp {
 
     fn run_preview_query(&mut self, repo_path: &str) {
         let engine = TrackerEngine::new(Path::new(repo_path));
+        engine.set_source("ui");
         match engine.preview_repo_map(900) {
             Ok(out) => {
                 let pct = if out.baseline_tokens > 0 {
@@ -1099,9 +1119,16 @@ impl TrackerTopApp {
         ui.columns(4, |cols| {
             glow_kpi_card(
                 &mut cols[0],
-                "NET TOKENS SAVED",
-                &fmt_num(s.total_tokens_saved),
-                &format!("{:.1}% reduction", s.savings_percent),
+                "TOKENS SAVED (RANGE)",
+                &format!(
+                    "{}–{}",
+                    fmt_num(s.conservative_tokens_saved),
+                    fmt_num(s.total_tokens_saved)
+                ),
+                &format!(
+                    "{:.0}–{:.0}% · conservative–upper · AI agents only",
+                    s.conservative_savings_percent, s.savings_percent
+                ),
                 Color32::from_rgb(110, 231, 183),
                 Color32::from_rgb(52, 211, 153),
             );
@@ -1439,6 +1466,7 @@ impl TrackerTopApp {
                     .selected_text(match self.graph_layout_mode {
                         GraphLayoutMode::Folders => "Layout: Folders",
                         GraphLayoutMode::Clusters => "Layout: Clusters",
+                        GraphLayoutMode::Nested => "Layout: Nested",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -1450,6 +1478,14 @@ impl TrackerTopApp {
                             &mut self.graph_layout_mode,
                             GraphLayoutMode::Clusters,
                             "Layout: Clusters",
+                        );
+                        ui.selectable_value(
+                            &mut self.graph_layout_mode,
+                            GraphLayoutMode::Nested,
+                            "Layout: Nested",
+                        )
+                        .on_hover_text(
+                            "Project → communities → files → symbols, one level at a time",
                         );
                     });
                 if self.graph_layout_mode != prev_layout {
@@ -1487,6 +1523,11 @@ impl TrackerTopApp {
             self.recompute_graph_layout();
         }
         ui.add_space(10.0);
+
+        if self.graph_layout_mode == GraphLayoutMode::Nested {
+            self.render_nested_graph(ui);
+            return;
+        }
 
         let avail = ui.available_size();
         let inspector_w = if self.selected_node_idx.is_some() {
@@ -1930,6 +1971,310 @@ impl TrackerTopApp {
                     });
                 }
         });
+    }
+
+    /// Matryoshka view: shows one level (project → communities → files → symbols) with
+    /// aggregated edges. Click a node to drill in, a breadcrumb to go back up.
+    fn render_nested_graph(&mut self, ui: &mut egui::Ui) {
+        let Some(ref lp) = self.loaded else {
+            ui.label("No project loaded.");
+            return;
+        };
+        let key = (lp.path.clone(), self.nested_level.clone());
+        if self.nested_cache.as_ref().map(|(k, _)| k) != Some(&key) {
+            let view = NestedGraph::new(&lp.graph)
+                .view(&self.nested_level)
+                .map_err(|e| e.to_string());
+            self.nested_cache = Some((key, view));
+        }
+        let Some((_, view)) = self.nested_cache.as_ref() else {
+            return;
+        };
+        let view = match view {
+            Ok(v) => v,
+            Err(msg) => {
+                ui.colored_label(Color32::from_rgb(248, 113, 113), msg.clone());
+                if ui.button("Back to Project").clicked() {
+                    self.nested_level = NestedLevel::Project;
+                }
+                return;
+            }
+        };
+
+        let mut next_level: Option<NestedLevel> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (i, (label, level)) in view.breadcrumbs.iter().enumerate() {
+                if i > 0 {
+                    ui.label(RichText::new("›").color(Color32::from_rgb(148, 163, 184)));
+                }
+                let current = i + 1 == view.breadcrumbs.len();
+                let text = RichText::new(truncate_label_tail(label, 48)).strong();
+                if current {
+                    ui.label(text);
+                } else if ui.link(text).clicked() {
+                    next_level = Some(level.clone());
+                }
+            }
+        });
+        ui.label(
+            RichText::new(NestedGraph::coverage_line(view))
+                .small()
+                .color(Color32::from_rgb(148, 163, 184)),
+        );
+        ui.add_space(6.0);
+
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(
+            Vec2::new(avail.x.max(240.0), (avail.y - 6.0).max(200.0)),
+            Sense::click(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(9, 13, 24));
+        if let Some(ref tex) = self.backdrop_tex {
+            paint_smooth_aurora(&painter, rect, tex.id());
+        }
+
+        let n = view.nodes.len();
+        if n == 0 {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "This level has no children.",
+                egui::FontId::proportional(14.0),
+                Color32::from_rgb(148, 163, 184),
+            );
+        }
+
+        // Ring layout on an ellipse. No three points of a strictly convex curve are
+        // collinear, so an edge never runs through a third node (as it did on a grid), and
+        // labels sit outside the ring, away from the edges.
+        let center = Pos2::new(rect.center().x, rect.center().y - 10.0);
+        let rx0 = (rect.width() * 0.5 - 150.0).max(60.0);
+        let ry0 = (rect.height() * 0.5 - 44.0).max(60.0);
+        let perimeter = std::f32::consts::TAU * ((rx0 * rx0 + ry0 * ry0) * 0.5).sqrt();
+        let max_r = (perimeter / n.max(1) as f32 * 0.4).clamp(3.0, 40.0);
+        let (rx, ry) = ((rx0 - max_r).max(40.0), (ry0 - max_r).max(40.0));
+        let angle = |i: usize| {
+            -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n.max(1) as f32
+        };
+        let max_tok = view
+            .nodes
+            .iter()
+            .map(|x| x.tokens)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        let reg = default_registry();
+        let pos: Vec<Pos2> = (0..n)
+            .map(|i| {
+                let a = angle(i);
+                Pos2::new(center.x + rx * a.cos(), center.y + ry * a.sin())
+            })
+            .collect();
+        let radius: Vec<f32> = view
+            .nodes
+            .iter()
+            .map(|x| (max_r * (x.tokens as f32 / max_tok).sqrt()).max(3.0))
+            .collect();
+
+        let hovered: Option<usize> = resp.hover_pos().and_then(|h| {
+            (0..n)
+                .filter(|&i| h.distance(pos[i]) <= radius[i].max(6.0))
+                .min_by(|&a, &b| h.distance(pos[a]).total_cmp(&h.distance(pos[b])))
+        });
+
+        // Edges are directed. Both directions of one pair are drawn side by side with
+        // arrowheads instead of on top of each other. Counts are drawn for every edge when
+        // there are few, otherwise for the hovered node's edges only.
+        const OUT_RGB: (u8, u8, u8) = (125, 211, 252);
+        const IN_RGB: (u8, u8, u8) = (251, 191, 36);
+        let pairs: HashSet<(usize, usize)> = view.edges.iter().map(|e| (e.src, e.tgt)).collect();
+        let max_w = view.edges.iter().map(|e| e.weight).max().unwrap_or(1) as f32;
+        let label_all = view.edges.len() <= 30;
+        let mut count_labels: Vec<(Pos2, String, Color32)> = Vec::new();
+        let (mut out_edges, mut in_edges) = (0usize, 0usize);
+        for e in &view.edges {
+            let (a, b) = (pos[e.src], pos[e.tgt]);
+            let len = (b - a).length();
+            if e.src == e.tgt || len < 1.0 {
+                continue;
+            }
+            let dir = (b - a) / len;
+            let normal = Vec2::new(-dir.y, dir.x);
+            let off = if pairs.contains(&(e.tgt, e.src)) {
+                normal * 3.0
+            } else {
+                Vec2::ZERO
+            };
+            let start = a + dir * radius[e.src] + off;
+            let end = b - dir * (radius[e.tgt] + 1.0) + off;
+            if (end - start).length() < 2.0 {
+                continue;
+            }
+            let t = (e.weight as f32 / max_w).sqrt();
+            let rgba = |(r, g, b): (u8, u8, u8), alpha: f32| {
+                Color32::from_rgba_unmultiplied(r, g, b, alpha as u8)
+            };
+            let incident = hovered.map(|h| h == e.src || h == e.tgt);
+            let (color, width) = match incident {
+                Some(true) if hovered == Some(e.src) => {
+                    out_edges += 1;
+                    (rgba(OUT_RGB, 235.0), 1.6 + 2.4 * t)
+                }
+                Some(true) => {
+                    in_edges += 1;
+                    (rgba(IN_RGB, 235.0), 1.6 + 2.4 * t)
+                }
+                Some(false) => (rgba(OUT_RGB, 22.0), 0.8),
+                None => (rgba(OUT_RGB, 70.0 + 140.0 * t), 0.8 + 2.2 * t),
+            };
+            painter.line_segment([start, end], Stroke::new(width, color));
+            if incident != Some(false) {
+                let head = 7.0_f32.min((end - start).length() * 0.3);
+                let back = end - dir * head;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        end,
+                        back + normal * head * 0.45,
+                        back - normal * head * 0.45,
+                    ],
+                    color,
+                    Stroke::NONE,
+                ));
+            }
+            if incident == Some(true) || (hovered.is_none() && label_all) {
+                // Hovered: put the count near the other node, so counts spread around the ring.
+                let at = match incident {
+                    Some(true) if hovered == Some(e.src) => 0.75,
+                    Some(true) => 0.25,
+                    // The two directions of one pair get separate spots (each toward its
+                    // own target) so their counts do not cover each other.
+                    _ if off != Vec2::ZERO => 0.62,
+                    _ => 0.5,
+                };
+                let at_pos = start + (end - start) * at + off * 3.0;
+                count_labels.push((at_pos, fmt_num(e.weight), color));
+            }
+        }
+
+        let label_color = Color32::from_rgb(226, 232, 240);
+        let obstacles: Vec<Rect> = (0..n)
+            .map(|i| Rect::from_center_size(pos[i], Vec2::splat(radius[i] * 2.0)))
+            .collect();
+        for (i, node) in view.nodes.iter().enumerate() {
+            let color = match node.kind {
+                NestedKind::Community => cluster_color(i),
+                NestedKind::File => parse_hex_color(reg.color_for(&node.detail)),
+                NestedKind::Symbol => Color32::from_rgb(167, 139, 250),
+            };
+            painter.circle_filled(pos[i], radius[i], color);
+            if hovered == Some(i) {
+                painter.circle_stroke(
+                    pos[i],
+                    radius[i] + 2.0,
+                    Stroke::new(2.0_f32, Color32::WHITE),
+                );
+            }
+        }
+
+        // Labels: largest nodes first; a label that would overlap another label or node, or
+        // leave the canvas, is skipped (hover still names the node) rather than drawn on top.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| view.nodes[b].tokens.cmp(&view.nodes[a].tokens));
+        let mut placed: Vec<Rect> = Vec::new();
+        let mut skipped_labels = 0usize;
+        for i in order {
+            let (c, s) = (angle(i).cos(), angle(i).sin());
+            let galley = painter.layout_no_wrap(
+                truncate_label_tail(&view.nodes[i].label, 28),
+                egui::FontId::proportional(11.0),
+                label_color,
+            );
+            let size = galley.size();
+            let anchor = pos[i] + Vec2::new(c, s) * (radius[i] + 4.0);
+            let min = if c > 0.35 {
+                Pos2::new(anchor.x, anchor.y - size.y * 0.5)
+            } else if c < -0.35 {
+                Pos2::new(anchor.x - size.x, anchor.y - size.y * 0.5)
+            } else if s < 0.0 {
+                Pos2::new(anchor.x - size.x * 0.5, anchor.y - size.y)
+            } else {
+                Pos2::new(anchor.x - size.x * 0.5, anchor.y)
+            };
+            let r = Rect::from_min_size(min, size);
+            let blocked = !rect.contains_rect(r)
+                || placed.iter().any(|p| p.expand(2.0).intersects(r))
+                || obstacles
+                    .iter()
+                    .enumerate()
+                    .any(|(j, o)| j != i && o.intersects(r));
+            if blocked {
+                skipped_labels += 1;
+                continue;
+            }
+            placed.push(r);
+            painter.galley(min, galley, label_color);
+        }
+
+        for (p, text, color) in count_labels {
+            let galley =
+                painter.layout_no_wrap(text, egui::FontId::proportional(10.0), Color32::WHITE);
+            let r = Rect::from_center_size(p, galley.size() + Vec2::new(8.0, 2.0));
+            painter.rect_filled(
+                r,
+                CornerRadius::same(4),
+                Color32::from_rgba_unmultiplied(9, 13, 24, 225),
+            );
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(4),
+                Stroke::new(1.0_f32, color),
+                StrokeKind::Inside,
+            );
+            painter.galley(r.center() - galley.size() * 0.5, galley, Color32::WHITE);
+        }
+
+        let footer = if let Some(i) = hovered {
+            let node = &view.nodes[i];
+            let mut info = format!("{}  ·  {} tok", node.label, fmt_num(node.tokens));
+            match node.kind {
+                NestedKind::Community => info.push_str(&format!("  ·  {} files", node.child_count)),
+                NestedKind::File => info.push_str(&format!("  ·  {} symbols", node.child_count)),
+                NestedKind::Symbol => info.push_str(&format!("  ·  {}", node.detail)),
+            }
+            if let Some(loc) = &node.location {
+                info.push_str(&format!("  ·  {loc}"));
+            }
+            info.push_str(&format!(
+                "  ·  edges here: {out_edges} out (blue), {in_edges} in (amber)"
+            ));
+            if node.drill.is_some() {
+                info.push_str("  ·  click to open");
+            }
+            if resp.clicked() {
+                next_level = node.drill.clone();
+            }
+            (info, Color32::WHITE)
+        } else {
+            let mut hint = String::from("Hover a node for its edges and counts; click to open.");
+            if skipped_labels > 0 {
+                hint.push_str(&format!(
+                    "  {skipped_labels} labels hidden to avoid overlap."
+                ));
+            }
+            (hint, Color32::from_rgb(148, 163, 184))
+        };
+        painter.text(
+            Pos2::new(rect.left() + 12.0, rect.bottom() - 8.0),
+            egui::Align2::LEFT_BOTTOM,
+            footer.0,
+            egui::FontId::proportional(12.0),
+            footer.1,
+        );
+
+        if let Some(level) = next_level {
+            self.nested_level = level;
+        }
     }
 
     fn render_architecture_tab(&mut self, ui: &mut egui::Ui) {
@@ -2511,6 +2856,7 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         nodes,
         edges,
         islands: Vec::new(),
+        graph: cg,
     })
 }
 
@@ -2561,7 +2907,7 @@ fn arrange_structured_islands(
             continue;
         }
         let key = match mode {
-            GraphLayoutMode::Folders => n.group_folder.clone(),
+            GraphLayoutMode::Folders | GraphLayoutMode::Nested => n.group_folder.clone(),
             GraphLayoutMode::Clusters => format!("Cluster {}", n.community + 1),
         };
         groups.entry(key).or_default().push(idx);
@@ -2886,6 +3232,19 @@ fn fmt_num(n: usize) -> String {
     out.chars().rev().collect()
 }
 
+/// Shortens a label from the front, keeping its distinctive end (`...kuzgun/tests/a`,
+/// `...App::render`). Cutting the end made sibling paths identical.
+fn truncate_label_tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(3);
+        let tail: String = s.chars().skip(count - keep).collect();
+        format!("...{tail}")
+    }
+}
+
 fn truncate_label(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -2893,5 +3252,22 @@ fn truncate_label(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(3)).collect();
         t.push_str("...");
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_label_tail;
+
+    #[test]
+    fn tail_truncation_keeps_sibling_paths_distinct() {
+        let a = truncate_label_tail("tools/kuzgun/tests/fixtures/alpha.rs", 20);
+        let b = truncate_label_tail("tools/kuzgun/tests/fixtures/beta.rs", 20);
+        assert_ne!(a, b);
+        assert!(a.ends_with("alpha.rs") && a.starts_with("..."));
+        assert_eq!(a.chars().count(), 20);
+        assert_eq!(truncate_label_tail("short", 20), "short");
+        // Multi-byte characters are cut on char boundaries.
+        assert_eq!(truncate_label_tail("çğüşöıçğüşö", 6), "...üşö");
     }
 }

@@ -1,3 +1,5 @@
+pub mod changes;
+pub mod checks;
 pub mod context;
 pub mod db;
 pub mod fsutil;
@@ -7,7 +9,9 @@ pub mod indexer;
 pub mod install;
 pub mod mcp;
 pub mod model;
+pub mod nested;
 pub mod parser;
+pub mod playbook;
 pub mod registry;
 pub mod report;
 pub mod tokens;
