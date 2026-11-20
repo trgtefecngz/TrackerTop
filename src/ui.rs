@@ -214,6 +214,11 @@ impl TrackerTopApp {
         self.dragged_node_idx = None;
         self.preview_result = None;
         self.nested_cache = None;
+        // A nested level belongs to one project: switching projects starts at its root.
+        // A re-index of the same project keeps the level (a stale one shows an error).
+        if self.loaded.as_ref().map(|lp| lp.path.as_str()) != Some(path.as_str()) {
+            self.nested_level = NestedLevel::Project;
+        }
         self.loaded = load_project_details(Path::new(path)).ok();
         self.recompute_graph_layout();
     }
@@ -2003,7 +2008,7 @@ impl TrackerTopApp {
                     ui.label(RichText::new("›").color(Color32::from_rgb(148, 163, 184)));
                 }
                 let current = i + 1 == view.breadcrumbs.len();
-                let text = RichText::new(truncate_label(label, 40)).strong();
+                let text = RichText::new(truncate_label_tail(label, 48)).strong();
                 if current {
                     ui.label(text);
                 } else if ui.link(text).clicked() {
@@ -2040,14 +2045,18 @@ impl TrackerTopApp {
             );
         }
 
-        // Grid layout; node radius grows with sqrt(tokens) relative to the largest child.
-        let cols = (n as f32).sqrt().ceil().max(1.0) as usize;
-        let rows = n.div_ceil(cols).max(1);
-        let cell = Vec2::new(
-            rect.width() / cols as f32,
-            (rect.height() - 24.0) / rows as f32,
-        );
-        let max_r = (cell.x.min(cell.y) * 0.32).clamp(3.0, 60.0);
+        // Ring layout on an ellipse. No three points of a strictly convex curve are
+        // collinear, so an edge never runs through a third node (as it did on a grid), and
+        // labels sit outside the ring, away from the edges.
+        let center = Pos2::new(rect.center().x, rect.center().y - 10.0);
+        let rx0 = (rect.width() * 0.5 - 150.0).max(60.0);
+        let ry0 = (rect.height() * 0.5 - 44.0).max(60.0);
+        let perimeter = std::f32::consts::TAU * ((rx0 * rx0 + ry0 * ry0) * 0.5).sqrt();
+        let max_r = (perimeter / n.max(1) as f32 * 0.4).clamp(3.0, 40.0);
+        let (rx, ry) = ((rx0 - max_r).max(40.0), (ry0 - max_r).max(40.0));
+        let angle = |i: usize| {
+            -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n.max(1) as f32
+        };
         let max_tok = view
             .nodes
             .iter()
@@ -2058,11 +2067,8 @@ impl TrackerTopApp {
         let reg = default_registry();
         let pos: Vec<Pos2> = (0..n)
             .map(|i| {
-                let (c, r) = ((i % cols) as f32, (i / cols) as f32);
-                Pos2::new(
-                    rect.left() + (c + 0.5) * cell.x,
-                    rect.top() + 12.0 + (r + 0.5) * cell.y,
-                )
+                let a = angle(i);
+                Pos2::new(center.x + rx * a.cos(), center.y + ry * a.sin())
             })
             .collect();
         let radius: Vec<f32> = view
@@ -2071,20 +2077,90 @@ impl TrackerTopApp {
             .map(|x| (max_r * (x.tokens as f32 / max_tok).sqrt()).max(3.0))
             .collect();
 
+        let hovered: Option<usize> = resp.hover_pos().and_then(|h| {
+            (0..n)
+                .filter(|&i| h.distance(pos[i]) <= radius[i].max(6.0))
+                .min_by(|&a, &b| h.distance(pos[a]).total_cmp(&h.distance(pos[b])))
+        });
+
+        // Edges are directed. Both directions of one pair are drawn side by side with
+        // arrowheads instead of on top of each other. Counts are drawn for every edge when
+        // there are few, otherwise for the hovered node's edges only.
+        const OUT_RGB: (u8, u8, u8) = (125, 211, 252);
+        const IN_RGB: (u8, u8, u8) = (251, 191, 36);
+        let pairs: HashSet<(usize, usize)> = view.edges.iter().map(|e| (e.src, e.tgt)).collect();
         let max_w = view.edges.iter().map(|e| e.weight).max().unwrap_or(1) as f32;
+        let label_all = view.edges.len() <= 30;
+        let mut count_labels: Vec<(Pos2, String, Color32)> = Vec::new();
+        let (mut out_edges, mut in_edges) = (0usize, 0usize);
         for e in &view.edges {
+            let (a, b) = (pos[e.src], pos[e.tgt]);
+            let len = (b - a).length();
+            if e.src == e.tgt || len < 1.0 {
+                continue;
+            }
+            let dir = (b - a) / len;
+            let normal = Vec2::new(-dir.y, dir.x);
+            let off = if pairs.contains(&(e.tgt, e.src)) {
+                normal * 3.0
+            } else {
+                Vec2::ZERO
+            };
+            let start = a + dir * radius[e.src] + off;
+            let end = b - dir * (radius[e.tgt] + 1.0) + off;
+            if (end - start).length() < 2.0 {
+                continue;
+            }
             let t = (e.weight as f32 / max_w).sqrt();
-            painter.line_segment(
-                [pos[e.src], pos[e.tgt]],
-                Stroke::new(
-                    0.6 + 3.0 * t,
-                    Color32::from_rgba_unmultiplied(125, 211, 252, (40.0 + 150.0 * t) as u8),
-                ),
-            );
+            let rgba = |(r, g, b): (u8, u8, u8), alpha: f32| {
+                Color32::from_rgba_unmultiplied(r, g, b, alpha as u8)
+            };
+            let incident = hovered.map(|h| h == e.src || h == e.tgt);
+            let (color, width) = match incident {
+                Some(true) if hovered == Some(e.src) => {
+                    out_edges += 1;
+                    (rgba(OUT_RGB, 235.0), 1.6 + 2.4 * t)
+                }
+                Some(true) => {
+                    in_edges += 1;
+                    (rgba(IN_RGB, 235.0), 1.6 + 2.4 * t)
+                }
+                Some(false) => (rgba(OUT_RGB, 22.0), 0.8),
+                None => (rgba(OUT_RGB, 70.0 + 140.0 * t), 0.8 + 2.2 * t),
+            };
+            painter.line_segment([start, end], Stroke::new(width, color));
+            if incident != Some(false) {
+                let head = 7.0_f32.min((end - start).length() * 0.3);
+                let back = end - dir * head;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        end,
+                        back + normal * head * 0.45,
+                        back - normal * head * 0.45,
+                    ],
+                    color,
+                    Stroke::NONE,
+                ));
+            }
+            if incident == Some(true) || (hovered.is_none() && label_all) {
+                // Hovered: put the count near the other node, so counts spread around the ring.
+                let at = match incident {
+                    Some(true) if hovered == Some(e.src) => 0.75,
+                    Some(true) => 0.25,
+                    // The two directions of one pair get separate spots (each toward its
+                    // own target) so their counts do not cover each other.
+                    _ if off != Vec2::ZERO => 0.62,
+                    _ => 0.5,
+                };
+                let at_pos = start + (end - start) * at + off * 3.0;
+                count_labels.push((at_pos, fmt_num(e.weight), color));
+            }
         }
 
-        let hover = resp.hover_pos();
-        let mut hovered: Option<usize> = None;
+        let label_color = Color32::from_rgb(226, 232, 240);
+        let obstacles: Vec<Rect> = (0..n)
+            .map(|i| Rect::from_center_size(pos[i], Vec2::splat(radius[i] * 2.0)))
+            .collect();
         for (i, node) in view.nodes.iter().enumerate() {
             let color = match node.kind {
                 NestedKind::Community => cluster_color(i),
@@ -2092,26 +2168,73 @@ impl TrackerTopApp {
                 NestedKind::Symbol => Color32::from_rgb(167, 139, 250),
             };
             painter.circle_filled(pos[i], radius[i], color);
-            if hover.is_some_and(|h| h.distance(pos[i]) <= radius[i].max(6.0)) {
-                hovered = Some(i);
+            if hovered == Some(i) {
                 painter.circle_stroke(
                     pos[i],
                     radius[i] + 2.0,
                     Stroke::new(2.0_f32, Color32::WHITE),
                 );
             }
-            if n <= 80 {
-                painter.text(
-                    pos[i] + Vec2::new(0.0, radius[i] + 3.0),
-                    egui::Align2::CENTER_TOP,
-                    truncate_label(&node.label, 22),
-                    egui::FontId::proportional(11.0),
-                    Color32::from_rgb(226, 232, 240),
-                );
-            }
         }
 
-        if let Some(i) = hovered {
+        // Labels: largest nodes first; a label that would overlap another label or node, or
+        // leave the canvas, is skipped (hover still names the node) rather than drawn on top.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| view.nodes[b].tokens.cmp(&view.nodes[a].tokens));
+        let mut placed: Vec<Rect> = Vec::new();
+        let mut skipped_labels = 0usize;
+        for i in order {
+            let (c, s) = (angle(i).cos(), angle(i).sin());
+            let galley = painter.layout_no_wrap(
+                truncate_label_tail(&view.nodes[i].label, 28),
+                egui::FontId::proportional(11.0),
+                label_color,
+            );
+            let size = galley.size();
+            let anchor = pos[i] + Vec2::new(c, s) * (radius[i] + 4.0);
+            let min = if c > 0.35 {
+                Pos2::new(anchor.x, anchor.y - size.y * 0.5)
+            } else if c < -0.35 {
+                Pos2::new(anchor.x - size.x, anchor.y - size.y * 0.5)
+            } else if s < 0.0 {
+                Pos2::new(anchor.x - size.x * 0.5, anchor.y - size.y)
+            } else {
+                Pos2::new(anchor.x - size.x * 0.5, anchor.y)
+            };
+            let r = Rect::from_min_size(min, size);
+            let blocked = !rect.contains_rect(r)
+                || placed.iter().any(|p| p.expand(2.0).intersects(r))
+                || obstacles
+                    .iter()
+                    .enumerate()
+                    .any(|(j, o)| j != i && o.intersects(r));
+            if blocked {
+                skipped_labels += 1;
+                continue;
+            }
+            placed.push(r);
+            painter.galley(min, galley, label_color);
+        }
+
+        for (p, text, color) in count_labels {
+            let galley =
+                painter.layout_no_wrap(text, egui::FontId::proportional(10.0), Color32::WHITE);
+            let r = Rect::from_center_size(p, galley.size() + Vec2::new(8.0, 2.0));
+            painter.rect_filled(
+                r,
+                CornerRadius::same(4),
+                Color32::from_rgba_unmultiplied(9, 13, 24, 225),
+            );
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(4),
+                Stroke::new(1.0_f32, color),
+                StrokeKind::Inside,
+            );
+            painter.galley(r.center() - galley.size() * 0.5, galley, Color32::WHITE);
+        }
+
+        let footer = if let Some(i) = hovered {
             let node = &view.nodes[i];
             let mut info = format!("{}  ·  {} tok", node.label, fmt_num(node.tokens));
             match node.kind {
@@ -2122,20 +2245,32 @@ impl TrackerTopApp {
             if let Some(loc) = &node.location {
                 info.push_str(&format!("  ·  {loc}"));
             }
+            info.push_str(&format!(
+                "  ·  edges here: {out_edges} out (blue), {in_edges} in (amber)"
+            ));
             if node.drill.is_some() {
                 info.push_str("  ·  click to open");
             }
-            painter.text(
-                Pos2::new(rect.left() + 12.0, rect.bottom() - 10.0),
-                egui::Align2::LEFT_BOTTOM,
-                info,
-                egui::FontId::proportional(12.0),
-                Color32::WHITE,
-            );
             if resp.clicked() {
                 next_level = node.drill.clone();
             }
-        }
+            (info, Color32::WHITE)
+        } else {
+            let mut hint = String::from("Hover a node for its edges and counts; click to open.");
+            if skipped_labels > 0 {
+                hint.push_str(&format!(
+                    "  {skipped_labels} labels hidden to avoid overlap."
+                ));
+            }
+            (hint, Color32::from_rgb(148, 163, 184))
+        };
+        painter.text(
+            Pos2::new(rect.left() + 12.0, rect.bottom() - 8.0),
+            egui::Align2::LEFT_BOTTOM,
+            footer.0,
+            egui::FontId::proportional(12.0),
+            footer.1,
+        );
 
         if let Some(level) = next_level {
             self.nested_level = level;
@@ -3097,6 +3232,19 @@ fn fmt_num(n: usize) -> String {
     out.chars().rev().collect()
 }
 
+/// Shortens a label from the front, keeping its distinctive end (`...kuzgun/tests/a`,
+/// `...App::render`). Cutting the end made sibling paths identical.
+fn truncate_label_tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(3);
+        let tail: String = s.chars().skip(count - keep).collect();
+        format!("...{tail}")
+    }
+}
+
 fn truncate_label(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -3104,5 +3252,22 @@ fn truncate_label(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(3)).collect();
         t.push_str("...");
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_label_tail;
+
+    #[test]
+    fn tail_truncation_keeps_sibling_paths_distinct() {
+        let a = truncate_label_tail("tools/kuzgun/tests/fixtures/alpha.rs", 20);
+        let b = truncate_label_tail("tools/kuzgun/tests/fixtures/beta.rs", 20);
+        assert_ne!(a, b);
+        assert!(a.ends_with("alpha.rs") && a.starts_with("..."));
+        assert_eq!(a.chars().count(), 20);
+        assert_eq!(truncate_label_tail("short", 20), "short");
+        // Multi-byte characters are cut on char boundaries.
+        assert_eq!(truncate_label_tail("çğüşöıçğüşö", 6), "...üşö");
     }
 }
