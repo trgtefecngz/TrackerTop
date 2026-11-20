@@ -2210,3 +2210,112 @@ pub fn real_assoc() -> usize { Set::all().len() }
     assert_eq!(from("real_assoc").len(), 1, "{calls:?}");
     assert!(from("real_assoc")[0].contains("::Set::all#"), "{calls:?}");
 }
+
+/// The health check reports only real issues: Rust module cycles and doc mentions are not
+/// dependency cycles, scripts and entry points run directly are not orphans (they are
+/// listed apart, with the reason), and only size outliers are oversized.
+#[test]
+fn health_check_reports_only_real_issues() {
+    use trackertop::graph::CodeGraph;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    for d in ["src", "scripts", "web"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    // A real import cycle (TypeScript)
+    std::fs::write(
+        root.join("web/c.ts"),
+        "import { d } from \"./d\";\nexport function c(): number {\n  return d();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("web/d.ts"),
+        "import { c } from \"./c\";\nexport function d(): number {\n  return c();\n}\n",
+    )
+    .unwrap();
+    // Rust modules that call each other: allowed
+    std::fs::write(root.join("src/lib.rs"), "pub mod x;\npub mod y;\n").unwrap();
+    std::fs::write(
+        root.join("src/x.rs"),
+        "pub fn ping(n: u32) -> u32 { if n == 0 { 0 } else { crate::y::pong(n - 1) } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/y.rs"),
+        "pub fn pong(n: u32) -> u32 { crate::x::ping(n) }\n",
+    )
+    .unwrap();
+    // Docs mentioning both TS files in both directions are no dependency
+    std::fs::write(
+        root.join("README.md"),
+        "# Demo\n\nSee `web/c.ts` and `web/d.ts`.\n",
+    )
+    .unwrap();
+    // An installer run by the user and a file nothing refers to
+    std::fs::write(
+        root.join("scripts/install.ps1"),
+        "function Install-Demo {\n  Write-Host 'hi'\n}\nInstall-Demo\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("web/lonely.py"), "def lonely():\n    return 1\n").unwrap();
+    // Many ordinary files and one size outlier
+    for i in 0..12 {
+        let body: String = (0..20)
+            .map(|j| format!("export function f{i}_{j}(a: number): number {{ return a + {j}; }}\n"))
+            .collect();
+        std::fs::write(root.join(format!("web/m{i}.ts")), body).unwrap();
+    }
+    let big: String = (0..900)
+        .map(|j| {
+            format!("export function big_{j}(alpha: number, beta: number): number {{ return alpha * {j} + beta; }}\n")
+        })
+        .collect();
+    std::fs::write(root.join("web/big.ts"), big).unwrap();
+    // Larger than the rest but not an outlier: a fixed 3,500-token threshold flagged it
+    let mid: String = (0..250)
+        .map(|j| {
+            format!("export function mid_{j}(alpha: number, beta: number): number {{ return alpha * {j} + beta; }}\n")
+        })
+        .collect();
+    std::fs::write(root.join("web/mid.ts"), mid).unwrap();
+    index_repository(root, true).unwrap();
+
+    let db = trackertop::db::Database::open_for_repo(root).unwrap();
+    let hr = CodeGraph::load(&db).unwrap().health_report();
+    assert_eq!(
+        hr.circular_groups,
+        vec![vec!["web/c.ts".to_string(), "web/d.ts".to_string()]],
+        "{hr:#?}"
+    );
+    assert_eq!(hr.cycle_exempt_files, 3, "{hr:#?}");
+    assert!(
+        hr.orphan_files.contains(&"web/lonely.py".to_string()),
+        "{hr:#?}"
+    );
+    assert!(
+        !hr.orphan_files
+            .iter()
+            .any(|p| p.starts_with("scripts/") || p.starts_with("src/")),
+        "{hr:#?}"
+    );
+    assert!(
+        hr.orphan_excluded
+            .iter()
+            .any(|(p, why)| p == "scripts/install.ps1" && why.contains("script")),
+        "{hr:#?}"
+    );
+    let oversized: Vec<&str> = hr.bloated_files.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(oversized, vec!["web/big.ts"], "{hr:#?}");
+    assert!(hr.bloat_threshold >= trackertop::graph::BLOAT_FLOOR_TOKENS);
+
+    let engine = TrackerEngine::new(root);
+    let text = engine.health_check(2_000).unwrap().text;
+    for want in [
+        "Coverage:",
+        "3 Rust files left out",
+        "`scripts/install.ps1` — script run directly",
+        "`web/big.ts`",
+    ] {
+        assert!(text.contains(want), "missing {want:?}:\n{text}");
+    }
+}

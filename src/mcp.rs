@@ -409,7 +409,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "health_check",
-            "description": "Code health & AI-friendliness diagnostics: finds token-bloated files (>=3500 tok), circular dependency cycles, and potential orphan code files.",
+            "description": "Code health & AI-friendliness diagnostics: oversized files (size outliers of this repo, largest first), circular dependency cycles through code (Rust module cycles are allowed), and orphan code files (entry points and scripts run directly are listed apart). States what it covered.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

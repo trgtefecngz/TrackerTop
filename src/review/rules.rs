@@ -6,7 +6,7 @@
 //! it is not.
 
 use super::{Change, ChangeSet, ChangedSymbol, Span};
-use crate::graph::CodeGraph;
+use crate::graph::{CodeGraph, file_cycles};
 use crate::model::{EdgeKind, Symbol, SymbolKind};
 use petgraph::Direction;
 use petgraph::visit::EdgeRef;
@@ -421,70 +421,6 @@ fn impact(cs: &ChangeSet, head: &CodeGraph, out: &mut Vec<Finding>) {
     }
 }
 
-/// File-to-file dependencies through code only (calls, type uses, impls, imports) between
-/// code files: doc mentions and co-change history are not dependencies. Rust files are
-/// left out: modules of one crate depend on each other freely and such cycles are not a
-/// problem there, unlike import cycles in JS/TS or Python. Each pair keeps one example
-/// `(path:line source symbol, target symbol)`.
-fn code_file_edges(cg: &CodeGraph) -> BTreeMap<(String, String), String> {
-    let is_code = |path: &str| {
-        cg.files.get(path).is_some_and(|f| {
-            !matches!(
-                f.language.as_str(),
-                "markdown" | "toml" | "json" | "rust" | "html" | "css"
-            )
-        })
-    };
-    let mut out = BTreeMap::new();
-    for e in &cg.edges {
-        if !matches!(
-            e.kind,
-            EdgeKind::Calls | EdgeKind::UsesType | EdgeKind::Implements | EdgeKind::Imports
-        ) {
-            continue;
-        }
-        let (Some(s), Some(t)) = (cg.symbols.get(&e.source_id), cg.symbols.get(&e.target_id))
-        else {
-            continue;
-        };
-        if s.file_path == t.file_path || !is_code(&s.file_path) || !is_code(&t.file_path) {
-            continue;
-        }
-        out.entry((s.file_path.clone(), t.file_path.clone()))
-            .or_insert_with(|| {
-                format!(
-                    "{}:{} {} -> {}:{} {}",
-                    s.file_path,
-                    s.start_line,
-                    s.qualified_name,
-                    t.file_path,
-                    t.start_line,
-                    t.qualified_name
-                )
-            });
-    }
-    out
-}
-
-/// Groups of files that depend on each other in a cycle (strongly connected, ≥ 2 files).
-fn file_cycles(edges: &BTreeMap<(String, String), String>) -> Vec<BTreeSet<String>> {
-    let mut g: petgraph::graph::DiGraph<String, ()> = petgraph::graph::DiGraph::new();
-    let mut idx = BTreeMap::new();
-    for (a, b) in edges.keys() {
-        for p in [a, b] {
-            if !idx.contains_key(p) {
-                idx.insert(p.clone(), g.add_node(p.clone()));
-            }
-        }
-        g.add_edge(idx[a], idx[b], ());
-    }
-    petgraph::algo::tarjan_scc(&g)
-        .into_iter()
-        .filter(|scc| scc.len() >= 2)
-        .map(|scc| scc.into_iter().map(|i| g[i].clone()).collect())
-        .collect()
-}
-
 /// `new-cycle`: a group of files that depend on each other in a cycle at head, where the
 /// base had no cycle containing all of them (files renamed by the change are mapped back).
 /// The evidence lists the file-to-file dependencies inside the cycle that the change added.
@@ -495,8 +431,8 @@ fn new_cycles(cs: &ChangeSet, head: &CodeGraph, base: &CodeGraph, out: &mut Vec<
         .filter_map(|f| f.old_path.as_deref().map(|o| (f.path.as_str(), o)))
         .collect();
     let base_name = |p: &str| to_base.get(p).copied().unwrap_or(p).to_string();
-    let head_edges = code_file_edges(head);
-    let base_edges = code_file_edges(base);
+    let head_edges = head.code_file_edges();
+    let base_edges = base.code_file_edges();
     let base_cycles = file_cycles(&base_edges);
     for cycle in file_cycles(&head_edges) {
         let as_base: BTreeSet<String> = cycle.iter().map(|p| base_name(p)).collect();
@@ -547,11 +483,10 @@ fn new_cycles(cs: &ChangeSet, head: &CodeGraph, base: &CodeGraph, out: &mut Vec<
     }
 }
 
-/// Files that crossed this size in the change are worth splitting before they grow more.
-const BLOAT_TOKENS: usize = 3500;
-
-/// `bloat`: a code file that crossed the size threshold in this change.
+/// `bloat`: a code file that crossed the repository's outlier size in this change (the
+/// same threshold as the health check, [`CodeGraph::bloat_threshold`] at head).
 fn bloat(cs: &ChangeSet, head: &CodeGraph, base: &CodeGraph, out: &mut Vec<Finding>) {
+    let limit = head.bloat_threshold();
     for f in &cs.files {
         let Some(now) = head.files.get(&f.path) else {
             continue;
@@ -563,7 +498,7 @@ fn bloat(cs: &ChangeSet, head: &CodeGraph, base: &CodeGraph, out: &mut Vec<Findi
             .files
             .get(f.old_path.as_deref().unwrap_or(&f.path))
             .map_or(0, |b| b.token_count);
-        if now.token_count >= BLOAT_TOKENS && before < BLOAT_TOKENS {
+        if now.token_count > limit && before <= limit {
             out.push(Finding {
                 id: format!("bloat:{}", f.path),
                 rule: "bloat",
@@ -571,8 +506,8 @@ fn bloat(cs: &ChangeSet, head: &CodeGraph, base: &CodeGraph, out: &mut Vec<Findi
                 symbol: String::new(),
                 location: f.path.clone(),
                 message: format!(
-                    "{} grew to {} tokens ({} lines), past {BLOAT_TOKENS}: agents now need \
-                     several reads to see it whole",
+                    "{} grew to {} tokens ({} lines), past this repository's outlier size \
+                     ({limit} tokens): agents now need several reads to see it whole",
                     f.path, now.token_count, now.line_count
                 ),
                 evidence: vec![if before == 0 {

@@ -1316,15 +1316,26 @@ impl TrackerEngine {
         let hr = cg.health_report();
 
         let mut out = format!(
-            "# CODE HEALTH CHECK\nBloated files (>=3500 tok): {} | Circular clusters: {} | Orphan code files: {}\n",
+            "# CODE HEALTH CHECK\nOversized files (>{} tok): {} | Circular clusters: {} | Orphan code files: {}\n\
+             Coverage: sizes of {} code files; cycles through code in languages with import \
+             cycles ({} Rust files left out: module cycles inside one crate are allowed); \
+             orphans leave out {} entry points and scripts run directly.\n",
+            hr.bloat_threshold,
             hr.bloated_files.len(),
             hr.circular_groups.len(),
-            hr.orphan_files.len()
+            hr.orphan_files.len(),
+            hr.code_files,
+            hr.cycle_exempt_files,
+            hr.orphan_excluded.len()
         );
 
         if !hr.bloated_files.is_empty() {
-            out.push_str("\n## Token Bloat Warnings (Consider Splitting for Better AI Accuracy)\n");
-            out.push_str(&more_note(hr.bloated_files.len(), 15, "bloated files"));
+            out.push_str(&format!(
+                "\n## Oversized Files (size outliers: above Q3 + 1.5×IQR of this repo's code \
+                 files, at least {} tok; consider splitting)\n",
+                crate::graph::BLOAT_FLOOR_TOKENS
+            ));
+            out.push_str(&more_note(hr.bloated_files.len(), 15, "oversized files"));
             for (p, toks, lines) in hr.bloated_files.iter().take(15) {
                 out.push_str(&format!("- `{p}` — {toks} tok ({lines} lines)\n"));
             }
@@ -1349,6 +1360,13 @@ impl TrackerEngine {
             out.push_str(&more_note(hr.orphan_files.len(), 20, "orphan files"));
             for p in hr.orphan_files.iter().take(20) {
                 out.push_str(&format!("- `{p}`\n"));
+            }
+        }
+        if !hr.orphan_excluded.is_empty() {
+            out.push_str("\n## Unreferenced but not orphans (entry points, scripts)\n");
+            out.push_str(&more_note(hr.orphan_excluded.len(), 10, "excluded files"));
+            for (p, why) in hr.orphan_excluded.iter().take(10) {
+                out.push_str(&format!("- `{p}` — {why}\n"));
             }
         }
 

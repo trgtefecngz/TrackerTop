@@ -1904,9 +1904,12 @@ impl TrackerTopApp {
                 };
                 glow_kpi_card(
                     &mut cols[0],
-                    "TOKEN BLOAT FILES (>=3.5K TOK)",
+                    &format!(
+                        "OVERSIZED FILES (>{} TOK)",
+                        fmt_num(lp.health.bloat_threshold)
+                    ),
                     &lp.health.bloated_files.len().to_string(),
-                    "Large files strain LLM context",
+                    "Size outliers among this repo's files",
                     bloat_col,
                     bloat_col,
                 );
@@ -1919,7 +1922,7 @@ impl TrackerTopApp {
                     &mut cols[1],
                     "CIRCULAR DEPENDENCY CYCLES",
                     &lp.health.circular_groups.len().to_string(),
-                    "Strongly connected file loops",
+                    "Through code; Rust module cycles allowed",
                     cyc_col,
                     cyc_col,
                 );
@@ -1927,7 +1930,10 @@ impl TrackerTopApp {
                     &mut cols[2],
                     "ORPHAN CODE FILES",
                     &lp.health.orphan_files.len().to_string(),
-                    "Zero incoming graph references",
+                    &format!(
+                        "No references; {} entry points/scripts excluded",
+                        lp.health.orphan_excluded.len()
+                    ),
                     T::ACCENT,
                     T::ACCENT,
                 );
@@ -1948,7 +1954,7 @@ impl TrackerTopApp {
                     for (p, toks, lines) in lp.health.bloated_files.iter().take(6) {
                         ui.label(
                             RichText::new(format!(
-                                "Bloat: {p} — {} tokens ({lines} lines) — consider splitting",
+                                "Oversized: {p} — {} tokens ({lines} lines) — consider splitting",
                                 fmt_num(*toks)
                             ))
                             .small()
