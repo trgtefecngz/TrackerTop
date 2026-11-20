@@ -1,11 +1,24 @@
+//! TypeScript / JavaScript extractor backed by tree-sitter.
+//!
+//! `.ts` uses the TypeScript grammar, `.tsx` the TSX grammar and `.js`/`.jsx`/`.mjs`/`.cjs`
+//! the JavaScript grammar (which includes JSX). Symbol spans come from the syntax tree, so
+//! strings, template literals, regex literals, comments and JSX can no longer make a symbol
+//! swallow the code after it (the failure mode of the previous line-based scanner).
+//!
+//! Extracted: functions (declarations, ambient signatures, `const f = () => …` and
+//! `const f = function …`), classes with their methods and arrow-function fields,
+//! interfaces, enums, type aliases, `it(…)`/`test(…)` test blocks (also inside `describe`),
+//! relative ES/CommonJS/dynamic imports, `extends`/`implements` edges and call edges.
+
 use crate::model::{EdgeKind, RawReference, Symbol, SymbolKind};
 use crate::parser::{
     LanguageExtractor, ParsedFile, compact_signature, file_symbol_id, make_file_symbol,
     make_symbol_id,
 };
 use crate::tokens::count_tokens;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
+use tree_sitter::{Language, Node, Parser};
 
 pub struct TypeScriptExtractor;
 
@@ -27,559 +40,678 @@ impl LanguageExtractor for TypeScriptExtractor {
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language_for(file_path))
+            .context("failed to load tree-sitter TypeScript/JavaScript grammar")?;
+        let tree = parser
+            .parse(source, None)
+            .context("tree-sitter TypeScript/JavaScript parser returned None")?;
+
         let mut out = ParsedFile::default();
         let file_id = file_symbol_id(file_path);
         out.symbols.push(make_file_symbol(file_path, source));
 
-        let lines: Vec<&str> = source.lines().collect();
-        let mut in_block_comment = false;
-        let mut pending_doc = String::new();
-        let mut i = 0usize;
-
-        while i < lines.len() {
-            let trimmed = lines[i].trim();
-            let line_no = i + 1;
-
-            if in_block_comment {
-                if trimmed.contains("*/") {
-                    in_block_comment = false;
-                } else if pending_doc.is_empty() {
-                    let clean = trimmed.trim_start_matches('*').trim();
-                    if !clean.is_empty() && !clean.starts_with('@') {
-                        pending_doc = compact_signature(clean, 110);
-                    }
-                }
-                i += 1;
-                continue;
-            }
-            if trimmed.starts_with("/*") {
-                if !trimmed.contains("*/") {
-                    in_block_comment = true;
-                }
-                i += 1;
-                continue;
-            }
-            if trimmed.starts_with("//") {
-                let doc = trimmed.trim_start_matches('/').trim();
-                if !doc.is_empty() && pending_doc.is_empty() {
-                    pending_doc = compact_signature(doc, 110);
-                }
-                i += 1;
-                continue;
-            }
-            if trimmed.is_empty() {
-                pending_doc.clear();
-                i += 1;
-                continue;
-            }
-
-            // ES import / re-export: `import ... from "./foo"` or `import "./foo"`
-            if trimmed.starts_with("import ")
-                || (trimmed.starts_with("export ") && trimmed.contains(" from "))
-            {
-                if let Some(spec) = extract_quoted_path(trimmed)
-                    && (spec.starts_with('.') || spec.starts_with('/'))
-                {
-                    out.refs.push(RawReference {
-                        source_symbol_id: file_id.clone(),
-                        target_name: normalize_ts_import(&spec),
-                        kind: EdgeKind::Imports,
-                        line: line_no,
-                    });
-                }
-                i += 1;
-                continue;
-            }
-
-            // CommonJS require("./foo")
-            if let Some(req_pos) = trimmed.find("require(")
-                && let Some(spec) = extract_quoted_path(&trimmed[req_pos..])
-                && (spec.starts_with('.') || spec.starts_with('/'))
-            {
-                out.refs.push(RawReference {
-                    source_symbol_id: file_id.clone(),
-                    target_name: normalize_ts_import(&spec),
-                    kind: EdgeKind::Imports,
-                    line: line_no,
-                });
-            }
-
-            let (vis, rest) = strip_ts_modifiers(trimmed);
-
-            // `function name(...)`
-            if let Some(after) = rest.strip_prefix("function ") {
-                let after = after.trim_start_matches('*').trim_start();
-                let name = read_ts_ident(after);
-                if !name.is_empty() {
-                    let end_idx = find_brace_end(&lines, i);
-                    let block = lines[i..=end_idx].join("\n");
-                    let sig = compact_signature(trimmed.split('{').next().unwrap_or(trimmed), 140);
-                    let sym_id = make_symbol_id(file_path, &name, line_no);
-                    out.symbols.push(Symbol {
-                        id: sym_id.clone(),
-                        file_path: file_path.to_string(),
-                        name: name.clone(),
-                        qualified_name: name.clone(),
-                        kind: SymbolKind::Function,
-                        signature: sig,
-                        start_line: line_no,
-                        end_line: end_idx + 1,
-                        token_count: count_tokens(&block),
-                        visibility: vis,
-                        doc_summary: std::mem::take(&mut pending_doc),
-                        parent_id: Some(file_id.clone()),
-                    });
-                    collect_ts_calls(&block, &name, &sym_id, line_no, EdgeKind::Calls, &mut out);
-                    i = end_idx + 1;
-                    continue;
-                }
-            }
-
-            // `class Name`, `interface Name`, `enum Name`, `type Name = ...`
-            if let Some((kind, after)) = rest
-                .strip_prefix("class ")
-                .map(|r| (SymbolKind::Class, r))
-                .or_else(|| {
-                    rest.strip_prefix("interface ")
-                        .map(|r| (SymbolKind::Trait, r))
-                })
-                .or_else(|| rest.strip_prefix("enum ").map(|r| (SymbolKind::Enum, r)))
-                .or_else(|| {
-                    rest.strip_prefix("type ")
-                        .map(|r| (SymbolKind::TypeAlias, r))
-                })
-            {
-                let name = read_ts_ident(after);
-                if !name.is_empty() {
-                    let end_idx = if kind == SymbolKind::TypeAlias && !trimmed.contains('{') {
-                        i
-                    } else {
-                        find_brace_end(&lines, i)
-                    };
-                    let block = lines[i..=end_idx].join("\n");
-                    let sig = compact_signature(trimmed.split('{').next().unwrap_or(trimmed), 140);
-                    let sym_id = make_symbol_id(file_path, &name, line_no);
-                    out.symbols.push(Symbol {
-                        id: sym_id.clone(),
-                        file_path: file_path.to_string(),
-                        name: name.clone(),
-                        qualified_name: name.clone(),
-                        kind,
-                        signature: sig,
-                        start_line: line_no,
-                        end_line: end_idx + 1,
-                        token_count: count_tokens(&block),
-                        visibility: vis,
-                        doc_summary: std::mem::take(&mut pending_doc),
-                        parent_id: Some(file_id.clone()),
-                    });
-
-                    // Detect `extends Base` / `implements Iface`
-                    for kw in ["extends ", "implements "] {
-                        if let Some(pos) = trimmed.find(kw) {
-                            let target = read_ts_ident(&trimmed[pos + kw.len()..]);
-                            if !target.is_empty() {
-                                out.refs.push(RawReference {
-                                    source_symbol_id: sym_id.clone(),
-                                    target_name: target,
-                                    kind: EdgeKind::Implements,
-                                    line: line_no,
-                                });
-                            }
-                        }
-                    }
-
-                    if kind == SymbolKind::Class {
-                        extract_class_methods(
-                            &lines,
-                            i + 1,
-                            end_idx,
-                            file_path,
-                            &name,
-                            &sym_id,
-                            &mut out,
-                        );
-                    }
-                    i = end_idx + 1;
-                    continue;
-                }
-            }
-
-            // `const foo = (...) => { ... }` or `const foo = async (...) => {`
-            if let Some(after) = rest
-                .strip_prefix("const ")
-                .or_else(|| rest.strip_prefix("let "))
-                && trimmed.contains("=>")
-            {
-                let name = read_ts_ident(after);
-                if !name.is_empty() {
-                    // Judge the body by code only: a `{` inside a string on this line must
-                    // not start a brace search that swallows the following code.
-                    let end_idx = if ts_code_only(trimmed).contains('{') {
-                        find_brace_end(&lines, i)
-                    } else {
-                        i
-                    };
-                    let block = lines[i..=end_idx].join("\n");
-                    let sig = compact_signature(trimmed.split("=>").next().unwrap_or(trimmed), 140);
-                    let sym_id = make_symbol_id(file_path, &name, line_no);
-                    out.symbols.push(Symbol {
-                        id: sym_id.clone(),
-                        file_path: file_path.to_string(),
-                        name: name.clone(),
-                        qualified_name: name.clone(),
-                        kind: SymbolKind::Function,
-                        signature: format!("{sig} => ..."),
-                        start_line: line_no,
-                        end_line: end_idx + 1,
-                        token_count: count_tokens(&block),
-                        visibility: vis,
-                        doc_summary: std::mem::take(&mut pending_doc),
-                        parent_id: Some(file_id.clone()),
-                    });
-                    collect_ts_calls(&block, &name, &sym_id, line_no, EdgeKind::Calls, &mut out);
-                    i = end_idx + 1;
-                    continue;
-                }
-            }
-
-            // Test blocks: `test("...", () => {` / `it("...", () => {`
-            if (trimmed.starts_with("test(") || trimmed.starts_with("it("))
-                && let Some(test_name) = extract_quoted_path(trimmed)
-            {
-                // A test is exactly the `it(` / `test(` call: it ends where that call's
-                // parenthesis closes. This covers one-line calls (`it("x", runCase);`),
-                // block bodies, Allman braces, comments before the `{`, argument lists that
-                // continue on later lines and expression-bodied arrows, without guessing
-                // from braces (which made the test swallow the following code).
-                let end_idx = find_call_end(&lines, i);
-                let block = lines[i..=end_idx].join("\n");
-                let sym_id = make_symbol_id(file_path, &test_name, line_no);
-                out.symbols.push(Symbol {
-                    id: sym_id.clone(),
-                    file_path: file_path.to_string(),
-                    name: test_name.clone(),
-                    qualified_name: test_name.clone(),
-                    kind: SymbolKind::Test,
-                    signature: compact_signature(before_code_brace(trimmed), 120),
-                    start_line: line_no,
-                    end_line: end_idx + 1,
-                    token_count: count_tokens(&block),
-                    visibility: "test".to_string(),
-                    // Consume the doc comment so it is not attached to the next symbol
-                    doc_summary: std::mem::take(&mut pending_doc),
-                    parent_id: Some(file_id.clone()),
-                });
-                collect_ts_calls(
-                    &block,
-                    &test_name,
-                    &sym_id,
-                    line_no,
-                    EdgeKind::Tests,
-                    &mut out,
-                );
-                i = end_idx + 1;
-                continue;
-            }
-
-            pending_doc.clear();
-            i += 1;
-        }
-
+        let ctx = Ctx {
+            file_path,
+            bytes: source.as_bytes(),
+            lines: source.lines().collect(),
+            file_id: &file_id,
+        };
+        let root = tree.root_node();
+        walk(root, &ctx, &mut out);
+        collect_imports(root, &ctx, &mut out);
         Ok(out)
     }
 }
 
-fn extract_class_methods(
-    lines: &[&str],
-    start: usize,
-    end: usize,
-    file_path: &str,
-    class_name: &str,
-    class_id: &str,
-    out: &mut ParsedFile,
-) {
-    let mut i = start;
-    while i < end {
-        let t = lines[i].trim();
-        let (_, rest) = strip_ts_modifiers(t);
-        if let Some(paren) = rest.find('(') {
-            let head = rest[..paren].trim();
-            let name = read_ts_ident(head);
-            if !name.is_empty()
-                && !matches!(
-                    name.as_str(),
-                    "if" | "for" | "while" | "switch" | "catch" | "return" | "new"
-                )
-                && t.contains('{')
-            {
-                let m_end = find_brace_end(lines, i).min(end);
-                let block = lines[i..=m_end].join("\n");
-                let qname = format!("{class_name}::{name}");
-                let sym_id = make_symbol_id(file_path, &qname, i + 1);
-                out.symbols.push(Symbol {
-                    id: sym_id.clone(),
-                    file_path: file_path.to_string(),
-                    name: name.clone(),
-                    qualified_name: qname,
-                    kind: SymbolKind::Method,
-                    signature: compact_signature(t.split('{').next().unwrap_or(t), 130),
-                    start_line: i + 1,
-                    end_line: m_end + 1,
-                    token_count: count_tokens(&block),
-                    visibility: "method".to_string(),
-                    doc_summary: String::new(),
-                    parent_id: Some(class_id.to_string()),
-                });
-                collect_ts_calls(&block, &name, &sym_id, i + 1, EdgeKind::Calls, out);
-                i = m_end + 1;
-                continue;
-            }
-        }
-        i += 1;
+fn language_for(file_path: &str) -> Language {
+    let ext = file_path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "ts" | "mts" | "cts" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        _ => tree_sitter_javascript::LANGUAGE.into(),
     }
 }
 
-/// The structural "code only" view of one line, used to judge where a statement ends:
-/// - `// …` and `/* … */` comments are removed (comment text, including quotes inside it,
-///   cannot affect the result);
-/// - the contents of '…', "…" and `…` string literals are dropped (the quotes are kept), so
-///   braces, `//` or `;` inside strings (`it("parses {x}", run);`) are not seen as code.
-///
-/// Single-line convenience wrapper around [`ts_code_line`] (no state carried in or out).
-fn ts_code_only(line: &str) -> String {
-    let mut carry = ScanCarry::Code;
-    ts_code_line(line, &mut carry)
+struct Ctx<'a> {
+    file_path: &'a str,
+    bytes: &'a [u8],
+    lines: Vec<&'a str>,
+    file_id: &'a str,
 }
 
-/// Lexer state that survives a line break: only template literals and block comments can
-/// span lines ('…' and "…" cannot).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum ScanCarry {
-    #[default]
-    Code,
-    BlockComment,
-    Template,
+impl Ctx<'_> {
+    fn text(&self, node: Node) -> &str {
+        node.utf8_text(self.bytes).unwrap_or("")
+    }
+
+    /// Source text from `start` up to (not including) byte `end`.
+    fn slice(&self, start: usize, end: usize) -> &str {
+        let end = end.min(self.bytes.len());
+        std::str::from_utf8(&self.bytes[start.min(end)..end]).unwrap_or("")
+    }
+
+    /// Whole source lines `start_line..=end_line` (1-based), the text read_symbol serves.
+    fn block(&self, start_line: usize, end_line: usize) -> String {
+        let s = start_line.saturating_sub(1).min(self.lines.len());
+        let e = end_line.min(self.lines.len()).max(s);
+        self.lines[s..e].join("\n")
+    }
 }
 
-/// Code-only view of one line, given the state left by the previous line (`carry`), which is
-/// updated for the next line. A `)` or `{` inside a template literal or block comment that
-/// started on an earlier line is therefore never mistaken for code.
-fn ts_code_line(line: &str, carry: &mut ScanCarry) -> String {
-    let bytes = line.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    // Finish whatever construct the previous line left open
-    match *carry {
-        ScanCarry::Code => {}
-        ScanCarry::BlockComment => match line.find("*/") {
-            Some(p) => {
-                i = p + 2;
-                *carry = ScanCarry::Code;
-            }
-            None => return String::new(),
-        },
-        ScanCarry::Template => match find_unescaped(bytes, 0, b'`') {
-            Some(p) => {
-                out.push(b'`');
-                i = p + 1;
-                *carry = ScanCarry::Code;
-            }
-            None => return String::new(),
-        },
-    }
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
-            b'/' if bytes.get(i + 1) == Some(&b'*') => match line[i + 2..].find("*/") {
-                Some(p) => {
-                    i += 2 + p + 2;
-                    continue;
-                }
-                None => {
-                    *carry = ScanCarry::BlockComment;
-                    break;
-                }
-            },
-            b'/' if regex_can_start(&out) => match find_regex_end(bytes, i + 1) {
-                // Regex literal: its contents (`/\)/`, `/[{(]/`) are not code
-                Some(close) => {
-                    out.extend_from_slice(b"//");
-                    i = close;
-                }
-                // No closing slash on this line: it was a division after all
-                None => out.push(b),
-            },
-            b'"' | b'\'' | b'`' => match find_unescaped(bytes, i + 1, b) {
-                Some(close) => {
-                    out.push(b);
-                    out.push(b);
-                    i = close;
-                }
-                None if b == b'`' => {
-                    // Template literal continues on the next line
-                    out.push(b);
-                    *carry = ScanCarry::Template;
-                    break;
-                }
-                // '…' and "…" cannot span lines in JS/TS, so an unmatched one is plain text
-                // (e.g. the apostrophe in JSX text `<p>Don't {x}</p>`): keep scanning.
-                None => {}
-            },
-            _ => out.push(b),
-        }
-        i += 1;
-    }
-    // Only ASCII bytes are dropped (whole multi-byte sequences are either copied or skipped),
-    // so this is valid UTF-8.
-    String::from_utf8(out).unwrap_or_default()
+fn line_of(node: Node) -> usize {
+    node.start_position().row + 1
 }
 
-/// The part of `line` before its first `{` that is code, not inside a '…', "…" or `…`
-/// string (so `it("parses {x}", () => {` keeps the full test name in its signature).
-fn before_code_brace(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => return &line[..i],
-            q @ (b'"' | b'\'' | b'`') => {
-                // An unmatched quote is plain text (same rule as the code-only scanner), so it
-                // cannot make the signature run on through the test body.
-                if let Some(close) = find_unescaped(bytes, i + 1, q) {
-                    i = close;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    line
+fn end_line_of(node: Node) -> usize {
+    node.end_position().row + 1
 }
 
-/// Whether a `/` at this point starts a regex literal rather than a division, judged by the
-/// previous significant code character (the usual lexer rule): after an operator, an opening
-/// bracket, a separator, or a keyword like `return`, an operand is expected, so `/` opens a
-/// regex; after an identifier, number or `)` / `]`, it divides.
-fn regex_can_start(code_so_far: &[u8]) -> bool {
-    // `</` right after `<` is a JSX/TSX closing tag (`</p>`), not a regex; treating it as one
-    // would hide the code up to the next `/`.
-    if code_so_far.last() == Some(&b'<') {
-        return false;
-    }
-    let trimmed = code_so_far.trim_ascii_end();
-    let Some(&last) = trimmed.last() else {
-        return true;
-    };
-    if b"(,=:[!&|?{};+-*%<>~^".contains(&last) {
-        return true;
-    }
-    // Keywords after which an expression (operand) follows
-    let word_start = trimmed
-        .iter()
-        .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$'))
-        .map_or(0, |p| p + 1);
-    matches!(
-        &trimmed[word_start..],
-        b"return"
-            | b"throw"
-            | b"typeof"
-            | b"instanceof"
-            | b"case"
-            | b"in"
-            | b"of"
-            | b"delete"
-            | b"void"
-            | b"yield"
-            | b"await"
-            | b"else"
-            | b"do"
-    )
-}
-
-/// End (index of the closing `/`) of a regex literal whose body starts at `from`, honoring
-/// escapes and `[...]` character classes (where `/` does not close the regex).
-fn find_regex_end(bytes: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    let mut in_class = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 1,
-            b'[' => in_class = true,
-            b']' => in_class = false,
-            b'/' if !in_class => return Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Position of the next `quote` at or after `from` that is not escaped with a backslash.
-fn find_unescaped(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
-    let mut i = from;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b if b == quote => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn strip_ts_modifiers(mut s: &str) -> (String, &str) {
-    let mut vis = "private".to_string();
-    loop {
-        if let Some(r) = s.strip_prefix("export ") {
-            vis = "export".to_string();
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("default ") {
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("declare ") {
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("async ") {
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("abstract ") {
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("public ") {
-            vis = "public".to_string();
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("private ") {
-            vis = "private".to_string();
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("protected ") {
-            vis = "protected".to_string();
-            s = r.trim_start();
-        } else if let Some(r) = s.strip_prefix("static ") {
-            s = r.trim_start();
+/// The node that carries a declaration's modifiers and leading comments: the declaration
+/// itself, or the `export …` / `declare …` statement wrapping it.
+fn outer_of(node: Node) -> Node {
+    let mut cur = node;
+    while let Some(p) = cur.parent() {
+        if matches!(p.kind(), "export_statement" | "ambient_declaration") {
+            cur = p;
         } else {
             break;
         }
     }
-    (vis, s)
+    cur
 }
 
-fn read_ts_ident(s: &str) -> String {
-    s.trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-        .collect()
+fn visibility_of(node: Node) -> String {
+    let mut cur = node;
+    while let Some(p) = cur.parent() {
+        match p.kind() {
+            "export_statement" => return "export".to_string(),
+            "ambient_declaration" => cur = p,
+            _ => break,
+        }
+    }
+    "private".to_string()
 }
 
-fn extract_quoted_path(s: &str) -> Option<String> {
-    for q in ['"', '\'', '`'] {
-        if let Some(start) = s.find(q) {
-            let rest = &s[start + 1..];
-            if let Some(end) = rest.find(q) {
-                return Some(rest[..end].to_string());
+/// First meaningful line of the comment run directly above `outer` (no blank line between),
+/// skipping JSDoc `@tags`. Comments that trail code on the previous line are not docs.
+fn doc_of(outer: Node, ctx: &Ctx) -> String {
+    let mut cur = outer;
+    let mut first: Option<Node> = None;
+    while let Some(prev) = cur.prev_named_sibling() {
+        if prev.kind() != "comment" || prev.end_position().row + 1 < cur.start_position().row {
+            break;
+        }
+        // A comment sharing its line with earlier code (`foo(); // note`) belongs to that code
+        if let Some(before) = prev.prev_sibling()
+            && before.end_position().row == prev.start_position().row
+        {
+            break;
+        }
+        first = Some(prev);
+        cur = prev;
+    }
+    let Some(comment) = first else {
+        return String::new();
+    };
+    for raw in ctx.text(comment).lines() {
+        let clean = raw
+            .trim()
+            .trim_start_matches("/**")
+            .trim_start_matches("/*")
+            .trim_start_matches("//")
+            .trim_end_matches("*/")
+            .trim()
+            .trim_start_matches('*')
+            .trim_start_matches('/')
+            .trim();
+        if !clean.is_empty() && !clean.starts_with('@') {
+            return compact_signature(clean, 110);
+        }
+    }
+    String::new()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_symbol(
+    ctx: &Ctx,
+    out: &mut ParsedFile,
+    name: &str,
+    qualified_name: &str,
+    kind: SymbolKind,
+    signature: String,
+    start_line: usize,
+    end_line: usize,
+    visibility: String,
+    doc_summary: String,
+    parent_id: &str,
+) -> String {
+    let id = make_symbol_id(ctx.file_path, qualified_name, start_line);
+    out.symbols.push(Symbol {
+        id: id.clone(),
+        file_path: ctx.file_path.to_string(),
+        name: name.to_string(),
+        qualified_name: qualified_name.to_string(),
+        kind,
+        signature,
+        start_line,
+        end_line,
+        token_count: count_tokens(&ctx.block(start_line, end_line)),
+        visibility,
+        doc_summary,
+        parent_id: Some(parent_id.to_string()),
+    });
+    id
+}
+
+/// Walks statements looking for declarations. Declarations that are extracted are not
+/// descended into (nested helpers stay part of their parent), except classes for methods.
+fn walk(node: Node, ctx: &Ctx, out: &mut ParsedFile) {
+    if node.is_error() {
+        extract_broken_tests(node, ctx, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "comment" | "import_statement" => {}
+            "function_declaration" | "generator_function_declaration" | "function_signature" => {
+                extract_function(child, ctx, out)
+            }
+            "class_declaration" | "abstract_class_declaration" => extract_class(child, ctx, out),
+            "interface_declaration" => extract_type_like(child, SymbolKind::Trait, ctx, out),
+            "enum_declaration" => extract_type_like(child, SymbolKind::Enum, ctx, out),
+            "type_alias_declaration" => extract_type_like(child, SymbolKind::TypeAlias, ctx, out),
+            "lexical_declaration" | "variable_declaration" => {
+                if !extract_function_variables(child, ctx, out) {
+                    walk(child, ctx, out);
+                }
+            }
+            "expression_statement" => {
+                if !extract_test(child, ctx, out) {
+                    walk(child, ctx, out);
+                }
+            }
+            _ => walk(child, ctx, out),
+        }
+    }
+}
+
+fn extract_function(node: Node, ctx: &Ctx, out: &mut ParsedFile) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return; // `export default function () {}` has no name to look up
+    };
+    let name = ctx.text(name_node).to_string();
+    let outer = outer_of(node);
+    let sig_end = node
+        .child_by_field_name("body")
+        .map_or(node.end_byte(), |b| b.start_byte());
+    let signature = compact_signature(ctx.slice(outer.start_byte(), sig_end).trim(), 140);
+    let start = line_of(outer);
+    let id = push_symbol(
+        ctx,
+        out,
+        &name,
+        &name,
+        SymbolKind::Function,
+        signature,
+        start,
+        end_line_of(outer),
+        visibility_of(node),
+        doc_of(outer, ctx),
+        ctx.file_id,
+    );
+    collect_calls(node, &name, &id, EdgeKind::Calls, ctx, out);
+}
+
+fn extract_type_like(node: Node, kind: SymbolKind, ctx: &Ctx, out: &mut ParsedFile) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = ctx.text(name_node).to_string();
+    let outer = outer_of(node);
+    let sig_end = node
+        .child_by_field_name("body")
+        .filter(|_| kind != SymbolKind::TypeAlias)
+        .map_or(node.end_byte(), |b| b.start_byte());
+    let signature = compact_signature(ctx.slice(outer.start_byte(), sig_end).trim(), 140);
+    let id = push_symbol(
+        ctx,
+        out,
+        &name,
+        &name,
+        kind,
+        signature,
+        line_of(outer),
+        end_line_of(outer),
+        visibility_of(node),
+        doc_of(outer, ctx),
+        ctx.file_id,
+    );
+    if kind == SymbolKind::Trait {
+        let mut cursor = node.walk();
+        for clause in node.named_children(&mut cursor) {
+            if clause.kind() == "extends_type_clause" {
+                push_heritage(clause, &id, ctx, out);
             }
         }
     }
-    None
+}
+
+fn extract_class(node: Node, ctx: &Ctx, out: &mut ParsedFile) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = ctx.text(name_node).to_string();
+    let outer = outer_of(node);
+    let body = node.child_by_field_name("body");
+    let sig_end = body.map_or(node.end_byte(), |b| b.start_byte());
+    let signature = compact_signature(ctx.slice(outer.start_byte(), sig_end).trim(), 140);
+    let class_id = push_symbol(
+        ctx,
+        out,
+        &name,
+        &name,
+        SymbolKind::Class,
+        signature,
+        line_of(outer),
+        end_line_of(outer),
+        visibility_of(node),
+        doc_of(outer, ctx),
+        ctx.file_id,
+    );
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "class_heritage" {
+            let mut c2 = child.walk();
+            let clauses: Vec<Node> = child.named_children(&mut c2).collect();
+            if clauses
+                .iter()
+                .any(|c| matches!(c.kind(), "extends_clause" | "implements_clause"))
+            {
+                for clause in clauses {
+                    push_heritage(clause, &class_id, ctx, out);
+                }
+            } else {
+                // JavaScript grammar: `class A extends B` puts the expression directly here
+                push_heritage(child, &class_id, ctx, out);
+            }
+        }
+    }
+
+    let Some(body) = body else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        let (name_node, fn_node) = match member.kind() {
+            "method_definition" => (member.child_by_field_name("name"), Some(member)),
+            "public_field_definition" | "field_definition" => {
+                let value = member.child_by_field_name("value");
+                let is_fn = value.is_some_and(|v| {
+                    matches!(
+                        v.kind(),
+                        "arrow_function" | "function_expression" | "function"
+                    )
+                });
+                if !is_fn {
+                    continue;
+                }
+                let name = member
+                    .child_by_field_name("name")
+                    .or_else(|| member.child_by_field_name("property"));
+                (name, value)
+            }
+            _ => continue,
+        };
+        let (Some(name_node), Some(fn_node)) = (name_node, fn_node) else {
+            continue;
+        };
+        let method = ctx.text(name_node).to_string();
+        let qname = format!("{name}::{method}");
+        let sig_end = fn_node
+            .child_by_field_name("body")
+            .map_or(member.end_byte(), |b| b.start_byte());
+        let signature = compact_signature(ctx.slice(member.start_byte(), sig_end).trim(), 130);
+        let id = push_symbol(
+            ctx,
+            out,
+            &method,
+            &qname,
+            SymbolKind::Method,
+            signature,
+            line_of(member),
+            end_line_of(member),
+            "method".to_string(),
+            doc_of(member, ctx),
+            &class_id,
+        );
+        collect_calls(member, &method, &id, EdgeKind::Calls, ctx, out);
+    }
+}
+
+/// `const f = () => …`, `let g = async function () {…}`: one Function per declarator whose
+/// value is a function. Returns false when the declaration holds no function at all.
+fn extract_function_variables(node: Node, ctx: &Ctx, out: &mut ParsedFile) -> bool {
+    let outer = outer_of(node);
+    let mut cursor = node.walk();
+    let declarators: Vec<Node> = node
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "variable_declarator")
+        .collect();
+    let single = declarators.len() == 1;
+    let mut any = false;
+    for decl in declarators {
+        let (Some(name_node), Some(value)) = (
+            decl.child_by_field_name("name"),
+            decl.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        let is_arrow = value.kind() == "arrow_function";
+        if !is_arrow
+            && !matches!(
+                value.kind(),
+                "function_expression" | "function" | "generator_function"
+            )
+        {
+            continue;
+        }
+        if name_node.kind() != "identifier" {
+            continue; // destructuring patterns have no single name
+        }
+        any = true;
+        let name = ctx.text(name_node).to_string();
+        let (start_node, end_node) = if single { (outer, outer) } else { (decl, decl) };
+        let sig_end = value
+            .child_by_field_name("body")
+            .map_or(value.end_byte(), |b| b.start_byte());
+        let raw = ctx.slice(start_node.start_byte(), sig_end).trim();
+        let signature = if is_arrow {
+            let head = raw.strip_suffix("=>").unwrap_or(raw).trim_end();
+            format!("{} => ...", compact_signature(head, 140))
+        } else {
+            compact_signature(raw, 140)
+        };
+        let id = push_symbol(
+            ctx,
+            out,
+            &name,
+            &name,
+            SymbolKind::Function,
+            signature,
+            line_of(start_node),
+            end_line_of(end_node),
+            visibility_of(node),
+            if single {
+                doc_of(outer, ctx)
+            } else {
+                String::new()
+            },
+            ctx.file_id,
+        );
+        collect_calls(value, &name, &id, EdgeKind::Calls, ctx, out);
+    }
+    any
+}
+
+/// `it("name", …)` / `test("name", …)` (also `.only` / `.skip` / `.todo` / `.concurrent`).
+/// The test is exactly the call: it ends where the call's parenthesis closes.
+fn extract_test(stmt: Node, ctx: &Ctx, out: &mut ParsedFile) -> bool {
+    let Some(call) = stmt
+        .named_child(0)
+        .filter(|c| c.kind() == "call_expression")
+    else {
+        return false;
+    };
+    let Some(callee) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let is_test_fn = |n: Node| matches!(ctx.text(n), "it" | "test");
+    let is_test = match callee.kind() {
+        "identifier" => is_test_fn(callee),
+        "member_expression" => {
+            callee
+                .child_by_field_name("object")
+                .is_some_and(|o| o.kind() == "identifier" && is_test_fn(o))
+                && callee
+                    .child_by_field_name("property")
+                    .is_some_and(|p| matches!(ctx.text(p), "only" | "skip" | "todo" | "concurrent"))
+        }
+        _ => false,
+    };
+    if !is_test {
+        return false;
+    }
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let arg_nodes: Vec<Node> = args.named_children(&mut cursor).collect();
+    let Some(name) = arg_nodes.first().and_then(|a| string_value(*a, ctx)) else {
+        return false;
+    };
+    // An unterminated call (truncated or broken source) would otherwise run to the end of
+    // the file; claim only its first line instead of swallowing the code after it.
+    let broken = call.has_error() || call.is_missing() || args.is_missing() || {
+        let last = args.child(args.child_count().saturating_sub(1));
+        last.is_none_or(|l| l.kind() != ")" || l.is_missing())
+    };
+    let start = line_of(stmt);
+    let end = if broken { start } else { end_line_of(call) };
+    let body_start = arg_nodes
+        .iter()
+        .skip(1)
+        .filter(|a| {
+            matches!(
+                a.kind(),
+                "arrow_function" | "function_expression" | "function"
+            )
+        })
+        .find_map(|a| a.child_by_field_name("body"))
+        .filter(|b| b.kind() == "statement_block")
+        .map(|b| b.start_byte());
+    let sig_raw = match body_start {
+        Some(b) if !broken => ctx.slice(call.start_byte(), b),
+        _ => ctx.lines.get(start - 1).copied().unwrap_or(""),
+    };
+    let id = push_symbol(
+        ctx,
+        out,
+        &name,
+        &name,
+        SymbolKind::Test,
+        compact_signature(sig_raw.trim(), 120),
+        start,
+        end,
+        "test".to_string(),
+        doc_of(stmt, ctx),
+        ctx.file_id,
+    );
+    if !broken {
+        collect_calls(args, &name, &id, EdgeKind::Tests, ctx, out);
+    }
+    true
+}
+
+/// Inside a syntax error, `it("name"` / `test("name"` whose call never closes: the parser
+/// cannot tell where the test ends, so it is recorded as its first line only (no call
+/// edges) instead of being dropped or swallowing the code after it.
+fn extract_broken_tests(error: Node, ctx: &Ctx, out: &mut ParsedFile) {
+    let mut cursor = error.walk();
+    let children: Vec<Node> = error.named_children(&mut cursor).collect();
+    for pair in children.windows(2) {
+        let (callee, arg) = (pair[0], pair[1]);
+        if callee.kind() != "identifier" || !matches!(ctx.text(callee), "it" | "test") {
+            continue;
+        }
+        let Some(name) = string_value(arg, ctx) else {
+            continue;
+        };
+        let start = line_of(callee);
+        let first_line = ctx.lines.get(start - 1).copied().unwrap_or("");
+        push_symbol(
+            ctx,
+            out,
+            &name,
+            &name,
+            SymbolKind::Test,
+            compact_signature(first_line.trim(), 120),
+            start,
+            start,
+            "test".to_string(),
+            String::new(),
+            ctx.file_id,
+        );
+    }
+}
+
+/// Contents of a string or template literal (without its quotes).
+fn string_value(node: Node, ctx: &Ctx) -> Option<String> {
+    match node.kind() {
+        "string" => {
+            let t = ctx.text(node);
+            Some(
+                t.get(1..t.len().saturating_sub(1))
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+        "template_string" => {
+            let t = ctx.text(node);
+            Some(t.trim_matches('`').to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Base type/class name of one heritage entry (`Base`, `ns.Base` → `Base`, `Base<T>` → `Base`).
+fn base_name(node: Node, ctx: &Ctx) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => Some(ctx.text(node).to_string()),
+        "generic_type" => node
+            .child_by_field_name("name")
+            .and_then(|n| base_name(n, ctx)),
+        "member_expression" => node
+            .child_by_field_name("property")
+            .map(|p| ctx.text(p).to_string()),
+        "nested_type_identifier" => node
+            .child_by_field_name("name")
+            .map(|p| ctx.text(p).to_string()),
+        _ => None,
+    }
+}
+
+fn push_heritage(clause: Node, source_id: &str, ctx: &Ctx, out: &mut ParsedFile) {
+    let mut cursor = clause.walk();
+    for entry in clause.named_children(&mut cursor) {
+        if let Some(target) = base_name(entry, ctx) {
+            out.refs.push(RawReference {
+                source_symbol_id: source_id.to_string(),
+                target_name: target,
+                kind: EdgeKind::Implements,
+                line: line_of(entry),
+            });
+        }
+    }
+}
+
+/// Call edges from every `f(…)`, `obj.m(…)` and `new C(…)` inside `node`, first occurrence
+/// per name. Builtins and the symbol's own name are skipped.
+fn collect_calls(
+    node: Node,
+    self_name: &str,
+    source_id: &str,
+    edge_kind: EdgeKind,
+    ctx: &Ctx,
+    out: &mut ParsedFile,
+) {
+    let mut seen = HashSet::new();
+    let mut stack = vec![node];
+    let mut found: Vec<(usize, usize, String)> = Vec::new();
+    while let Some(n) = stack.pop() {
+        let callee = match n.kind() {
+            "call_expression" => n.child_by_field_name("function"),
+            "new_expression" => n.child_by_field_name("constructor"),
+            _ => None,
+        };
+        if let Some(c) = callee {
+            let name = match c.kind() {
+                "identifier" => Some(ctx.text(c)),
+                "member_expression" => c.child_by_field_name("property").map(|p| ctx.text(p)),
+                _ => None,
+            };
+            if let Some(name) = name {
+                found.push((n.start_byte(), line_of(n), name.to_string()));
+            }
+        }
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    found.sort_by_key(|(byte, _, _)| *byte);
+    for (_, line, ident) in found {
+        if ident.len() >= 2
+            && ident != self_name
+            && !is_ts_builtin(&ident)
+            && seen.insert(ident.clone())
+        {
+            out.refs.push(RawReference {
+                source_symbol_id: source_id.to_string(),
+                target_name: ident,
+                kind: edge_kind,
+                line,
+            });
+        }
+    }
+}
+
+/// Relative imports anywhere in the file: `import … from "./x"`, `export … from "./x"`,
+/// `require("./x")` and `import("./x")`. Package imports are not graph edges.
+fn collect_imports(root: Node, ctx: &Ctx, out: &mut ParsedFile) {
+    let mut stack = vec![root];
+    let mut found: Vec<(usize, usize, String)> = Vec::new();
+    while let Some(n) = stack.pop() {
+        let spec = match n.kind() {
+            "import_statement" | "export_statement" => n.child_by_field_name("source"),
+            "call_expression" => {
+                let is_loader = n
+                    .child_by_field_name("function")
+                    .is_some_and(|f| f.kind() == "import" || ctx.text(f) == "require");
+                if is_loader {
+                    n.child_by_field_name("arguments")
+                        .and_then(|a| a.named_child(0))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(spec) = spec.and_then(|s| string_value(s, ctx))
+            && (spec.starts_with('.') || spec.starts_with('/'))
+        {
+            found.push((n.start_byte(), line_of(n), normalize_ts_import(&spec)));
+        }
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    found.sort_by_key(|(byte, _, _)| *byte);
+    for (_, line, target) in found {
+        out.refs.push(RawReference {
+            source_symbol_id: ctx.file_id.to_string(),
+            target_name: target,
+            kind: EdgeKind::Imports,
+            line,
+        });
+    }
 }
 
 fn normalize_ts_import(spec: &str) -> String {
@@ -587,104 +719,6 @@ fn normalize_ts_import(spec: &str) -> String {
         .trim_start_matches("../")
         .trim_start_matches('/')
         .to_string()
-}
-
-/// Index of the line where the call whose first `(` is on line `start` closes, scanning the
-/// code-only view (parentheses inside strings and comments, including template literals and
-/// block comments spanning lines, are ignored). If the call never closes (malformed or
-/// truncated source), the call is treated as one line rather than swallowing the rest of
-/// the file.
-fn find_call_end(lines: &[&str], start: usize) -> usize {
-    let mut depth = 0i32;
-    let mut opened = false;
-    let mut carry = ScanCarry::Code;
-    for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in ts_code_line(line, &mut carry).chars() {
-            match ch {
-                '(' => {
-                    depth += 1;
-                    opened = true;
-                }
-                ')' => {
-                    depth -= 1;
-                    if opened && depth <= 0 {
-                        return idx;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    start
-}
-
-/// Index of the line that closes the first `{` opened at or after `start`. Braces inside
-/// string literals and comments are ignored (`it("parses {x", () => {` must not count the
-/// one in the name), using the same multi-line-aware code-only view as [`find_call_end`].
-fn find_brace_end(lines: &[&str], start: usize) -> usize {
-    let mut depth = 0i32;
-    let mut seen = false;
-    let mut carry = ScanCarry::Code;
-    for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in ts_code_line(line, &mut carry).chars() {
-            if ch == '{' {
-                depth += 1;
-                seen = true;
-            } else if ch == '}' {
-                depth -= 1;
-                if seen && depth <= 0 {
-                    return idx;
-                }
-            }
-        }
-    }
-    start
-}
-
-fn collect_ts_calls(
-    block: &str,
-    self_name: &str,
-    source_id: &str,
-    base_line: usize,
-    edge_kind: EdgeKind,
-    out: &mut ParsedFile,
-) {
-    let mut seen = HashSet::new();
-    let chars: Vec<char> = block.chars().collect();
-    let mut i = 0usize;
-    let mut line_off = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\n' {
-            line_off += 1;
-            i += 1;
-            continue;
-        }
-        if chars[i].is_ascii_alphabetic() || chars[i] == '_' || chars[i] == '$' {
-            let start = i;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$')
-            {
-                i += 1;
-            }
-            let ident: String = chars[start..i].iter().collect();
-            if i < chars.len()
-                && chars[i] == '('
-                && ident.len() >= 2
-                && ident != self_name
-                && !is_ts_builtin(&ident)
-                && seen.insert(ident.clone())
-            {
-                out.refs.push(RawReference {
-                    source_symbol_id: source_id.to_string(),
-                    target_name: ident,
-                    kind: edge_kind,
-                    line: base_line + line_off,
-                });
-            }
-        } else {
-            i += 1;
-        }
-    }
 }
 
 fn is_ts_builtin(name: &str) -> bool {
@@ -699,6 +733,7 @@ fn is_ts_builtin(name: &str) -> bool {
             | "function"
             | "constructor"
             | "super"
+            | "require"
             | "log"
             | "error"
             | "warn"
@@ -736,6 +771,28 @@ mod tests {
 
     fn parse(src: &str) -> ParsedFile {
         TypeScriptExtractor.parse("src/a.test.ts", src).unwrap()
+    }
+
+    fn parse_as(path: &str, src: &str) -> ParsedFile {
+        TypeScriptExtractor.parse(path, src).unwrap()
+    }
+
+    fn sym<'a>(out: &'a ParsedFile, name: &str) -> &'a Symbol {
+        out.symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol {name} not extracted"))
+    }
+
+    fn span(out: &ParsedFile, name: &str) -> (usize, usize) {
+        let s = sym(out, name);
+        (s.start_line, s.end_line)
+    }
+
+    fn has_ref(out: &ParsedFile, target: &str, kind: EdgeKind) -> bool {
+        out.refs
+            .iter()
+            .any(|r| r.target_name == target && r.kind == kind)
     }
 
     #[test]
@@ -787,6 +844,10 @@ mod tests {
             .unwrap();
         assert_eq!(test.end_line, 1);
         assert!(out.symbols.iter().any(|s| s.name == "helperAfter"));
+        assert!(
+            sym(&out, "helperAfter").doc_summary.is_empty(),
+            "a trailing comment on the previous code line is not a doc comment"
+        );
     }
 
     #[test]
@@ -801,19 +862,30 @@ mod tests {
         assert_eq!((test.start_line, test.end_line), (1, 4));
     }
 
+    // Replaces the old lexer unit test `code_only_view_ignores_comments_and_string_contents`:
+    // the same inputs must not change where the test ends.
     #[test]
-    fn code_only_view_ignores_comments_and_string_contents() {
-        assert_eq!(ts_code_only("it(\"a//b\", f); // c"), "it(\"\", f); ");
-        assert_eq!(ts_code_only("x = `//`;"), "x = ``;");
-        assert_eq!(ts_code_only("f('it\\'s'); //x"), "f(''); ");
-        assert_eq!(ts_code_only("it(\"parses {x}\", f);"), "it(\"\", f);");
-        assert_eq!(
-            ts_code_only("it(\"x\", f); /* it's done */"),
-            "it(\"\", f); "
-        );
-        assert_eq!(ts_code_only("a /* c */ b"), "a  b");
-        assert_eq!(ts_code_only("it(\"x\", f); /* open"), "it(\"\", f); ");
-        assert_eq!(ts_code_only("s = \"çğü{\"; t"), "s = \"\"; t");
+    fn comments_and_string_contents_do_not_change_spans() {
+        for header in [
+            "it(\"a//b\", f); // c",
+            "it(\"x\", () => `//`);",
+            "it('it\\'s', f); //x",
+            "it(\"parses {x}\", f);",
+            "it(\"x\", f); /* it's done */",
+            "it(\"x\", f); /* open\n */",
+            "it(\"çğü{\", f);",
+        ] {
+            let src = format!("{header}\nfunction helperAfter() {{\n  return 1;\n}}\n");
+            let out = parse(&src);
+            let t = out
+                .symbols
+                .iter()
+                .find(|s| s.kind == SymbolKind::Test)
+                .unwrap_or_else(|| panic!("no test for {header}"));
+            assert_eq!(t.end_line, 1, "{header}");
+            let helper_start = header.lines().count() + 1;
+            assert_eq!(span(&out, "helperAfter").0, helper_start, "{header}");
+        }
     }
 
     #[test]
@@ -914,18 +986,15 @@ mod tests {
         assert_eq!(test_span(src), (1, 6, true));
     }
 
+    // Replaces `scanner_carries_template_and_comment_state_across_lines`: template
+    // interpolations and multi-line comments around braces/parens keep spans exact.
     #[test]
-    fn scanner_carries_template_and_comment_state_across_lines() {
-        let mut carry = ScanCarry::Code;
-        assert_eq!(ts_code_line("a(`x", &mut carry), "a(`");
-        assert_eq!(carry, ScanCarry::Template);
-        assert_eq!(ts_code_line(") } still text", &mut carry), "");
-        assert_eq!(ts_code_line("end` )", &mut carry), "` )");
-        assert_eq!(carry, ScanCarry::Code);
-        assert_eq!(ts_code_line("b /* open", &mut carry), "b ");
-        assert_eq!(carry, ScanCarry::BlockComment);
-        assert_eq!(ts_code_line("{ ) */ c", &mut carry), " c");
-        assert_eq!(carry, ScanCarry::Code);
+    fn template_interpolation_and_comments_keep_function_spans() {
+        let src = "function a() {\n  const s = `x ${f(`)`)} }\n  y`;\n  /* { ( */\n  return s;\n}\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse(src);
+        assert_eq!(span(&out, "a"), (1, 6));
+        assert_eq!(span(&out, "helperAfter"), (7, 9));
     }
 
     #[test]
@@ -934,6 +1003,8 @@ mod tests {
                    function helperAfter() {\n  return 1;\n}\n";
         let out = parse(src);
         assert!(out.symbols.iter().any(|s| s.name == "helperAfter"));
+        assert_eq!(span(&out, "label"), (1, 1));
+        assert_eq!(sym(&out, "label").signature, "const label = () => ...");
     }
 
     #[test]
@@ -950,19 +1021,27 @@ function helperAfter() {
         assert_eq!(test_span(src), (1, 4, true));
     }
 
+    // Replaces the lexer unit test of the same name.
     #[test]
     fn division_is_not_mistaken_for_a_regex() {
-        assert_eq!(
-            ts_code_only("const r = (a) / b / (c);"),
-            "const r = (a) / b / (c);"
-        );
-        assert_eq!(ts_code_only("x = /[)}]/g; y()"), "x = //g; y()");
-        assert_eq!(ts_code_only(r"return /\)/.test(s)"), "return //.test(s)");
+        let src = "function ratio(a, b, c) {\n  const r = (a) / b / (c);\n  return r;\n}\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse(src);
+        assert_eq!(span(&out, "ratio"), (1, 4));
+        assert_eq!(span(&out, "helperAfter"), (5, 7));
     }
 
+    // Replaces the lexer unit test of the same name, on real JSX.
     #[test]
     fn jsx_apostrophe_does_not_hide_the_rest_of_the_line() {
-        assert_eq!(ts_code_only("<p>Don't {name}</p>"), "<p>Dont {name}</p>");
+        let src = "export function Greeting({ name }) {\n  return <p>Don't {format(name)}</p>;\n}\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        for path in ["src/a.tsx", "src/a.jsx"] {
+            let out = parse_as(path, src);
+            assert_eq!(span(&out, "Greeting"), (1, 3), "{path}");
+            assert_eq!(span(&out, "helperAfter"), (4, 6), "{path}");
+            assert!(has_ref(&out, "format", EdgeKind::Calls), "{path}");
+        }
     }
 
     #[test]
@@ -974,35 +1053,32 @@ function helperAfter() {
             .find(|s| s.kind == SymbolKind::Test)
             .unwrap();
         assert!(t.signature.contains("parses {x}"), "{}", t.signature);
+        assert!(!t.signature.contains("run()"), "{}", t.signature);
     }
 
     #[test]
     fn regex_after_throw_and_other_keywords_is_not_code() {
-        assert_eq!(ts_code_only("throw /)/;"), "throw //;");
-        assert_eq!(
-            ts_code_only("x instanceof /(/.constructor"),
-            "x instanceof //.constructor"
-        );
-        assert_eq!(ts_code_only("else /)/.test(s)"), "else //.test(s)");
-
         let src = r#"it("throws", () => {
   if (bad) throw /)/;
+  if (x instanceof /(/.constructor) {} else /)/.test(s);
   check();
 });
 function helperAfter() {
   return 1;
 }
 "#;
-        assert_eq!(test_span(src), (1, 4, true));
+        assert_eq!(test_span(src), (1, 5, true));
     }
 
+    // Replaces the lexer unit test of the same name, on real TSX.
     #[test]
     fn jsx_closing_tag_is_not_a_regex() {
-        // `</p>` must not be read as a regex running to the next `/`, hiding `{name}` and `(`
-        assert_eq!(
-            ts_code_only("<p>{a}</p> <b>{call(x)}</b>"),
-            "<p>{a}</p> <b>{call(x)}</b>"
-        );
+        let src = "const View = () => (\n  <div><p>{a}</p> <b>{call(x)}</b></div>\n);\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse_as("src/view.tsx", src);
+        assert_eq!(span(&out, "View"), (1, 3));
+        assert!(has_ref(&out, "call", EdgeKind::Calls));
+        assert_eq!(span(&out, "helperAfter"), (4, 6));
     }
 
     #[test]
@@ -1011,9 +1087,81 @@ function helperAfter() {
         if let Some(t) = out.symbols.iter().find(|s| s.kind == SymbolKind::Test) {
             assert!(!t.signature.contains("run()"), "{}", t.signature);
         }
-        assert_eq!(
-            before_code_brace("it(\"x\" + ', () => { run(); }"),
-            "it(\"x\" + ', () => "
+    }
+
+    #[test]
+    fn classes_methods_heritage_and_visibility() {
+        let src = "/** Stores users. */\nexport class UserStore extends Base<T> implements IStore, ns.Other {\n  \
+                   private cache = new Map();\n  \
+                   onChange = () => {\n    notify();\n  };\n  \
+                   async load(id: string): Promise<User> {\n    return fetchUser(id);\n  }\n}\n\
+                   interface IStore extends Readable {\n  load(id: string): Promise<User>;\n}\n\
+                   export enum Color { Red, Green }\n\
+                   type Id = string | number;\n\
+                   declare function ambient(x: number): void;\n";
+        let out = parse_as("src/store.ts", src);
+        let class = sym(&out, "UserStore");
+        assert_eq!(class.kind, SymbolKind::Class);
+        assert_eq!((class.start_line, class.end_line), (2, 10));
+        assert_eq!(class.visibility, "export");
+        assert_eq!(class.doc_summary, "Stores users.");
+        assert!(!class.signature.contains("cache"), "{}", class.signature);
+        for base in ["Base", "IStore", "Other", "Readable"] {
+            assert!(has_ref(&out, base, EdgeKind::Implements), "{base}");
+        }
+        let load = sym(&out, "load");
+        assert_eq!(load.kind, SymbolKind::Method);
+        assert_eq!(load.qualified_name, "UserStore::load");
+        assert_eq!((load.start_line, load.end_line), (7, 9));
+        assert_eq!(load.parent_id.as_deref(), Some(class.id.as_str()));
+        assert_eq!(span(&out, "onChange"), (4, 6));
+        assert!(
+            !out.symbols.iter().any(|s| s.name == "cache"),
+            "non-function field"
         );
+        assert!(has_ref(&out, "fetchUser", EdgeKind::Calls));
+        assert!(has_ref(&out, "notify", EdgeKind::Calls));
+        assert_eq!(sym(&out, "IStore").kind, SymbolKind::Trait);
+        assert_eq!(sym(&out, "Color").kind, SymbolKind::Enum);
+        assert_eq!(sym(&out, "Id").kind, SymbolKind::TypeAlias);
+        assert_eq!(sym(&out, "Id").signature, "type Id = string | number;");
+        assert_eq!(sym(&out, "ambient").kind, SymbolKind::Function);
+        assert_eq!(sym(&out, "Color").visibility, "export");
+        assert_eq!(sym(&out, "Id").visibility, "private");
+    }
+
+    #[test]
+    fn relative_imports_requires_and_dynamic_imports() {
+        let src = "import { a } from \"./a\";\nimport React from 'react';\n\
+                   export { b } from '../b';\nconst c = require(\"./c\");\n\
+                   async function lazy() {\n  return import(\"./d\");\n}\n";
+        let out = parse_as("src/x.js", src);
+        let imports: Vec<(&str, usize)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == EdgeKind::Imports)
+            .map(|r| (r.target_name.as_str(), r.line))
+            .collect();
+        assert_eq!(imports, vec![("a", 1), ("b", 3), ("c", 4), ("d", 6)]);
+    }
+
+    #[test]
+    fn tests_inside_describe_and_modifiers_are_found() {
+        let src = "describe(\"suite\", () => {\n  it.only(\"first\", () => {\n    runA();\n  });\n  \
+                   test(`second`, async () => {\n    await runB();\n  });\n});\n";
+        let out = parse(src);
+        assert_eq!(span(&out, "first"), (2, 4));
+        assert_eq!(span(&out, "second"), (5, 7));
+        assert!(has_ref(&out, "runA", EdgeKind::Tests));
+        assert!(has_ref(&out, "runB", EdgeKind::Tests));
+    }
+
+    #[test]
+    fn calls_in_strings_and_comments_are_not_edges() {
+        let src = "function f() {\n  // ghost()\n  const s = \"phantom()\";\n  real();\n}\n";
+        let out = parse(src);
+        assert!(has_ref(&out, "real", EdgeKind::Calls));
+        assert!(!has_ref(&out, "ghost", EdgeKind::Calls));
+        assert!(!has_ref(&out, "phantom", EdgeKind::Calls));
     }
 }
