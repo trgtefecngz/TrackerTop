@@ -647,6 +647,36 @@ impl Database {
         })
     }
 
+    /// The latest `limit` telemetry rows recorded by AI agents over MCP, oldest first.
+    pub fn agent_telemetry(&self, limit: usize) -> Result<Vec<TelemetryEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, timestamp, tool, query, tokens_sent, baseline_tokens, tokens_saved, files_avoided, latency_ms, source
+             FROM telemetry
+             WHERE {}
+             ORDER BY id DESC
+             LIMIT ?1",
+            StatsScope::Agents.where_clause()
+        ))?;
+        let mut rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(TelemetryEntry {
+                    id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    tool: r.get(2)?,
+                    query: r.get(3)?,
+                    tokens_sent: r.get::<_, i64>(4)? as usize,
+                    baseline_tokens: r.get::<_, i64>(5)? as usize,
+                    tokens_saved: r.get::<_, i64>(6)? as usize,
+                    files_avoided: r.get::<_, i64>(7)? as usize,
+                    latency_ms: r.get::<_, i64>(8)? as u64,
+                    source: r.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     pub fn clear_telemetry(&self) -> Result<()> {
         self.conn.execute("DELETE FROM telemetry", [])?;
         Ok(())
