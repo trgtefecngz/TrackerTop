@@ -17,14 +17,14 @@ use std::path::Path;
 /// Who depends on a symbol through code: calls, tests, type uses and trait impls. Doc
 /// mentions (`References` from Markdown), file imports and co-change history are left out:
 /// they are not callers, and counting them inflates a blast radius.
-struct Dependents {
-    direct_dependents: Vec<Symbol>,
+pub(super) struct Dependents {
+    pub(super) direct_dependents: Vec<Symbol>,
     transitive_dependents: Vec<Symbol>,
-    related_tests: Vec<Symbol>,
+    pub(super) related_tests: Vec<Symbol>,
     affected_files: BTreeSet<String>,
 }
 
-fn code_dependents(cg: &CodeGraph, id: &str, depth: usize) -> Option<Dependents> {
+pub(super) fn code_dependents(cg: &CodeGraph, id: &str, depth: usize) -> Option<Dependents> {
     let root = cg.symbols.get(id)?;
     let &start = cg.id_to_idx.get(id)?;
     let mut d = Dependents {
@@ -110,18 +110,18 @@ pub struct Finding {
     pub evidence: Vec<String>,
 }
 
-fn loc(s: &Span) -> String {
+pub(super) fn loc(s: &Span) -> String {
     format!("{}:L{}-{}", s.path, s.start_line, s.end_line)
 }
 
 /// Functions and methods: the symbols whose callers and tests the graph tracks.
-fn is_callable(kind: &str) -> bool {
+pub(super) fn is_callable(kind: &str) -> bool {
     [SymbolKind::Function, SymbolKind::Method]
         .iter()
         .any(|k| k.as_str() == kind)
 }
 
-fn is_test_path(path: &str) -> bool {
+pub(super) fn is_test_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     p.starts_with("tests/")
         || p.contains("/tests/")
@@ -134,7 +134,7 @@ fn is_test_path(path: &str) -> bool {
 }
 
 /// The graph symbol behind one side of a changed symbol.
-fn symbol_at<'a>(cg: &'a CodeGraph, span: &Span, qname: &str) -> Option<&'a Symbol> {
+pub(super) fn symbol_at<'a>(cg: &'a CodeGraph, span: &Span, qname: &str) -> Option<&'a Symbol> {
     cg.symbols_by_file.get(&span.path)?.iter().find_map(|id| {
         cg.symbols
             .get(id)
@@ -154,7 +154,7 @@ fn read_lines(root: &Path, path: &str, start: usize, end: usize) -> Option<Vec<S
     )
 }
 
-fn is_ident(c: char) -> bool {
+pub(super) fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
@@ -591,6 +591,7 @@ pub fn run_rules(
     bloat(cs, head, base, &mut out);
     untested(cs, head, &mut out);
     super::cochange::cochange_miss(cs, history, head_root, &mut out);
+    super::orphan::orphans(cs, head, base, head_root, &mut out);
     out.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.id.cmp(&b.id)));
     out.dedup_by(|a, b| a.id == b.id);
     out

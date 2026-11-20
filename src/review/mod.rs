@@ -8,6 +8,7 @@
 //! both graphs to work with.
 
 pub mod cochange;
+pub mod orphan;
 pub mod rules;
 pub mod snapshot;
 

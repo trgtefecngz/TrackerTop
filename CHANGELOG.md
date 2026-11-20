@@ -12,6 +12,7 @@ All notable changes to TrackerTop are documented here.
   - `untested`: new or modified code that no test reaches;
   - `new-cycle`: an import cycle the change created between JS/TS/Python/Go files;
   - `bloat`: a file that grew past 3,500 tokens;
+  - `orphan`: a function whose last caller this change removed or rewrote, reported only when its name appears nowhere else in the project's code (so a function passed as a value or named in a registry is never called unused);
   - `cochange-miss`: a file that changed together with a file you touched in at least 4 commits and 60% of that file's recent history (at the base, bulk commits ignored), but not in this change. Reported as a habit with the commits it rests on, never as proof.
 - New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
 
@@ -23,6 +24,9 @@ All notable changes to TrackerTop are documented here.
 
 ### Fixed: symbol lookups never guess silently
 - `read_symbol`, `read_symbols_batch`, `call_graph` and `impact_analysis` used to fall back to the best fuzzy match without saying so. For example, `src/review/rules.rs::tests` returned an unrelated test. Lookups now try an exact symbol id, `path::name`, an exact qualified name, then an exact name, in that order. When several symbols share the name, the answer says **AMBIGUOUS** and lists them; a fuzzy match is labelled as the closest match.
+
+### Fixed: stale graph after upgrading TrackerTop
+- The index records which extractor revision parsed it. An index written by another TrackerTop version is re-parsed in full on its next run. Before, files whose content had not changed kept the references an older extractor produced, so call-edge fixes never reached them: on this repository, `TrackerEngine::finalize_inner` showed 0 callers instead of 19.
 
 ### Fixed: call edges (all tools)
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.

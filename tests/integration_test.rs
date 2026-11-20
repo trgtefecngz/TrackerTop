@@ -1801,3 +1801,91 @@ fn review_flags_files_that_habitually_change_together() {
         cs.findings
     );
 }
+
+/// `orphan`: a function whose last caller the change removed. Code that was already
+/// dead, and a function still named somewhere (passed as a value), are not reported.
+#[test]
+fn review_flags_functions_the_change_left_without_callers() {
+    use trackertop::review::review;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let base = "fn helper_alpha() -> i32 { 1 }\n\
+                fn mapper_beta(x: i32) -> i32 { x }\n\
+                fn already_dead() -> i32 { 3 }\n\
+                pub fn api_gamma() -> i32 { 4 }\n\
+                pub fn run() -> i32 {\n    helper_alpha() + mapper_beta(2) + api_gamma()\n}\n";
+    std::fs::write(root.join("src/lib.rs"), base).unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+    let head = base.replace(
+        "    helper_alpha() + mapper_beta(2) + api_gamma()\n",
+        "    [2].iter().map(|x| mapper_beta(*x)).sum::<i32>() + [1].len() as i32\n",
+    );
+    let head = head.replace("mapper_beta(*x)).sum", "*x).map(mapper_beta).sum");
+    std::fs::write(root.join("src/lib.rs"), head).unwrap();
+
+    let cs = review(root, "main").unwrap();
+    let orphans: Vec<&str> = cs
+        .findings
+        .iter()
+        .filter(|f| f.rule == "orphan")
+        .map(|f| f.id.as_str())
+        .collect();
+    assert_eq!(
+        orphans,
+        vec![
+            "orphan:src/lib.rs:api_gamma",
+            "orphan:src/lib.rs:helper_alpha"
+        ],
+        "{:?}",
+        cs.findings
+    );
+    let alpha = cs
+        .findings
+        .iter()
+        .find(|f| f.id == "orphan:src/lib.rs:helper_alpha")
+        .unwrap();
+    assert_eq!(alpha.location, "src/lib.rs:L1-1");
+    assert!(
+        alpha.evidence[0].contains("src/lib.rs:5 `run` (modified)"),
+        "{:?}",
+        alpha.evidence
+    );
+    assert!(!alpha.message.contains("public"), "{}", alpha.message);
+    let gamma = cs
+        .findings
+        .iter()
+        .find(|f| f.id == "orphan:src/lib.rs:api_gamma")
+        .unwrap();
+    assert!(gamma.message.contains("public"), "{}", gamma.message);
+}
+
+/// An index written by another extractor revision is re-parsed in full: unchanged files
+/// must not keep the references an older extractor produced (stale edges, all tools).
+#[test]
+fn index_from_another_extractor_revision_is_reparsed_in_full() {
+    use trackertop::db::Database;
+    use trackertop::indexer::{EXTRACTOR_REVISION, index_repository};
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "pub fn a() -> i32 { b() }\n").unwrap();
+    std::fs::write(root.join("src/b.rs"), "pub fn b() -> i32 { 1 }\n").unwrap();
+    let first = index_repository(root, false).unwrap();
+    assert_eq!(first.parsed_files, 2);
+    let db = Database::open_for_repo(root).unwrap();
+    assert_eq!(db.extractor_revision().unwrap(), EXTRACTOR_REVISION);
+    assert_eq!(index_repository(root, false).unwrap().parsed_files, 0);
+
+    // Simulate an index from an older TrackerTop, with a file deleted meanwhile
+    db.set_extractor_revision(EXTRACTOR_REVISION - 1).unwrap();
+    std::fs::remove_file(root.join("src/b.rs")).unwrap();
+    let upgraded = index_repository(root, false).unwrap();
+    assert_eq!(upgraded.parsed_files, 1, "the unchanged file is re-parsed");
+    assert_eq!(upgraded.deleted_files, 1, "deletions are still detected");
+    assert_eq!(db.extractor_revision().unwrap(), EXTRACTOR_REVISION);
+    assert_eq!(index_repository(root, false).unwrap().parsed_files, 0);
+}
