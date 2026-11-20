@@ -277,6 +277,23 @@ fn index_with(
     }
 
     let parsed_files = parsed_batch.len();
+    // A full re-parse must not keep rows it could not refresh (unreadable, too large or
+    // unparsable now): they were produced by another extractor revision or are stale, and
+    // the index is about to be marked current. Without rows the file reads as not indexed.
+    let mut deleted = deleted;
+    if reparse_all {
+        let refreshed: HashSet<&str> = parsed_batch
+            .iter()
+            .map(|(r, _, _)| r.path.as_str())
+            .collect();
+        let gone: HashSet<&str> = deleted.iter().map(String::as_str).collect();
+        let stale: Vec<String> = existing
+            .keys()
+            .filter(|p| !refreshed.contains(p.as_str()) && !gone.contains(p.as_str()))
+            .cloned()
+            .collect();
+        deleted.extend(stale);
+    }
     let deleted_files = deleted.len();
 
     if deleted_files > 0 {

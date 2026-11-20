@@ -1989,3 +1989,27 @@ fn rust_type_users_include_function_bodies() {
     // `Widget` here is an external type: no edge to the function of that name
     assert!(users("Widget").is_empty(), "{:?}", users("Widget"));
 }
+
+/// A full re-parse drops the rows of a file it could not re-parse (here: no longer valid
+/// UTF-8), instead of keeping the old extractor's symbols and marking the index current.
+#[test]
+fn full_reparse_drops_files_it_could_not_reparse() {
+    use trackertop::db::Database;
+    use trackertop::indexer::{EXTRACTOR_REVISION, index_repository};
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "pub fn a() -> i32 { b() }\n").unwrap();
+    std::fs::write(root.join("src/b.rs"), "pub fn b() -> i32 { 1 }\n").unwrap();
+    index_repository(root, false).unwrap();
+    let db = Database::open_for_repo(root).unwrap();
+    db.set_extractor_revision(EXTRACTOR_REVISION - 1).unwrap();
+    std::fs::write(root.join("src/b.rs"), [0xff, 0xfe, b'f', b'n']).unwrap();
+    index_repository(root, false).unwrap();
+    let files = db.load_file_map().unwrap();
+    assert!(files.contains_key("src/a.rs"));
+    assert!(
+        !files.contains_key("src/b.rs"),
+        "rows from the old extractor survived a full re-parse"
+    );
+}
