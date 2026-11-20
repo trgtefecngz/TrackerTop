@@ -14,6 +14,7 @@ pub mod parser;
 pub mod playbook;
 pub mod registry;
 pub mod report;
+pub mod review;
 pub mod tokens;
 #[cfg(feature = "gui")]
 pub mod ui;

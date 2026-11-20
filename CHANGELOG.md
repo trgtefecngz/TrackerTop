@@ -2,6 +2,11 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [0.8.0] - unreleased
+
+### Added: `trackertop review` (step 1)
+- `trackertop review [--base <ref>] [--format md|json]` lists which symbols your branch and uncommitted work added, removed or modified compared with the merge base, with `file:line` on both sides. The base is checked out and indexed separately under `.trackertop/review-base/`, without touching your branch, index or working tree.
+
 ## [0.7.0] - 2026-11-20
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).

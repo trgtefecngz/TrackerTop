@@ -16,7 +16,7 @@ use std::process::Command;
 /// Max diff lines printed per file before the rest is summarized.
 const LINES_PER_FILE: usize = 40;
 
-fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_root)
         .args(["-c", "core.quotepath=false"])
@@ -60,6 +60,11 @@ impl Hunk {
         } else {
             (self.new_start, self.new_start + self.new_count - 1)
         }
+    }
+
+    /// Inclusive old-side line range, or `None` for a pure insertion (nothing removed).
+    pub fn old_range(&self) -> Option<(usize, usize)> {
+        (self.old_count > 0).then(|| (self.old_start, self.old_start + self.old_count - 1))
     }
 }
 
@@ -254,7 +259,7 @@ fn old_symbol_names(repo_root: &Path, commit: &str, path: &str) -> Option<BTreeS
 }
 
 /// Innermost symbols of `syms` that intersect `[a, b]`.
-fn touched<'a>(syms: &[&'a Symbol], a: usize, b: usize) -> Vec<&'a Symbol> {
+pub(crate) fn touched<'a>(syms: &[&'a Symbol], a: usize, b: usize) -> Vec<&'a Symbol> {
     let hit: Vec<&Symbol> = syms
         .iter()
         .copied()

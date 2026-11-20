@@ -90,6 +90,17 @@ enum Commands {
     Languages,
     /// Generate concise Markdown summary at .trackertop/GRAPH_REPORT.md
     Report,
+    /// Review the working tree (commits, staged, unstaged and untracked work) against a base
+    /// branch: which symbols were added, removed or modified, with file:line on both sides
+    Review {
+        /// Branch, tag or commit to compare against (default: origin/HEAD, main or master);
+        /// the review uses its merge base with HEAD
+        #[arg(long)]
+        base: Option<String>,
+        /// Output format: md or json
+        #[arg(long, default_value = "md")]
+        format: String,
+    },
     /// Configure AI agent integration (claude, cursor, codex, windsurf)
     Install {
         /// Target agent (claude, cursor, codex, windsurf)
@@ -332,6 +343,18 @@ fn main() -> Result<()> {
             index_repository(&repo_root, false)?;
             let md_path = generate_markdown_report(&repo_root)?;
             println!("Generated Markdown summary: {}", md_path.display());
+        }
+        Commands::Review { base, format } => {
+            let base = match base {
+                Some(b) => b,
+                None => trackertop::review::default_base(&repo_root)?,
+            };
+            let cs = trackertop::review::review(&repo_root, &base)?;
+            match format.to_ascii_lowercase().as_str() {
+                "md" | "markdown" => print!("{}", trackertop::review::render_markdown(&cs)),
+                "json" => println!("{}", serde_json::to_string_pretty(&cs)?),
+                other => anyhow::bail!("unknown format `{other}`: use md or json"),
+            }
         }
         Commands::Install { target, global } => {
             let actions = match target.to_ascii_lowercase().as_str() {

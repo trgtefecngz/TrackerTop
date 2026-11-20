@@ -121,15 +121,32 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
     index_repository_with_registry(repo_root, force, default_registry())
 }
 
+/// Indexes a temporary snapshot (for example a review's base commit checked out in a
+/// worktree) without adding it to the global project list shown in the desktop app.
+pub fn index_snapshot(root: &Path) -> Result<IndexStats> {
+    index_with(root, false, default_registry(), false)
+}
+
 /// Runs an incremental index using any custom `LanguageRegistry` (open core for community languages).
 pub fn index_repository_with_registry(
     repo_root: &Path,
     force: bool,
     registry: &LanguageRegistry,
 ) -> Result<IndexStats> {
+    index_with(repo_root, force, registry, true)
+}
+
+fn index_with(
+    repo_root: &Path,
+    force: bool,
+    registry: &LanguageRegistry,
+    register: bool,
+) -> Result<IndexStats> {
     let start = Instant::now();
     ensure_indexable_root(repo_root)?;
-    let _ = register_project(repo_root);
+    if register {
+        let _ = register_project(repo_root);
+    }
     let mut db = Database::open_for_repo(repo_root)?;
     let existing = if force {
         HashMap::new()
@@ -137,7 +154,9 @@ pub fn index_repository_with_registry(
         db.load_file_map()?
     };
 
-    let discovered = discover_supported_files(repo_root, registry);
+    // A snapshot lives under the project's git-ignored `.trackertop/`: ignore rules from
+    // directories above it would hide every file, so only its own `.gitignore`s apply.
+    let discovered = discover_supported_files(repo_root, registry, register);
     let current_paths: HashSet<String> = discovered.iter().map(|(rel, _, _)| rel.clone()).collect();
 
     // Detect deleted files
@@ -329,9 +348,12 @@ pub fn index_repository_with_registry(
 fn discover_supported_files(
     repo_root: &Path,
     registry: &LanguageRegistry,
+    parent_ignores: bool,
 ) -> Vec<(String, PathBuf, Arc<dyn LanguageExtractor>)> {
     let mut results = Vec::new();
     let walker = WalkBuilder::new(repo_root)
+        .parents(parent_ignores)
+        .require_git(parent_ignores)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)

@@ -1350,3 +1350,108 @@ fn changes_since_works_when_the_project_is_a_git_subdirectory() {
     assert!(out.contains("Removed symbols: gamma"), "{out}");
     assert!(!out.contains("other/x.rs"), "{out}");
 }
+
+/// `review` step 1: every kind of change maps to the right symbols on the right side,
+/// including file renames, deletions, untracked files, and a project that is a
+/// subdirectory of its git repository.
+#[test]
+fn review_lists_changed_symbols_for_every_kind_of_change() {
+    use trackertop::review::{Change, review};
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    let root = repo.join("pkg");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(repo.join("sibling.rs"), "pub fn sibling() {}\n").unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn keep() -> i32 {\n    1\n}\n\npub fn edit() -> i32 {\n    2\n}\n\npub fn drop_me() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/old_name.rs"),
+        "pub fn moved() -> i32 {\n    4\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/gone.rs"), "pub fn gone() {}\n").unwrap();
+    git_in(repo, &["init", "-q", "-b", "main"]);
+    git_in(repo, &["add", "."]);
+    git_in(repo, &["commit", "-q", "-m", "base"]);
+    git_in(repo, &["checkout", "-q", "-b", "work"]);
+
+    // Committed on the branch: edit() changes, drop_me() goes, fresh() arrives
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn keep() -> i32 {\n    1\n}\n\npub fn edit() -> i32 {\n    20\n}\n\npub fn fresh() -> i32 {\n    5\n}\n",
+    )
+    .unwrap();
+    git_in(repo, &["mv", "pkg/src/old_name.rs", "pkg/src/new_name.rs"]);
+    git_in(repo, &["rm", "-q", "pkg/src/gone.rs"]);
+    git_in(repo, &["commit", "-q", "-am", "work"]);
+    // Uncommitted: an untracked file, and a change outside the project
+    std::fs::write(root.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+    std::fs::write(repo.join("sibling.rs"), "pub fn sibling() { }\n").unwrap();
+    // The base branch moves on after the fork: the review must use the merge base
+    git_in(repo, &["checkout", "-q", "main"]);
+    std::fs::write(root.join("src/later.rs"), "pub fn later() {}\n").unwrap();
+    git_in(repo, &["add", "pkg/src/later.rs"]);
+    git_in(
+        repo,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "main moves on",
+            "--",
+            "pkg/src/later.rs",
+        ],
+    );
+    git_in(repo, &["checkout", "-q", "work"]);
+
+    let cs = review(&root, "main").unwrap();
+    let got: Vec<(String, Change)> = cs
+        .symbols
+        .iter()
+        .map(|s| (s.qualified_name.clone(), s.change))
+        .collect();
+    let has = |name: &str, change: Change| got.iter().any(|(n, c)| n == name && *c == change);
+    assert!(has("edit", Change::Modified), "{got:?}");
+    assert!(has("fresh", Change::Added), "{got:?}");
+    assert!(has("drop_me", Change::Removed), "{got:?}");
+    assert!(has("gone", Change::Removed), "{got:?}");
+    assert!(has("extra", Change::Added), "{got:?}");
+    // Unchanged symbols, moved-but-unchanged code and other packages are not listed
+    for n in ["keep", "moved", "sibling", "later"] {
+        assert!(!got.iter().any(|(g, _)| g == n), "{n}: {got:?}");
+    }
+    let renamed = cs.files.iter().find(|f| f.status == "renamed").unwrap();
+    assert_eq!(
+        (renamed.old_path.as_deref(), renamed.path.as_str()),
+        (Some("src/old_name.rs"), "src/new_name.rs")
+    );
+    let removed = cs
+        .symbols
+        .iter()
+        .find(|s| s.qualified_name == "drop_me")
+        .unwrap();
+    assert_eq!(removed.base.as_ref().unwrap().start_line, 9);
+    assert!(removed.head.is_none());
+
+    // The user's branch, index and working tree are untouched by the base checkout
+    let status = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert_eq!(status.lines().count(), 2, "{status}");
+    let wt = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&wt.stdout).lines().count(), 1);
+
+    // A second run reuses the cached snapshot and gives the same answer
+    let again = review(&root, "main").unwrap();
+    assert_eq!(again.symbols, cs.symbols);
+}
