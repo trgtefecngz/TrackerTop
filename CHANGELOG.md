@@ -2,7 +2,7 @@
 
 All notable changes to TrackerTop are documented here.
 
-## [Unreleased]
+## [0.8.1] - 2026-11-21
 
 ### Added: cross-session continuity
 - **Work journal.** The MCP server records every tool call per agent session (one server process = one session, which survives `/compact`): tool, compacted arguments and outcome (`ok`, the RESULT or findings line of checks and reviews, NOT FOUND misses, or the error). Kept per project in the index DB, newest 20,000 calls.
@@ -227,6 +227,7 @@ A reliability and safety release. There are no new MCP tools; everything that al
 
 Global Edition: TypeScript/JavaScript, Python and Go extractors, custom app icon, Claude Code SessionStart hook, macOS release CI, one-line installers.
 
+[0.8.1]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.1
 [0.8.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.0
 [0.7.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.7.0
 [0.6.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.6.0
