@@ -24,7 +24,7 @@ Everything below serves the agent first: catch mistakes before they are pushed, 
 | v1.0 | Editing and continuity | Symbol-level editing; working memory across sessions (`resume`) |
 | Later | Breadth | Structural search/replace; version-exact dependency docs; more tree-sitter languages |
 
-## v0.8: local, graph-grounded review (`trackertop review`)
+## v0.8: local, graph-grounded review (`trackertop review`), released as v0.8.0
 
 ### Goal
 

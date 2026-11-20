@@ -70,11 +70,28 @@ pub struct NestedView {
     pub edges: Vec<NestedEdge>,
     /// Symbol edges with exactly one endpoint inside this scope (not drawn at this level).
     pub external_edges: usize,
+    /// `external_edges` by where they lead: other communities (community level) or other
+    /// files (file level); largest first. The counts sum to `external_edges`.
+    pub external: Vec<ExternalGroup>,
     /// Symbol edges inside this scope that are not drawn: both endpoints map to the same
     /// node, or an endpoint is a file-scope entry or was cut by the node cap.
     pub hidden_edges: usize,
     /// Children not shown because of [`MAX_LEVEL_NODES`].
     pub truncated: usize,
+}
+
+/// Edges leaving a scope toward one outside group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalGroup {
+    /// Community label, or file path at file level; `(not indexed)` when the far end's file
+    /// has no community.
+    pub label: String,
+    /// The level that opens the far end (`None` when it cannot be opened).
+    pub level: Option<NestedLevel>,
+    pub count: usize,
+    /// Children of this view that carry these edges: `(node index, edges)`. Edges whose
+    /// inside end is not a shown child (file-scope entry, cut by the cap) are only in `count`.
+    pub from: Vec<(usize, usize)>,
 }
 
 enum Scope<'p> {
@@ -158,6 +175,36 @@ impl<'a> NestedGraph<'a> {
             communities,
             community_of_file,
             symbols_by_file,
+        }
+    }
+
+    /// Stable id of the community holding `path`.
+    pub fn community_id_of(&self, path: &str) -> Option<&str> {
+        self.community_of_file
+            .get(path)
+            .map(|&i| self.communities[i].id.as_str())
+    }
+
+    /// Where an edge leaving `scope` lands: `(label, level that opens it)`.
+    fn external_target(
+        &self,
+        scope: &Scope<'_>,
+        outside: &Symbol,
+    ) -> (String, Option<NestedLevel>) {
+        match scope {
+            Scope::File(_) => (
+                outside.file_path.clone(),
+                self.files
+                    .contains_key(&outside.file_path)
+                    .then(|| NestedLevel::File(outside.file_path.clone())),
+            ),
+            _ => match self.community_of_file.get(&outside.file_path) {
+                Some(&i) => (
+                    self.communities[i].label.clone(),
+                    Some(NestedLevel::Community(self.communities[i].id.clone())),
+                ),
+                None => ("(not indexed)".to_string(), None),
+            },
         }
     }
 
@@ -294,6 +341,7 @@ impl<'a> NestedGraph<'a> {
 
         let mut agg: BTreeMap<(usize, usize), usize> = BTreeMap::new();
         let mut external_edges = 0;
+        let mut external: BTreeMap<String, ExternalGroup> = BTreeMap::new();
         let mut hidden_edges = 0;
         for e in self.edges {
             if e.kind == EdgeKind::Contains {
@@ -307,7 +355,28 @@ impl<'a> NestedGraph<'a> {
             };
             match (self.scope_key(&scope, s), self.scope_key(&scope, t)) {
                 (None, None) => {}
-                (Some(_), None) | (None, Some(_)) => external_edges += 1,
+                (Some(inside), None) | (None, Some(inside)) => {
+                    external_edges += 1;
+                    let outside = if self.scope_key(&scope, s).is_some() {
+                        t
+                    } else {
+                        s
+                    };
+                    let (label, lvl) = self.external_target(&scope, outside);
+                    let g = external.entry(label).or_insert_with(|| ExternalGroup {
+                        label: String::new(),
+                        level: lvl,
+                        count: 0,
+                        from: Vec::new(),
+                    });
+                    g.count += 1;
+                    if let Some(&ci) = index.get(inside.as_str()) {
+                        match g.from.iter_mut().find(|(i, _)| *i == ci) {
+                            Some((_, n)) => *n += 1,
+                            None => g.from.push((ci, 1)),
+                        }
+                    }
+                }
                 (Some(a), Some(b)) => match (index.get(a.as_str()), index.get(b.as_str())) {
                     (Some(&ia), Some(&ib)) if ia != ib => *agg.entry((ia, ib)).or_insert(0) += 1,
                     _ => hidden_edges += 1,
@@ -324,6 +393,18 @@ impl<'a> NestedGraph<'a> {
                 .map(|((src, tgt), weight)| NestedEdge { src, tgt, weight })
                 .collect(),
             external_edges,
+            external: {
+                let mut groups: Vec<ExternalGroup> = external
+                    .into_iter()
+                    .map(|(label, mut g)| {
+                        g.label = label;
+                        g.from.sort();
+                        g
+                    })
+                    .collect();
+                groups.sort_by(|a, b| b.count.cmp(&a.count).then(a.label.cmp(&b.label)));
+                groups
+            },
             hidden_edges,
             truncated,
         })
@@ -498,6 +579,26 @@ mod tests {
             "fb->fc and the import leave the community"
         );
         assert_eq!(v.hidden_edges, 1, "fa->ga stays inside a.rs");
+        // Both leaving edges go to the lib community: the import from a.rs (child 0) and
+        // fb->fc from b.rs (child 1).
+        assert_eq!(v.external.len(), 1);
+        assert_eq!(v.external[0].count, 2);
+        assert_eq!(
+            v.external[0].level,
+            Some(NestedLevel::Community("c:lib/c.rs".into()))
+        );
+        assert_eq!(v.external[0].from, vec![(0, 1), (1, 1)]);
+        let g = graph(&f);
+        assert_eq!(g.community_id_of("src/b.rs"), Some("c:src/a.rs"));
+        assert_eq!(g.community_id_of("nope.rs"), None);
+        let fv = g.view(&NestedLevel::File("src/b.rs".into())).unwrap();
+        let sum: usize = fv.external.iter().map(|e| e.count).sum();
+        assert_eq!(sum, fv.external_edges);
+        assert!(
+            fv.external
+                .iter()
+                .any(|e| e.level == Some(NestedLevel::File("lib/c.rs".into())))
+        );
         assert_eq!(v.breadcrumbs.len(), 2);
         assert_eq!(v.nodes[0].location.as_deref(), Some("src/a.rs:1"));
         assert_eq!(
