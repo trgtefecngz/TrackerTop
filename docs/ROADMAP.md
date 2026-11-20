@@ -1,6 +1,19 @@
 # Roadmap
 
-## v0.7: graph-grounded PR review (`trackertop review`)
+## v0.7: agent productivity (in progress, `feat/v0.7-agent-tools`)
+
+TrackerTop is a tool for the AI agent itself. v0.7 makes an agent's work cheaper and more correct: fewer wasted tool calls, fewer wrong turns, and never a silently incomplete answer.
+
+| # | Deliverable | Status |
+|---|---|---|
+| 1 | Correctness foundation: tree-sitter TS/TSX/JS extractor; every tool output states its coverage (capped lists say how much is hidden, "not indexed" vs "not found", heuristic extractors flagged); smart_grep proven against a plain scan | Done |
+| 2 | Agent tools: `run_checks` (compact test/lint/build summary that never hides a failure), `changes_since` (what changed since an index generation or git ref), `project_playbook` (build/test/lint commands, detected vs guessed), decision memory (Markdown notes under `.trackertop/notes/`, decisions and dismissed review leads surfaced on read) | Next |
+| 3 | Honest metrics: telemetry tagged by source (MCP client, CLI, UI, tests); conservative baseline next to the upper bound, savings as a range; optional log of what the agent asked for | Planned |
+| 4 | Nested ("matryoshka") Code Graph view: project → communities → files → symbols | Lowest priority |
+
+The graph-grounded PR review moves to v0.8.
+
+## v0.8: graph-grounded PR review (`trackertop review`)
 
 ### Goal
 
@@ -67,7 +80,7 @@ Fixing reviewer leads one round after another produced diminishing returns: late
 - Re-reviews are explicit (on a comment), not automatic on every push.
 - The report says when only unconfirmed P3 leads remain, which means the PR is ready.
 
-### Prerequisite: tree-sitter for TypeScript/JavaScript
+### Prerequisite: tree-sitter for TypeScript/JavaScript (done in v0.7)
 
 The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, template literals and regexes are recognised by hand-written scanning. Most late review findings in v0.6.0 were edge cases of that scanner. Both the review's symbol mapping and the AI context depend on accurate spans, so this comes first:
 - Use `tree-sitter-typescript` (TS and TSX grammars) and `tree-sitter-javascript`. Rust and HTML already use tree-sitter 0.25.
@@ -78,7 +91,7 @@ The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, 
 
 | # | Deliverable | Done when |
 |---|---|---|
-| 1 | Tree-sitter TS/JS extractor | All current TS tests pass; no line-scanner code left |
+| 1 | Tree-sitter TS/JS extractor | Done in v0.7 |
 | 2 | Diff → symbol mapping + base/head indexing | `review` lists changed symbols correctly for add/modify/delete/rename |
 | 3 | Deterministic rules + Markdown/JSON/SARIF | Each rule has fixture tests; runs offline in < 5 s on a 1k-file repo |
 | 4 | GitHub Action + single updating comment + commands | Works on this repository's own PRs |

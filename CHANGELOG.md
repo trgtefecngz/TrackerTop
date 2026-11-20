@@ -2,6 +2,21 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [Unreleased]
+
+v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
+
+### Changed: TypeScript / JavaScript extraction uses tree-sitter
+- `.ts`, `.tsx` and `.js`/`.jsx`/`.mjs`/`.cjs` are parsed with the tree-sitter TypeScript, TSX and JavaScript grammars. Strings, template literals, regex literals, comments and JSX can no longer shift where a symbol ends.
+- New: class fields holding arrow functions become methods, interface `extends` edges, dynamic `import("./x")`, `it.only`/`test.skip`, tests nested in `describe`. Calls inside strings and comments are no longer edges.
+- An `it(`/`test(` call left unterminated by a syntax error is recorded as its first line only.
+
+### Changed: tool answers state their coverage
+- Lists that are cut to fit say so: `(showing 10 of 37 callers; 27 more not shown)`. `read_symbols_batch` names the queries beyond its 10-per-call limit instead of dropping them.
+- Lookups distinguish **NOT INDEXED** (the file exists, but its type is not indexed or it is ignored) from **NOT FOUND**; symbol misses report the index's coverage and suggest `smart_grep`.
+- `smart_grep` ends with a coverage line: files searched, matching lines in total vs shown, `file_filter` exclusions, unreadable files, and the fact that non-indexed files are not searched. Case folding is now Unicode-aware.
+- `file_outline` names the extractor (`tree-sitter` or heuristic); `read_symbol` warns when spans come from a heuristic extractor.
+
 ## [0.6.0] - 2026-11-20
 
 A reliability and safety release. There are no new MCP tools; everything that already existed now behaves correctly with several agents at once, on unusual file systems, and with configs the installer did not create.
