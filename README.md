@@ -123,7 +123,7 @@ flowchart LR
 | `call_graph` | Callers and callees around a symbol, up to N hops |
 | `impact_analysis` | Direct and transitive dependents of a symbol, affected files and linked tests |
 | `diff_impact` | Blast radius of your uncommitted changes (or the last commit): dependents, co-changing files, tests to re-run |
-| `health_check` | Token-bloated files, circular dependencies and likely orphan files |
+| `health_check` | Oversized files (size outliers of the repo), import cycles through code (Rust module cycles allowed) and likely orphan files (entry points and scripts listed apart), with coverage |
 | `shortest_path` | Shortest dependency path between two symbols or files |
 | `remember` / `recall` | Persistent notes, decisions and dismissed review leads with reasons; shown automatically when the related symbol or file is read, and kept as Markdown in `.trackertop/notes/` |
 | `changes_since` | What changed since a git ref (default: uncommitted work), mapped onto symbols: touched, added and removed symbols plus only the changed lines |
