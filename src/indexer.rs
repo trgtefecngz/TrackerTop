@@ -221,6 +221,9 @@ pub fn index_repository_with_registry(
     let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
         const MAX_ATTEMPTS: usize = 5;
         let mut attempt = 0;
+        // Git co-change edges depend only on git history and the set of indexed paths, not on
+        // file contents, so a retry reuses them unless the path set itself changed.
+        let mut cochange: Option<(HashSet<String>, Vec<Edge>)> = None;
         loop {
             attempt += 1;
             // Snapshot marker first, then the data: if another process writes file rows
@@ -231,10 +234,16 @@ pub fn index_repository_with_registry(
             let all_refs = db.load_all_raw_refs()?;
             let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
             let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
-            resolved.extend(crate::git::extract_cochange_edges(
-                repo_root,
-                &indexed_paths,
-            ));
+            let reusable = cochange
+                .as_ref()
+                .is_some_and(|(paths, _)| *paths == indexed_paths);
+            if !reusable {
+                let edges = crate::git::extract_cochange_edges(repo_root, &indexed_paths);
+                cochange = Some((indexed_paths, edges));
+            }
+            if let Some((_, edges)) = &cochange {
+                resolved.extend(edges.iter().cloned());
+            }
             if db.replace_edges_if_current(&resolved, built_from)? {
                 let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
                 break (

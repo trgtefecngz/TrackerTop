@@ -518,7 +518,7 @@ fn interrupted_edge_rebuild_is_repaired_on_next_run() {
     // Simulate the crash window: file rows advanced, edges wiped and never rebuilt.
     // White-box on purpose; the row-count asserts make a schema change fail loudly here
     // instead of silently turning this into a no-op test.
-    let conn = rusqlite::Connection::open(root.join(".trackertop/index.db")).unwrap();
+    let conn = open_existing_index(root);
     let bumped = conn
         .execute(
             "UPDATE meta SET value = value + 1 WHERE key = 'files_generation'",
@@ -582,7 +582,38 @@ fn concurrent_indexers_never_leave_stale_edges() {
     }
 
     let settled = index_repository(&root, false).unwrap();
+    let settled_edges = edge_set(&root);
     let clean = index_repository(&root, true).unwrap();
-    assert_eq!(settled.total_edges, clean.total_edges);
     assert_eq!(settled.total_symbols, clean.total_symbols);
+    // Compare the actual edges, not just their count: a wrong set with the same size must fail.
+    assert_eq!(settled_edges, edge_set(&root));
+    assert_eq!(settled_edges.len(), clean.total_edges);
+}
+
+/// Opens the index of an already-indexed repo WITHOUT creating it, so a moved or renamed
+/// store fails with a clear message instead of an empty database and "no such table".
+fn open_existing_index(root: &std::path::Path) -> rusqlite::Connection {
+    let path = root.join(".trackertop/index.db");
+    assert!(
+        path.is_file(),
+        "index store not found at {}",
+        path.display()
+    );
+    rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap()
+}
+
+/// Sorted `(source, target, kind)` rows of the persisted edge set.
+fn edge_set(root: &std::path::Path) -> Vec<(String, String, String)> {
+    let conn = open_existing_index(root);
+    let mut stmt = conn
+        .prepare("SELECT source_id, target_id, kind FROM edges")
+        .unwrap();
+    let mut rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort();
+    rows
 }

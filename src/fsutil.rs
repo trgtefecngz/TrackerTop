@@ -77,34 +77,52 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Copies an existing file to `<name>.trackertop.bak` before TrackerTop modifies it.
 ///
-/// The FIRST backup wins: an existing `.trackertop.bak` is never overwritten, so running the
-/// installer again cannot replace the pristine pre-TrackerTop copy with an already-modified one.
+/// Guarantees:
+/// - **First backup wins:** an existing `.trackertop.bak` is never overwritten, so running the
+///   installer again cannot replace the pristine pre-TrackerTop copy with a modified one.
+/// - **Never partial:** the copy is written and fsynced under a temporary name and only then
+///   published as `.trackertop.bak`, so a crash mid-copy cannot leave a truncated file that a
+///   later run would trust as the recovery copy.
+/// - **Race-free publish:** publishing uses a hard link, which fails if the backup already
+///   exists, so two racing installers cannot both "win". On filesystems without hard links
+///   (e.g. FAT32) it falls back to an exists-check + rename.
 pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
     if !path.is_file() {
         return Ok(None);
     }
     let bak = sibling_path(path, "trackertop.bak");
-    // `create_new` makes "first backup wins" atomic: if two installers race, exactly one
-    // creates the file and the other sees AlreadyExists (no check-then-copy window).
-    let mut out = match OpenOptions::new().write(true).create_new(true).open(&bak) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(Some(bak)),
-        Err(e) => {
-            return Err(e).with_context(|| format!("failed to create backup {}", bak.display()));
-        }
-    };
+    if bak.exists() {
+        return Ok(Some(bak));
+    }
+
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = sibling_path(
+        path,
+        &format!("trackertop.bak.tmp-{}-{seq}", std::process::id()),
+    );
     let copied = (|| -> std::io::Result<()> {
         let mut src = File::open(path)?;
+        let mut out = File::create(&tmp)?;
         std::io::copy(&mut src, &mut out)?;
         out.sync_all()
     })();
     if let Err(e) = copied {
-        // A partial backup must not later be mistaken for the pristine copy.
-        drop(out);
-        let _ = std::fs::remove_file(&bak);
+        let _ = std::fs::remove_file(&tmp);
         return Err(e)
             .with_context(|| format!("failed to back up {} to {}", path.display(), bak.display()));
     }
+
+    let published = match std::fs::hard_link(&tmp, &bak) {
+        Ok(()) => Ok(()),
+        // Another installer published its (equally pristine) copy first: keep that one.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) if bak.exists() => Ok(()),
+        // No hard-link support on this filesystem.
+        Err(_) => std::fs::rename(&tmp, &bak),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    published.with_context(|| format!("failed to publish backup {}", bak.display()))?;
+    sync_parent_dir(&bak);
     Ok(Some(bak))
 }
 
@@ -236,6 +254,34 @@ mod tests {
         // Old-style lock file nobody holds an OS lock on
         std::fs::write(dir.path().join("reg.json.lock"), b"").unwrap();
         assert!(FileLock::acquire(&p, Duration::from_millis(10)).is_ok());
+    }
+
+    #[test]
+    fn interrupted_backup_is_never_trusted_as_the_pristine_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "original config").unwrap();
+        // Leftover from a run that crashed mid-copy: truncated data under a temp name only
+        std::fs::write(
+            dir.path().join("settings.json.trackertop.bak.tmp-999-0"),
+            "orig",
+        )
+        .unwrap();
+        let bak = dir.path().join("settings.json.trackertop.bak");
+        assert!(
+            !bak.exists(),
+            "a crash before publishing must leave no .bak at all"
+        );
+
+        backup_file(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "original config");
+        // This run's own temp file is cleaned up
+        let own_tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .any(|n| n.contains(&format!("tmp-{}-", std::process::id())));
+        assert!(!own_tmp_left);
     }
 
     #[test]

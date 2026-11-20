@@ -246,9 +246,17 @@ impl LanguageExtractor for TypeScriptExtractor {
                 && let Some(test_name) = extract_quoted_path(trimmed)
             {
                 // `it("works", runCase);` has no body of its own: searching for the next `{`
-                // would swallow the following functions/classes into this test.
-                let statement_ends_here =
-                    !trimmed.contains('{') && (trimmed.ends_with(';') || trimmed.ends_with(')'));
+                // would swallow the following functions/classes into this test. Judge the
+                // line without a trailing `// comment`, and keep Allman-style tests whose
+                // `{` opens on the next line (`it("x", function ()` + newline + `{`).
+                let code = strip_ts_line_comment(trimmed).trim_end();
+                let next_line_opens_body = lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .is_some_and(|l| l.starts_with('{'));
+                let statement_ends_here = !code.contains('{')
+                    && (code.ends_with(';') || (code.ends_with(')') && !next_line_opens_body));
                 let end_idx = if statement_ends_here {
                     i
                 } else {
@@ -339,6 +347,33 @@ fn extract_class_methods(
         }
         i += 1;
     }
+}
+
+/// Removes a trailing `// comment`, ignoring `//` inside '…', "…" and `…` string literals
+/// (e.g. `it("fetches http://x", run); // note` keeps the URL).
+fn strip_ts_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 1; // skip the escaped character
+                } else if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' | b'`' => quote = Some(b),
+                b'/' if bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    line
 }
 
 fn strip_ts_modifiers(mut s: &str) -> (String, &str) {
@@ -550,5 +585,41 @@ mod tests {
             plain.doc_summary.is_empty(),
             "comment leaked to the next symbol"
         );
+    }
+
+    #[test]
+    fn one_line_test_with_trailing_comment_does_not_swallow() {
+        let src = "it(\"fetches http://example.com\", runCase); // shared case\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse(src);
+        let test = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!(test.end_line, 1);
+        assert!(out.symbols.iter().any(|s| s.name == "helperAfter"));
+    }
+
+    #[test]
+    fn allman_style_test_keeps_its_body() {
+        let src = "it(\"allman\", function ()\n{\n  expect(run()).toBe(1);\n});\n";
+        let out = parse(src);
+        let test = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!((test.start_line, test.end_line), (1, 4));
+    }
+
+    #[test]
+    fn line_comment_stripping_respects_string_literals() {
+        assert_eq!(
+            strip_ts_line_comment("it(\"a//b\", f); // c"),
+            "it(\"a//b\", f); "
+        );
+        assert_eq!(strip_ts_line_comment("x = `//`;"), "x = `//`;");
+        assert_eq!(strip_ts_line_comment("f('it\\'s'); //x"), "f('it\\'s'); ");
     }
 }
