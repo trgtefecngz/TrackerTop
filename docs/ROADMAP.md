@@ -1,6 +1,6 @@
 # Roadmap
 
-## v0.7: agent productivity (milestones 1-3 done, awaiting review on `feat/v0.7-agent-tools`)
+## v0.7: agent productivity (released as v0.7.0)
 
 TrackerTop is a tool for the AI agent itself. v0.7 makes an agent's work cheaper and more correct: fewer wasted tool calls, fewer wrong turns, and never a silently incomplete answer.
 

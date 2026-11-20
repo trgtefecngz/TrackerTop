@@ -2,7 +2,7 @@
 
 All notable changes to TrackerTop are documented here.
 
-## [0.7.0] - unreleased (awaiting review)
+## [0.7.0] - 2026-11-20
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
@@ -139,5 +139,6 @@ A reliability and safety release. There are no new MCP tools; everything that al
 
 Global Edition: TypeScript/JavaScript, Python and Go extractors, custom app icon, Claude Code SessionStart hook, macOS release CI, one-line installers.
 
+[0.7.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.7.0
 [0.6.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.6.0
 [0.5.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.5.0
