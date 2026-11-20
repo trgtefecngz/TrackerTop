@@ -137,6 +137,14 @@ impl Database {
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+
+            -- v0.8: findings the last `review_changes` raised, per base ref
+            CREATE TABLE IF NOT EXISTS review_findings (
+                base_ref TEXT NOT NULL,
+                id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                PRIMARY KEY (base_ref, id)
+            );
             ",
         )?;
         // v0.7: decision memory. Added in place so existing notes keep working (kind 'note').
@@ -198,6 +206,38 @@ impl Database {
             [revision],
         )?;
         Ok(())
+    }
+
+    /// Stores the findings a review against `base_ref` raised, replacing the previous set,
+    /// and returns that previous set as `(id, summary)` (`None`: no earlier review against
+    /// this base was recorded).
+    pub fn swap_review_findings(
+        &mut self,
+        base_ref: &str,
+        findings: &[(String, String)],
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let tx = self.conn.transaction()?;
+        let seen = read_meta(&tx, &format!("reviewed:{base_ref}"))? > 0;
+        let previous = {
+            let mut stmt = tx.prepare(
+                "SELECT id, summary FROM review_findings WHERE base_ref = ?1 ORDER BY id",
+            )?;
+            stmt.query_map([base_ref], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(String, String)>>>()?
+        };
+        tx.execute(
+            "DELETE FROM review_findings WHERE base_ref = ?1",
+            [base_ref],
+        )?;
+        for (id, summary) in findings {
+            tx.execute(
+                "INSERT OR REPLACE INTO review_findings(base_ref, id, summary) VALUES(?1, ?2, ?3)",
+                [base_ref, id.as_str(), summary.as_str()],
+            )?;
+        }
+        bump_meta(&tx, &format!("reviewed:{base_ref}"))?;
+        tx.commit()?;
+        Ok(seen.then_some(previous))
     }
 
     /// Bumped (inside the same transaction) whenever file/symbol/raw-ref rows change.

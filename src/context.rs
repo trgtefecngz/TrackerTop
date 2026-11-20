@@ -1623,7 +1623,7 @@ impl TrackerEngine {
             base.trim().to_string()
         };
         let mut cs = crate::review::review(&self.repo_root, &base_ref)?;
-        let (db, cg) = self.load_fresh()?;
+        let (mut db, cg) = self.load_fresh()?;
         let notes = db.list_notes(None)?;
         let mut dismissed: Vec<(String, String)> = Vec::new();
         // A dismissal holds only while the code it was made about is unchanged; after that
@@ -1658,6 +1658,26 @@ impl TrackerEngine {
                 extra.push_str(&format!("- `{id}`: {reason}\n"));
             }
         }
+        let raised: Vec<(String, String)> = cs
+            .findings
+            .iter()
+            .map(|f| {
+                let msg: String = f.message.chars().take(140).collect();
+                let cut = if msg.len() < f.message.len() {
+                    "…"
+                } else {
+                    ""
+                };
+                (f.id.clone(), format!("{msg}{cut} ({})", f.location))
+            })
+            .collect();
+        let previous = db.swap_review_findings(&base_ref, &raised)?;
+        extra.push_str(&review_delta(
+            previous.as_deref(),
+            &raised,
+            &dismissed,
+            &base_ref,
+        ));
         if !cs.findings.is_empty() {
             extra.push_str(
                 "After checking a finding that is not a problem: \
@@ -1724,6 +1744,55 @@ impl TrackerEngine {
         let db = Database::open_for_repo(&self.repo_root)?;
         db.get_token_stats(20)
     }
+}
+
+/// "Since the previous review": findings resolved (raised before, gone now and not merely
+/// dismissed), new and unchanged, by stable id.
+fn review_delta(
+    previous: Option<&[(String, String)]>,
+    raised: &[(String, String)],
+    dismissed: &[(String, String)],
+    base_ref: &str,
+) -> String {
+    let Some(previous) = previous else {
+        return format!(
+            "Since the previous review: none recorded against `{base_ref}`; the next \
+             review_changes will list resolved / new / unchanged findings.\n"
+        );
+    };
+    let before: HashSet<&str> = previous.iter().map(|(id, _)| id.as_str()).collect();
+    let now: HashSet<&str> = raised.iter().map(|(id, _)| id.as_str()).collect();
+    let hidden: HashSet<&str> = dismissed.iter().map(|(id, _)| id.as_str()).collect();
+    let resolved: Vec<&(String, String)> = previous
+        .iter()
+        .filter(|(id, _)| !now.contains(id.as_str()) && !hidden.contains(id.as_str()))
+        .collect();
+    let new: Vec<&str> = raised
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !before.contains(id))
+        .collect();
+    let unchanged = raised.len() - new.len();
+    let mut s = format!(
+        "Since the previous review against `{base_ref}`: {} resolved, {} new, {unchanged} \
+         unchanged.\n",
+        resolved.len(),
+        new.len()
+    );
+    const SHOWN: usize = 10;
+    for (id, summary) in resolved.iter().take(SHOWN) {
+        s.push_str(&format!("- resolved `{id}`: was {summary}\n"));
+    }
+    s.push_str(&more_note(
+        resolved.len(),
+        SHOWN.min(resolved.len()),
+        "resolved",
+    ));
+    for id in new.iter().take(SHOWN) {
+        s.push_str(&format!("- new `{id}`\n"));
+    }
+    s.push_str(&more_note(new.len(), SHOWN.min(new.len()), "new"));
+    s
 }
 
 /// One line telling the agent that a list was cut, so a partial list never looks complete.

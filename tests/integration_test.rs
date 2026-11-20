@@ -1889,3 +1889,61 @@ fn index_from_another_extractor_revision_is_reparsed_in_full() {
     assert_eq!(db.extractor_revision().unwrap(), EXTRACTOR_REVISION);
     assert_eq!(index_repository(root, false).unwrap().parsed_files, 0);
 }
+
+/// `review_changes` reports resolved / new / unchanged findings against the previous
+/// review of the same base; a dismissed finding is not counted as resolved.
+#[test]
+fn review_changes_reports_what_changed_since_the_previous_review() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn old_api() -> i32 { 1 }\npub fn other_api() -> i32 { 2 }\n\
+         pub fn caller() -> i32 {\n    old_api()\n}\npub fn second() -> i32 {\n    other_api()\n}\n",
+    )
+    .unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+    let both_removed = "pub fn caller() -> i32 {\n    old_api()\n}\n\
+                        pub fn second() -> i32 {\n    other_api()\n}\n";
+    std::fs::write(root.join("src/lib.rs"), both_removed).unwrap();
+    let engine = TrackerEngine::new(root);
+    let a = "broken-ref:src/lib.rs:old_api";
+    let b = "broken-ref:src/lib.rs:other_api";
+
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(out.contains("none recorded against `main`"), "{out}");
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(out.contains("0 resolved, 0 new, 2 unchanged"), "{out}");
+
+    // Fix one caller: its finding is resolved, with what it was
+    std::fs::write(
+        root.join("src/lib.rs"),
+        both_removed.replace("    old_api()\n", "    3\n"),
+    )
+    .unwrap();
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(
+        out.contains("1 resolved, 1 new, 1 unchanged")
+            && out.contains("- new `untested:src/lib.rs:caller`"),
+        "{out}"
+    );
+    assert!(out.contains(&format!("- resolved `{a}`: was ")), "{out}");
+
+    // Dismissing the other one is not "resolved"
+    engine
+        .remember_kind(b, "generated", "dismissed", "checked: generated")
+        .unwrap();
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(out.contains("0 resolved, 0 new, 1 unchanged"), "{out}");
+
+    // Reintroducing the first broken call makes it new again; the file changed, so the
+    // dismissal of the other one no longer holds and it is raised again too
+    std::fs::write(root.join("src/lib.rs"), both_removed).unwrap();
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(out.contains("1 resolved, 2 new, 0 unchanged"), "{out}");
+    assert!(out.contains(&format!("- new `{a}`")), "{out}");
+}
