@@ -7,6 +7,7 @@
 //! files correct, and gives later rules (broken references, new cycles, untested code)
 //! both graphs to work with.
 
+pub mod cochange;
 pub mod rules;
 pub mod snapshot;
 
@@ -293,7 +294,8 @@ pub fn review(repo_root: &Path, base_ref: &str) -> Result<ChangeSet> {
     let (_, base) = snapshot::base_graph(repo_root, &base_commit)?;
     let (diffs, untracked) = diff_since(repo_root, &base_commit, &[])?;
     let mut cs = collect_changes(&diffs, &untracked, &head, &base, base_ref, &base_commit);
-    cs.findings = rules::run_rules(&cs, &head, &base, repo_root);
+    let history = cochange::load_history(repo_root, &base_commit)?;
+    cs.findings = rules::run_rules(&cs, &head, &base, repo_root, &history);
     Ok(cs)
 }
 

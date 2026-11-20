@@ -582,6 +582,7 @@ pub fn run_rules(
     head: &CodeGraph,
     base: &CodeGraph,
     head_root: &Path,
+    history: &[super::cochange::Commit],
 ) -> Vec<Finding> {
     let mut out = Vec::new();
     broken_refs(cs, head, base, head_root, &mut out);
@@ -589,6 +590,7 @@ pub fn run_rules(
     impact(cs, head, &mut out);
     bloat(cs, head, base, &mut out);
     untested(cs, head, &mut out);
+    super::cochange::cochange_miss(cs, history, head_root, &mut out);
     out.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.id.cmp(&b.id)));
     out.dedup_by(|a, b| a.id == b.id);
     out

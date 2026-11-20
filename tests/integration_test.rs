@@ -1752,3 +1752,52 @@ fn symbol_lookups_say_when_they_are_ambiguous_or_approximate() {
         "{out}"
     );
 }
+
+/// `cochange-miss` reads the base's history relative to the project root (here a
+/// monorepo package), and only the base's history: the branch never votes for itself.
+#[test]
+fn review_flags_files_that_habitually_change_together() {
+    use trackertop::review::review;
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    let pkg = repo.join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    git_in(repo, &["init", "-q", "-b", "main"]);
+    for i in 0..5 {
+        std::fs::write(
+            pkg.join("src/a.rs"),
+            format!("pub fn a() -> i32 {{ {i} }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("src/b.rs"),
+            format!("pub fn b() -> i32 {{ {i} }}\n"),
+        )
+        .unwrap();
+        // Outside the package: never part of its history
+        std::fs::write(repo.join("other.txt"), format!("{i}\n")).unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", &format!("step {i}")]);
+    }
+    git_in(repo, &["checkout", "-q", "-b", "work"]);
+    std::fs::write(pkg.join("src/a.rs"), "pub fn a() -> i32 { 42 }\n").unwrap();
+
+    let cs = review(&pkg, "main").unwrap();
+    let hit = cs
+        .findings
+        .iter()
+        .find(|f| f.rule == "cochange-miss")
+        .unwrap_or_else(|| panic!("{:?}", cs.findings));
+    assert_eq!(hit.id, "cochange-miss:src/b.rs");
+    assert!(hit.message.contains("5 of src/a.rs's 5"), "{}", hit.message);
+    assert!(hit.evidence[0].contains("step 4"), "{:?}", hit.evidence);
+
+    // Updating the partner too clears the finding
+    std::fs::write(pkg.join("src/b.rs"), "pub fn b() -> i32 { 42 }\n").unwrap();
+    let cs = review(&pkg, "main").unwrap();
+    assert!(
+        !cs.findings.iter().any(|f| f.rule == "cochange-miss"),
+        "{:?}",
+        cs.findings
+    );
+}

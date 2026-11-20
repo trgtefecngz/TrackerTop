@@ -11,7 +11,8 @@ All notable changes to TrackerTop are documented here.
   - `impact`: a modified function with many code dependents, with the tests that reach it;
   - `untested`: new or modified code that no test reaches;
   - `new-cycle`: an import cycle the change created between JS/TS/Python/Go files;
-  - `bloat`: a file that grew past 3,500 tokens.
+  - `bloat`: a file that grew past 3,500 tokens;
+  - `cochange-miss`: a file that changed together with a file you touched in at least 4 commits and 60% of that file's recent history (at the base, bulk commits ignored), but not in this change. Reported as a habit with the commits it rests on, never as proof.
 - New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
 
 ### Added: note provenance
