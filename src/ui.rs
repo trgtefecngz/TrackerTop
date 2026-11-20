@@ -6,6 +6,7 @@ use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
 use crate::indexer::index_repository;
 use crate::install::{AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed};
 use crate::model::{EdgeKind, ProjectNote, SymbolKind, TokenStatsSummary};
+use crate::nested::{NestedGraph, NestedKind, NestedLevel, NestedView};
 use crate::parser::default_registry;
 use crate::registry::{
     GlobalOverview, load_global_overview, register_project, remove_project_with_cache,
@@ -37,6 +38,8 @@ enum ProjectTab {
 enum GraphLayoutMode {
     Folders,
     Clusters,
+    /// Matryoshka drill-down: project → communities → files → symbols (`crate::nested`).
+    Nested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,8 @@ struct LoadedProject {
     nodes: Vec<GraphNodeVis>,
     edges: Vec<GraphEdgeVis>,
     islands: Vec<GraphIsland>,
+    /// Kept for the nested (matryoshka) view, which aggregates edges per level on demand.
+    graph: CodeGraph,
 }
 
 struct BgMessage {
@@ -128,6 +133,12 @@ pub struct TrackerTopApp {
     graph_color_mode: GraphColorMode,
     selected_node_idx: Option<usize>,
     dragged_node_idx: Option<usize>,
+
+    // Nested (matryoshka) view state: the level being shown and its cached view, keyed by
+    // (project path, level). An error (e.g. a group vanished after re-indexing) is shown,
+    // never an empty canvas.
+    nested_level: NestedLevel,
+    nested_cache: Option<((String, NestedLevel), Result<NestedView, String>)>,
 }
 
 impl TrackerTopApp {
@@ -182,6 +193,8 @@ impl TrackerTopApp {
             graph_color_mode: GraphColorMode::Language,
             selected_node_idx: None,
             dragged_node_idx: None,
+            nested_level: NestedLevel::Project,
+            nested_cache: None,
         };
         app.reload_selected_project();
         app
@@ -200,6 +213,7 @@ impl TrackerTopApp {
         self.selected_node_idx = None;
         self.dragged_node_idx = None;
         self.preview_result = None;
+        self.nested_cache = None;
         self.loaded = load_project_details(Path::new(path)).ok();
         self.recompute_graph_layout();
     }
@@ -1447,6 +1461,7 @@ impl TrackerTopApp {
                     .selected_text(match self.graph_layout_mode {
                         GraphLayoutMode::Folders => "Layout: Folders",
                         GraphLayoutMode::Clusters => "Layout: Clusters",
+                        GraphLayoutMode::Nested => "Layout: Nested",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -1458,6 +1473,14 @@ impl TrackerTopApp {
                             &mut self.graph_layout_mode,
                             GraphLayoutMode::Clusters,
                             "Layout: Clusters",
+                        );
+                        ui.selectable_value(
+                            &mut self.graph_layout_mode,
+                            GraphLayoutMode::Nested,
+                            "Layout: Nested",
+                        )
+                        .on_hover_text(
+                            "Project → communities → files → symbols, one level at a time",
                         );
                     });
                 if self.graph_layout_mode != prev_layout {
@@ -1495,6 +1518,11 @@ impl TrackerTopApp {
             self.recompute_graph_layout();
         }
         ui.add_space(10.0);
+
+        if self.graph_layout_mode == GraphLayoutMode::Nested {
+            self.render_nested_graph(ui);
+            return;
+        }
 
         let avail = ui.available_size();
         let inspector_w = if self.selected_node_idx.is_some() {
@@ -1938,6 +1966,180 @@ impl TrackerTopApp {
                     });
                 }
         });
+    }
+
+    /// Matryoshka view: shows one level (project → communities → files → symbols) with
+    /// aggregated edges. Click a node to drill in, a breadcrumb to go back up.
+    fn render_nested_graph(&mut self, ui: &mut egui::Ui) {
+        let Some(ref lp) = self.loaded else {
+            ui.label("No project loaded.");
+            return;
+        };
+        let key = (lp.path.clone(), self.nested_level.clone());
+        if self.nested_cache.as_ref().map(|(k, _)| k) != Some(&key) {
+            let view = NestedGraph::new(&lp.graph)
+                .view(&self.nested_level)
+                .map_err(|e| e.to_string());
+            self.nested_cache = Some((key, view));
+        }
+        let Some((_, view)) = self.nested_cache.as_ref() else {
+            return;
+        };
+        let view = match view {
+            Ok(v) => v,
+            Err(msg) => {
+                ui.colored_label(Color32::from_rgb(248, 113, 113), msg.clone());
+                if ui.button("Back to Project").clicked() {
+                    self.nested_level = NestedLevel::Project;
+                }
+                return;
+            }
+        };
+
+        let mut next_level: Option<NestedLevel> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (i, (label, level)) in view.breadcrumbs.iter().enumerate() {
+                if i > 0 {
+                    ui.label(RichText::new("›").color(Color32::from_rgb(148, 163, 184)));
+                }
+                let current = i + 1 == view.breadcrumbs.len();
+                let text = RichText::new(truncate_label(label, 40)).strong();
+                if current {
+                    ui.label(text);
+                } else if ui.link(text).clicked() {
+                    next_level = Some(level.clone());
+                }
+            }
+        });
+        ui.label(
+            RichText::new(NestedGraph::coverage_line(view))
+                .small()
+                .color(Color32::from_rgb(148, 163, 184)),
+        );
+        ui.add_space(6.0);
+
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(
+            Vec2::new(avail.x.max(240.0), (avail.y - 6.0).max(200.0)),
+            Sense::click(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(9, 13, 24));
+        if let Some(ref tex) = self.backdrop_tex {
+            paint_smooth_aurora(&painter, rect, tex.id());
+        }
+
+        let n = view.nodes.len();
+        if n == 0 {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "This level has no children.",
+                egui::FontId::proportional(14.0),
+                Color32::from_rgb(148, 163, 184),
+            );
+        }
+
+        // Grid layout; node radius grows with sqrt(tokens) relative to the largest child.
+        let cols = (n as f32).sqrt().ceil().max(1.0) as usize;
+        let rows = n.div_ceil(cols).max(1);
+        let cell = Vec2::new(
+            rect.width() / cols as f32,
+            (rect.height() - 24.0) / rows as f32,
+        );
+        let max_r = (cell.x.min(cell.y) * 0.32).clamp(3.0, 60.0);
+        let max_tok = view
+            .nodes
+            .iter()
+            .map(|x| x.tokens)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        let reg = default_registry();
+        let pos: Vec<Pos2> = (0..n)
+            .map(|i| {
+                let (c, r) = ((i % cols) as f32, (i / cols) as f32);
+                Pos2::new(
+                    rect.left() + (c + 0.5) * cell.x,
+                    rect.top() + 12.0 + (r + 0.5) * cell.y,
+                )
+            })
+            .collect();
+        let radius: Vec<f32> = view
+            .nodes
+            .iter()
+            .map(|x| (max_r * (x.tokens as f32 / max_tok).sqrt()).max(3.0))
+            .collect();
+
+        let max_w = view.edges.iter().map(|e| e.weight).max().unwrap_or(1) as f32;
+        for e in &view.edges {
+            let t = (e.weight as f32 / max_w).sqrt();
+            painter.line_segment(
+                [pos[e.src], pos[e.tgt]],
+                Stroke::new(
+                    0.6 + 3.0 * t,
+                    Color32::from_rgba_unmultiplied(125, 211, 252, (40.0 + 150.0 * t) as u8),
+                ),
+            );
+        }
+
+        let hover = resp.hover_pos();
+        let mut hovered: Option<usize> = None;
+        for (i, node) in view.nodes.iter().enumerate() {
+            let color = match node.kind {
+                NestedKind::Community => cluster_color(i),
+                NestedKind::File => parse_hex_color(reg.color_for(&node.detail)),
+                NestedKind::Symbol => Color32::from_rgb(167, 139, 250),
+            };
+            painter.circle_filled(pos[i], radius[i], color);
+            if hover.is_some_and(|h| h.distance(pos[i]) <= radius[i].max(6.0)) {
+                hovered = Some(i);
+                painter.circle_stroke(
+                    pos[i],
+                    radius[i] + 2.0,
+                    Stroke::new(2.0_f32, Color32::WHITE),
+                );
+            }
+            if n <= 80 {
+                painter.text(
+                    pos[i] + Vec2::new(0.0, radius[i] + 3.0),
+                    egui::Align2::CENTER_TOP,
+                    truncate_label(&node.label, 22),
+                    egui::FontId::proportional(11.0),
+                    Color32::from_rgb(226, 232, 240),
+                );
+            }
+        }
+
+        if let Some(i) = hovered {
+            let node = &view.nodes[i];
+            let mut info = format!("{}  ·  {} tok", node.label, fmt_num(node.tokens));
+            match node.kind {
+                NestedKind::Community => info.push_str(&format!("  ·  {} files", node.child_count)),
+                NestedKind::File => info.push_str(&format!("  ·  {} symbols", node.child_count)),
+                NestedKind::Symbol => info.push_str(&format!("  ·  {}", node.detail)),
+            }
+            if let Some(loc) = &node.location {
+                info.push_str(&format!("  ·  {loc}"));
+            }
+            if node.drill.is_some() {
+                info.push_str("  ·  click to open");
+            }
+            painter.text(
+                Pos2::new(rect.left() + 12.0, rect.bottom() - 10.0),
+                egui::Align2::LEFT_BOTTOM,
+                info,
+                egui::FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+            if resp.clicked() {
+                next_level = node.drill.clone();
+            }
+        }
+
+        if let Some(level) = next_level {
+            self.nested_level = level;
+        }
     }
 
     fn render_architecture_tab(&mut self, ui: &mut egui::Ui) {
@@ -2519,6 +2721,7 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         nodes,
         edges,
         islands: Vec::new(),
+        graph: cg,
     })
 }
 
@@ -2569,7 +2772,7 @@ fn arrange_structured_islands(
             continue;
         }
         let key = match mode {
-            GraphLayoutMode::Folders => n.group_folder.clone(),
+            GraphLayoutMode::Folders | GraphLayoutMode::Nested => n.group_folder.clone(),
             GraphLayoutMode::Clusters => format!("Cluster {}", n.community + 1),
         };
         groups.entry(key).or_default().push(idx);

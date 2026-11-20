@@ -1176,3 +1176,85 @@ fn mcp_calls_are_tagged_with_the_client_name() {
             .any(|s| s.source == "cli" && s.queries == 1)
     );
 }
+
+/// The matryoshka view must account for every symbol edge at every level of a real index:
+/// each edge touching a scope is drawn (inside an aggregated edge), hidden or external,
+/// checked against an independent count from the raw edge list.
+#[test]
+fn nested_graph_accounts_for_every_edge_on_a_real_index() {
+    use std::collections::HashSet;
+    use trackertop::db::Database;
+    use trackertop::graph::CodeGraph;
+    use trackertop::model::EdgeKind;
+    use trackertop::nested::{NestedGraph, NestedLevel, NestedView};
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_call_graph_repo(root, 3);
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::write(
+        root.join("tools/cli.rs"),
+        "pub fn main_tool() -> u8 { crate::root() + crate::b::leaf() }\n",
+    )
+    .unwrap();
+    index_repository(root, false).unwrap();
+    let db = Database::open_for_repo(root).unwrap();
+    let cg = CodeGraph::load(&db).unwrap();
+    let ng = NestedGraph::new(&cg);
+
+    let resolved: Vec<(String, String)> = cg
+        .edges
+        .iter()
+        .filter(|e| e.kind != EdgeKind::Contains)
+        .filter_map(|e| {
+            let s = cg.symbols.get(&e.source_id)?;
+            let t = cg.symbols.get(&e.target_id)?;
+            Some((s.file_path.clone(), t.file_path.clone()))
+        })
+        .collect();
+    assert!(
+        !resolved.is_empty(),
+        "fixture must produce cross-symbol edges"
+    );
+    let accounted = |v: &NestedView| {
+        v.edges.iter().map(|e| e.weight).sum::<usize>() + v.hidden_edges + v.external_edges
+    };
+
+    let project = ng.view(&NestedLevel::Project).unwrap();
+    assert_eq!(accounted(&project), resolved.len());
+    assert_eq!(project.truncated, 0);
+    let total_files: usize = project.nodes.iter().map(|n| n.child_count).sum();
+    assert_eq!(
+        total_files,
+        cg.files.len(),
+        "every file sits in exactly one community"
+    );
+
+    for c in &project.nodes {
+        let level = c.drill.clone().unwrap();
+        let cv = ng.view(&level).unwrap();
+        let files: HashSet<String> = cv
+            .nodes
+            .iter()
+            .map(|n| n.id.trim_start_matches("f:").to_string())
+            .collect();
+        let touching = resolved
+            .iter()
+            .filter(|(a, b)| files.contains(a) || files.contains(b))
+            .count();
+        assert_eq!(accounted(&cv), touching, "community {}", c.id);
+        for f in &cv.nodes {
+            let fv = ng.view(f.drill.as_ref().unwrap()).unwrap();
+            let path = f.id.trim_start_matches("f:");
+            let touching = resolved
+                .iter()
+                .filter(|(a, b)| a == path || b == path)
+                .count();
+            assert_eq!(accounted(&fv), touching, "file {path}");
+            for s in &fv.nodes {
+                let loc = s.location.as_deref().unwrap();
+                assert!(loc.starts_with(&format!("{path}:")), "{loc}");
+            }
+        }
+    }
+}
