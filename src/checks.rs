@@ -249,6 +249,8 @@ pub struct CheckRun {
     pub duration_ms: u64,
     /// stdout followed by stderr, ANSI color codes removed.
     pub output: String,
+    /// Bytes dropped from the middle of an output too large to keep whole.
+    pub dropped_bytes: usize,
 }
 
 impl CheckRun {
@@ -265,15 +267,58 @@ fn resolve_program(program: &str) -> String {
     }
 }
 
-/// Reads a pipe in chunks into a shared buffer, so whatever arrived is available even if
-/// the reader never reaches EOF (a grandchild process still holding the pipe).
+/// Bytes of a pipe kept from its start, and from its end once the start is full. A run
+/// that prints more loses only the middle, and the report says so.
+const CAPTURE_HEAD: usize = 16 << 20;
+const CAPTURE_TAIL: usize = 8 << 20;
+
+/// Bounded capture of one pipe: the first `CAPTURE_HEAD` bytes, then a rolling tail of
+/// at least `CAPTURE_TAIL` bytes, counting what was dropped in between.
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    dropped: usize,
+}
+
+impl Capture {
+    fn push(&mut self, data: &[u8]) {
+        let room = CAPTURE_HEAD.saturating_sub(self.head.len()).min(data.len());
+        let (into_head, rest) = data.split_at(room);
+        self.head.extend_from_slice(into_head);
+        if rest.is_empty() {
+            return;
+        }
+        self.tail.extend_from_slice(rest);
+        if self.tail.len() > 2 * CAPTURE_TAIL {
+            let cut = self.tail.len() - CAPTURE_TAIL;
+            self.tail.drain(..cut);
+            self.dropped += cut;
+        }
+    }
+
+    /// The kept text, with a marker line where bytes were dropped, and how many.
+    fn text(&self) -> (String, usize) {
+        let mut s = String::from_utf8_lossy(&self.head).into_owned();
+        if self.dropped > 0 {
+            s.push_str(&format!(
+                "\n[trackertop: {} bytes of output dropped here]\n",
+                self.dropped
+            ));
+        }
+        s.push_str(&String::from_utf8_lossy(&self.tail));
+        (s, self.dropped)
+    }
+}
+
+type SharedCapture = std::sync::Arc<std::sync::Mutex<Capture>>;
+
+/// Reads a pipe in chunks into a shared bounded capture, so whatever arrived is available
+/// even if the reader never reaches EOF (a grandchild process still holding the pipe).
 fn spawn_reader<R: Read + Send + 'static>(
     mut pipe: R,
-) -> (
-    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    std::thread::JoinHandle<()>,
-) {
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+) -> (SharedCapture, std::thread::JoinHandle<()>) {
+    let buf: SharedCapture = SharedCapture::default();
     let sink = std::sync::Arc::clone(&buf);
     let handle = std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -283,7 +328,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(n) => sink
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend_from_slice(&chunk[..n]),
+                    .push(&chunk[..n]),
             }
         }
     });
@@ -377,19 +422,18 @@ pub fn run_command(
     {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let take = |b: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
+    let take = |b: &SharedCapture| {
         b.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .text()
     };
-    let out = take(&out_buf);
-    let err = take(&err_buf);
-    let mut output = String::from_utf8_lossy(&out).into_owned();
+    let (mut output, out_dropped) = take(&out_buf);
+    let (err, err_dropped) = take(&err_buf);
     if !err.is_empty() {
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
-        output.push_str(&String::from_utf8_lossy(&err));
+        output.push_str(&err);
     }
     Ok(CheckRun {
         command: display,
@@ -397,6 +441,7 @@ pub fn run_command(
         timed_out,
         duration_ms: started.elapsed().as_millis() as u64,
         output: strip_ansi(&output),
+        dropped_bytes: out_dropped + err_dropped,
     })
 }
 
@@ -752,6 +797,14 @@ pub fn render(cmd: &CheckCommand, run: &CheckRun, summary: &CheckSummary) -> Str
     if run.timed_out {
         out.push_str("TIMEOUT: the process was killed; everything below is PARTIAL.\n");
     }
+    if run.dropped_bytes > 0 {
+        out.push_str(&format!(
+            "PARTIAL OUTPUT: the log was too large to keep whole; {:.1} MB from its middle were \
+             not read, so failures printed there may be missing. Re-run with a filter \
+             (extra_args) to see them.\n",
+            run.dropped_bytes as f64 / (1 << 20) as f64
+        ));
+    }
     if run.succeeded() && summary.found_problems() {
         out.push_str(
             "NOTE: exit code 0 but failures/errors were recognized in the output; check them.\n",
@@ -820,6 +873,7 @@ mod tests {
             timed_out: false,
             duration_ms: 10,
             output: output.into(),
+            dropped_bytes: 0,
         }
     }
 
@@ -931,6 +985,38 @@ error: test failed, to rerun pass `--lib`
                 .iter()
                 .any(|d| d.contains("add_test.go:9"))
         );
+    }
+
+    #[test]
+    fn capture_keeps_head_and_tail_and_counts_the_dropped_middle() {
+        let mut c = super::Capture::default();
+        let line = "x".repeat(1023) + "\n";
+        // 40 MB: more than head + 2 * tail, so the middle must go
+        for _ in 0..(40 << 10) {
+            c.push(line.as_bytes());
+        }
+        c.push(b"test result: FAILED. 0 passed; 1 failed;\n");
+        let (text, dropped) = c.text();
+        assert!(dropped > 0);
+        assert!(text.len() < 40 << 20);
+        assert!(text.contains("bytes of output dropped here"));
+        // The end of the log, where cargo prints its summary, survives
+        assert!(text.ends_with("test result: FAILED. 0 passed; 1 failed;\n"));
+        let summary = summarize(&text);
+        assert_eq!(summary.failed, Some(1));
+
+        let mut small = super::Capture::default();
+        small.push(b"ok\n");
+        assert_eq!(small.text(), ("ok\n".to_string(), 0));
+    }
+
+    #[test]
+    fn partial_output_is_announced() {
+        let mut r = run("test result: ok. 3 passed; 0 failed;\n", 0);
+        r.dropped_bytes = 5 << 20;
+        let text = render(&cmd(), &r, &summarize(&r.output));
+        assert!(text.contains("PARTIAL OUTPUT"), "{text}");
+        assert!(text.contains("5.0 MB"), "{text}");
     }
 
     #[test]

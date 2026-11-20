@@ -1,11 +1,17 @@
+//! Go extractor on tree-sitter: imports, types (struct, interface, other), functions,
+//! methods (`Recv::Name`), tests (`Test*` in `_test.go`) and the calls each function
+//! makes. Calls come from the syntax tree, so text in strings and comments is never a
+//! call, and braces inside strings never cut a function short.
+
 use crate::model::{EdgeKind, RawReference, Symbol, SymbolKind};
 use crate::parser::{
     LanguageExtractor, ParsedFile, compact_signature, file_symbol_id, make_file_symbol,
     make_symbol_id,
 };
 use crate::tokens::count_tokens;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
+use tree_sitter::{Node, Parser};
 
 pub struct GoExtractor;
 
@@ -27,288 +33,290 @@ impl LanguageExtractor for GoExtractor {
     }
 
     fn parse(&self, file_path: &str, source: &str) -> Result<ParsedFile> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .context("failed to load tree-sitter-go grammar")?;
+        let tree = parser
+            .parse(source, None)
+            .context("tree-sitter-go returned None")?;
         let mut out = ParsedFile::default();
         let file_id = file_symbol_id(file_path);
         out.symbols.push(make_file_symbol(file_path, source));
-
-        let lines: Vec<&str> = source.lines().collect();
-        let mut in_import_block = false;
-        let mut pending_doc = String::new();
-        let mut i = 0usize;
-
-        while i < lines.len() {
-            let trimmed = lines[i].trim();
-            let line_no = i + 1;
-
-            if in_import_block {
-                if trimmed.starts_with(')') {
-                    in_import_block = false;
-                } else if let Some(pkg) = extract_go_quoted(trimmed)
-                    && let Some(last) = pkg.rsplit('/').next()
-                {
-                    out.refs.push(RawReference {
-                        source_symbol_id: file_id.clone(),
-                        target_name: last.to_string(),
-                        kind: EdgeKind::Imports,
-                        line: line_no,
-                    });
-                }
-                i += 1;
-                continue;
-            }
-
-            if trimmed.starts_with("//") {
-                let doc = trimmed.trim_start_matches('/').trim();
-                if !doc.is_empty() && pending_doc.is_empty() {
-                    pending_doc = compact_signature(doc, 110);
-                }
-                i += 1;
-                continue;
-            }
-            if trimmed.is_empty() {
-                pending_doc.clear();
-                i += 1;
-                continue;
-            }
-
-            if trimmed.starts_with("import (") {
-                in_import_block = true;
-                i += 1;
-                continue;
-            }
-            if trimmed.starts_with("import ") {
-                if let Some(pkg) = extract_go_quoted(trimmed)
-                    && let Some(last) = pkg.rsplit('/').next()
-                {
-                    out.refs.push(RawReference {
-                        source_symbol_id: file_id.clone(),
-                        target_name: last.to_string(),
-                        kind: EdgeKind::Imports,
-                        line: line_no,
-                    });
-                }
-                i += 1;
-                continue;
-            }
-
-            // `type Name struct { ... }` / `type Name interface { ... }` / `type Name ...`
-            if let Some(rest) = trimmed.strip_prefix("type ") {
-                let name = read_go_ident(rest);
-                if !name.is_empty() {
-                    let after_name = rest[name.len()..].trim_start();
-                    let kind = if after_name.starts_with("struct") {
-                        SymbolKind::Struct
-                    } else if after_name.starts_with("interface") {
-                        SymbolKind::Trait
-                    } else {
-                        SymbolKind::TypeAlias
-                    };
-                    let end_idx = if trimmed.contains('{') {
-                        find_go_brace_end(&lines, i)
-                    } else {
-                        i
-                    };
-                    let block = lines[i..=end_idx].join("\n");
-                    let vis = if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                        "pub"
-                    } else {
-                        "private"
-                    };
-                    let sym_id = make_symbol_id(file_path, &name, line_no);
-                    out.symbols.push(Symbol {
-                        id: sym_id,
-                        file_path: file_path.to_string(),
-                        name: name.clone(),
-                        qualified_name: name,
-                        kind,
-                        signature: compact_signature(
-                            trimmed.split('{').next().unwrap_or(trimmed),
-                            140,
-                        ),
-                        start_line: line_no,
-                        end_line: end_idx + 1,
-                        token_count: count_tokens(&block),
-                        visibility: vis.to_string(),
-                        doc_summary: std::mem::take(&mut pending_doc),
-                        parent_id: Some(file_id.clone()),
-                    });
-                    i = end_idx + 1;
-                    continue;
-                }
-            }
-
-            // `func (r *Recv) Name(...)` or `func Name(...)`
-            if let Some(rest) = trimmed.strip_prefix("func ") {
-                let (recv, after_recv) = if rest.starts_with('(') {
-                    if let Some(close) = rest.find(')') {
-                        let inside = &rest[1..close];
-                        let recv_type = inside
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or("")
-                            .trim_start_matches('*')
-                            .to_string();
-                        (Some(recv_type), rest[close + 1..].trim_start())
-                    } else {
-                        (None, rest)
-                    }
-                } else {
-                    (None, rest)
-                };
-
-                let name = read_go_ident(after_recv);
-                if !name.is_empty() {
-                    let end_idx = find_go_brace_end(&lines, i);
-                    let block = lines[i..=end_idx].join("\n");
-                    let is_test = name.starts_with("Test") && file_path.ends_with("_test.go");
-                    let (kind, qname) = if is_test {
-                        (SymbolKind::Test, name.clone())
-                    } else if let Some(ref r) = recv {
-                        (SymbolKind::Method, format!("{r}::{name}"))
-                    } else {
-                        (SymbolKind::Function, name.clone())
-                    };
-                    let vis = if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                        "pub"
-                    } else {
-                        "private"
-                    };
-                    let sym_id = make_symbol_id(file_path, &qname, line_no);
-
-                    out.symbols.push(Symbol {
-                        id: sym_id.clone(),
-                        file_path: file_path.to_string(),
-                        name: name.clone(),
-                        qualified_name: qname,
-                        kind,
-                        signature: compact_signature(
-                            trimmed.split('{').next().unwrap_or(trimmed),
-                            140,
-                        ),
-                        start_line: line_no,
-                        end_line: end_idx + 1,
-                        token_count: count_tokens(&block),
-                        visibility: vis.to_string(),
-                        doc_summary: std::mem::take(&mut pending_doc),
-                        parent_id: Some(file_id.clone()),
-                    });
-
-                    if let Some(r) = recv
-                        && !r.is_empty()
-                    {
-                        out.refs.push(RawReference {
-                            source_symbol_id: sym_id.clone(),
-                            target_name: r,
-                            kind: EdgeKind::UsesType,
-                            line: line_no,
-                        });
-                    }
-
-                    let edge_kind = if is_test {
-                        EdgeKind::Tests
-                    } else {
-                        EdgeKind::Calls
-                    };
-                    collect_go_calls(&block, &name, &sym_id, line_no, edge_kind, &mut out);
-                    i = end_idx + 1;
-                    continue;
-                }
-            }
-
-            pending_doc.clear();
-            i += 1;
+        if !tree.root_node().has_error() {
+            declarations(
+                tree.root_node(),
+                source.as_bytes(),
+                file_path,
+                &file_id,
+                &mut out,
+            );
+            return Ok(out);
         }
-
+        // A syntax error can swallow the rest of the file: parse each top-level piece alone
+        let starts = |l: &str| {
+            ["func ", "func(", "type ", "var ", "const ", "import "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        };
+        for piece in crate::parser::recovery_segments(source, starts, |l| l.starts_with("//")) {
+            if let Some(tree) = parser.parse(&piece, None) {
+                declarations(
+                    tree.root_node(),
+                    piece.as_bytes(),
+                    file_path,
+                    &file_id,
+                    &mut out,
+                );
+            }
+        }
         Ok(out)
     }
 }
 
-fn read_go_ident(s: &str) -> String {
-    s.trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-fn extract_go_quoted(s: &str) -> Option<String> {
-    let start = s.find('"')?;
-    let rest = &s[start + 1..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn find_go_brace_end(lines: &[&str], start: usize) -> usize {
-    let mut depth = 0i32;
-    let mut seen = false;
-    for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in line.chars() {
-            if ch == '{' {
-                depth += 1;
-                seen = true;
-            } else if ch == '}' {
-                depth -= 1;
-                if seen && depth <= 0 {
-                    return idx;
-                }
+fn declarations(root: Node, bytes: &[u8], file_path: &str, file_id: &str, out: &mut ParsedFile) {
+    let mut cursor = root.walk();
+    for decl in root.named_children(&mut cursor) {
+        match decl.kind() {
+            "import_declaration" => imports(decl, bytes, file_id, out),
+            "type_declaration" => types(decl, bytes, file_path, file_id, out),
+            "function_declaration" | "method_declaration" => {
+                function(decl, bytes, file_path, file_id, out)
             }
+            _ => {}
         }
     }
-    start
 }
 
-fn collect_go_calls(
-    block: &str,
-    self_name: &str,
-    source_id: &str,
-    base_line: usize,
-    edge_kind: EdgeKind,
-    out: &mut ParsedFile,
-) {
-    let mut seen = HashSet::new();
-    let chars: Vec<char> = block.chars().collect();
-    let mut i = 0usize;
-    let mut line_off = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\n' {
-            line_off += 1;
-            i += 1;
+fn text<'a>(node: Node<'a>, bytes: &'a [u8]) -> &'a str {
+    node.utf8_text(bytes).unwrap_or("")
+}
+
+fn visibility(name: &str) -> String {
+    if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        "pub"
+    } else {
+        "private"
+    }
+    .to_string()
+}
+
+/// The declaration's text up to `stop` (its body), on one line.
+fn header(node: Node, stop: Option<Node>, bytes: &[u8]) -> String {
+    let end = stop.map_or(node.end_byte(), |b| b.start_byte());
+    let raw = std::str::from_utf8(&bytes[node.start_byte()..end]).unwrap_or("");
+    compact_signature(raw.trim(), 140)
+}
+
+/// First line of the `//` comment block directly above `node`.
+fn doc_comment(node: Node, bytes: &[u8]) -> String {
+    let mut first = None;
+    let mut expect_row = node.start_position().row;
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() != "comment" || p.end_position().row + 1 != expect_row {
+            break;
+        }
+        first = Some(p);
+        expect_row = p.start_position().row;
+        prev = p.prev_sibling();
+    }
+    first
+        .map(|c| text(c, bytes).trim_start_matches('/').trim())
+        .filter(|d| !d.is_empty() && !d.starts_with('*'))
+        .map(|d| compact_signature(d, 110))
+        .unwrap_or_default()
+}
+
+fn push_ref(out: &mut ParsedFile, source: &str, target: String, kind: EdgeKind, line: usize) {
+    out.refs.push(RawReference {
+        source_symbol_id: source.to_string(),
+        target_name: target,
+        kind,
+        line,
+    });
+}
+
+/// `import "a/b"` or an import block: the package's last path segment (`b`).
+fn imports(node: Node, bytes: &[u8], file_id: &str, out: &mut ParsedFile) {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "import_spec" {
+            if let Some(path) = n.child_by_field_name("path") {
+                let p = text(path, bytes).trim_matches(|c| c == '"' || c == '`');
+                if let Some(last) = p.rsplit('/').next().filter(|l| !l.is_empty()) {
+                    let line = n.start_position().row + 1;
+                    push_ref(out, file_id, last.to_string(), EdgeKind::Imports, line);
+                }
+            }
             continue;
         }
-        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
-            let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let ident: String = chars[start..i].iter().collect();
-            if i < chars.len()
-                && chars[i] == '('
-                && ident.len() >= 2
-                && ident != self_name
-                && !is_go_builtin(&ident)
-                && seen.insert(ident.clone())
-            {
-                out.refs.push(RawReference {
-                    source_symbol_id: source_id.to_string(),
-                    target_name: ident,
-                    kind: edge_kind,
-                    line: base_line + line_off,
-                });
-            }
-        } else {
-            i += 1;
+        let mut cursor = n.walk();
+        let children: Vec<Node> = n.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+}
+
+/// `type T struct {...}`, `type I interface {...}`, `type A = B`, and grouped `type (...)`.
+fn types(decl: Node, bytes: &[u8], file_path: &str, file_id: &str, out: &mut ParsedFile) {
+    let mut cursor = decl.walk();
+    let specs: Vec<Node> = decl
+        .named_children(&mut cursor)
+        .filter(|s| matches!(s.kind(), "type_spec" | "type_alias"))
+        .collect();
+    let grouped = specs.len() > 1
+        || text(decl, bytes)
+            .trim_start()
+            .strip_prefix("type")
+            .is_some_and(|r| r.trim_start().starts_with('('));
+    for spec in specs {
+        let Some(name_node) = spec.child_by_field_name("name") else {
+            continue;
+        };
+        let name = text(name_node, bytes).to_string();
+        let ty = spec.child_by_field_name("type");
+        let kind = match ty.map(|t| t.kind()) {
+            Some("struct_type") if spec.kind() == "type_spec" => SymbolKind::Struct,
+            Some("interface_type") if spec.kind() == "type_spec" => SymbolKind::Trait,
+            _ => SymbolKind::TypeAlias,
+        };
+        // A single declaration starts at `type`; one of a group at its own name
+        let node = if grouped { spec } else { decl };
+        let body = ty.filter(|t| matches!(t.kind(), "struct_type" | "interface_type"));
+        let stop = body.and_then(|b| {
+            let mut c = b.walk();
+            b.children(&mut c)
+                .find(|n| n.kind().ends_with("_list") || n.kind() == "{")
+        });
+        let line = node.start_position().row + 1;
+        out.symbols.push(Symbol {
+            id: make_symbol_id(file_path, &name, line),
+            file_path: file_path.to_string(),
+            name: name.clone(),
+            qualified_name: name.clone(),
+            kind,
+            signature: header(node, stop, bytes),
+            start_line: line,
+            end_line: node.end_position().row + 1,
+            token_count: count_tokens(text(node, bytes)),
+            visibility: visibility(&name),
+            doc_summary: doc_comment(node, bytes),
+            parent_id: Some(file_id.to_string()),
+        });
+    }
+}
+
+/// The receiver's type name: `(s *Server)` -> `Server`, `(s Stack[T])` -> `Stack`.
+fn receiver_type(decl: Node, bytes: &[u8]) -> Option<String> {
+    let recv = decl.child_by_field_name("receiver")?;
+    let mut cursor = recv.walk();
+    let param = recv
+        .named_children(&mut cursor)
+        .find(|n| n.kind() == "parameter_declaration")?;
+    let mut ty = param.child_by_field_name("type")?;
+    loop {
+        match ty.kind() {
+            "pointer_type" => ty = ty.named_child(0)?,
+            "generic_type" => ty = ty.child_by_field_name("type")?,
+            "type_identifier" => return Some(text(ty, bytes).to_string()),
+            _ => return None,
         }
+    }
+}
+
+fn function(decl: Node, bytes: &[u8], file_path: &str, file_id: &str, out: &mut ParsedFile) {
+    let Some(name_node) = decl.child_by_field_name("name") else {
+        return;
+    };
+    let name = text(name_node, bytes).to_string();
+    let recv = if decl.kind() == "method_declaration" {
+        receiver_type(decl, bytes)
+    } else {
+        None
+    };
+    let is_test = name.starts_with("Test") && file_path.ends_with("_test.go");
+    let (kind, qname) = if is_test {
+        (SymbolKind::Test, name.clone())
+    } else if let Some(r) = &recv {
+        (SymbolKind::Method, format!("{r}::{name}"))
+    } else {
+        (SymbolKind::Function, name.clone())
+    };
+    let line = decl.start_position().row + 1;
+    let sym_id = make_symbol_id(file_path, &qname, line);
+    let body = decl.child_by_field_name("body");
+    out.symbols.push(Symbol {
+        id: sym_id.clone(),
+        file_path: file_path.to_string(),
+        name: name.clone(),
+        qualified_name: qname,
+        kind,
+        signature: header(decl, body, bytes),
+        start_line: line,
+        end_line: decl.end_position().row + 1,
+        token_count: count_tokens(text(decl, bytes)),
+        visibility: visibility(&name),
+        doc_summary: doc_comment(decl, bytes),
+        parent_id: Some(file_id.to_string()),
+    });
+    if let Some(r) = recv {
+        push_ref(out, &sym_id, r, EdgeKind::UsesType, line);
+    }
+    let kind = if is_test {
+        EdgeKind::Tests
+    } else {
+        EdgeKind::Calls
+    };
+    if let Some(body) = body {
+        let mut seen = HashSet::new();
+        calls(body, bytes, &name, &sym_id, kind, &mut seen, out);
+    }
+}
+
+/// `f(...)` -> `f`, `pkg.F(...)` / `x.M(...)` -> `F` / `M` (bare name, as before).
+fn calls(
+    node: Node,
+    bytes: &[u8],
+    self_name: &str,
+    source_id: &str,
+    kind: EdgeKind,
+    seen: &mut HashSet<String>,
+    out: &mut ParsedFile,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "call_expression"
+            && let Some(f) = child.child_by_field_name("function")
+        {
+            let name = match f.kind() {
+                "identifier" => text(f, bytes),
+                "selector_expression" => f
+                    .child_by_field_name("field")
+                    .map_or("", |n| text(n, bytes)),
+                _ => "",
+            };
+            if name.len() >= 2
+                && name != self_name
+                && !is_go_builtin(name)
+                && seen.insert(name.to_string())
+            {
+                push_ref(
+                    out,
+                    source_id,
+                    name.to_string(),
+                    kind,
+                    child.start_position().row + 1,
+                );
+            }
+        }
+        calls(child, bytes, self_name, source_id, kind, seen, out);
     }
 }
 
 fn is_go_builtin(name: &str) -> bool {
     matches!(
         name,
-        "if" | "for"
-            | "switch"
-            | "select"
-            | "func"
-            | "return"
-            | "make"
+        "make"
             | "new"
             | "len"
             | "cap"
@@ -326,4 +334,138 @@ fn is_go_builtin(name: &str) -> bool {
             | "Fatal"
             | "Fatalf"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GoExtractor;
+    use crate::parser::LanguageExtractor;
+
+    const SRC: &str = r#"package server
+
+import (
+	"fmt"
+	cl "example.com/app/cluster"
+)
+
+import "strings"
+
+// Server serves requests.
+// Second line.
+type Server struct {
+	name string
+}
+
+type (
+	Handler interface {
+		Serve() error
+	}
+	ID = string
+)
+
+// Start boots the cluster.
+func (s *Server) Start(
+	port int,
+) error {
+	msg := "bootCluster(1) { in a string"
+	// stopCluster() in a comment
+	cl.bootCluster(port)
+	return fmt.Errorf("%s %s", msg, strings.ToUpper(s.name))
+}
+
+func (st Stack[T]) Push(v T) { st.grow() }
+
+func helper() int { return compute(2) }
+"#;
+
+    #[test]
+    fn golden_symbols_and_references() {
+        let parsed = GoExtractor.parse("server/server.go", SRC).unwrap();
+        let syms: Vec<(&str, &str, usize, usize)> = parsed
+            .symbols
+            .iter()
+            .skip(1)
+            .map(|s| {
+                (
+                    s.kind.as_str(),
+                    s.qualified_name.as_str(),
+                    s.start_line,
+                    s.end_line,
+                )
+            })
+            .collect();
+        assert_eq!(
+            syms,
+            vec![
+                ("struct", "Server", 12, 14),
+                ("trait", "Handler", 17, 19),
+                ("type", "ID", 20, 20),
+                ("method", "Server::Start", 24, 31),
+                ("method", "Stack::Push", 33, 33),
+                ("fn", "helper", 35, 35),
+            ]
+        );
+        assert_eq!(parsed.symbols[1].doc_summary, "Server serves requests.");
+        assert_eq!(parsed.symbols[1].signature, "type Server struct");
+        assert_eq!(parsed.symbols[4].doc_summary, "Start boots the cluster.");
+        assert_eq!(
+            parsed.symbols[4].signature,
+            "func (s *Server) Start( port int, ) error"
+        );
+
+        let refs: Vec<(String, &str, &str)> = parsed
+            .refs
+            .iter()
+            .map(|r| {
+                (
+                    r.source_symbol_id
+                        .split("::")
+                        .last()
+                        .unwrap_or("")
+                        .to_string(),
+                    r.kind.as_str(),
+                    r.target_name.as_str(),
+                )
+            })
+            .collect();
+        let has = |src: &str, kind: &str, target: &str| {
+            refs.iter()
+                .any(|(s, k, t)| s.starts_with(src) && *k == kind && *t == target)
+        };
+        for pkg in ["fmt", "cluster", "strings"] {
+            assert!(has("__file__", "IMPORTS", pkg), "{pkg}: {refs:?}");
+        }
+        assert!(has("Start#", "USES_TYPE", "Server"), "{refs:?}");
+        assert!(has("Start#", "CALLS", "bootCluster"), "{refs:?}");
+        assert!(has("Start#", "CALLS", "ToUpper"), "{refs:?}");
+        assert!(has("Push#", "USES_TYPE", "Stack"), "{refs:?}");
+        assert!(has("Push#", "CALLS", "grow"), "{refs:?}");
+        assert!(has("helper#", "CALLS", "compute"), "{refs:?}");
+        assert!(!has("Start#", "CALLS", "stopCluster"), "{refs:?}");
+        assert!(!has("Start#", "CALLS", "Errorf"), "{refs:?}");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::GoExtractor;
+    use crate::parser::LanguageExtractor;
+
+    /// A file mid-edit (one unclosed brace) must not lose every later declaration.
+    #[test]
+    fn a_syntax_error_does_not_hide_later_declarations() {
+        let src = "package p\n\nvar cfg = map[string]int{\n\t\"a\": 1,\n\n// One does things.\nfunc One() { two() }\n\nfunc two() {}\n\ntype T struct{}\n";
+        let parsed = GoExtractor.parse("p.go", src).unwrap();
+        let got: Vec<(&str, usize)> = parsed
+            .symbols
+            .iter()
+            .skip(1)
+            .map(|s| (s.qualified_name.as_str(), s.start_line))
+            .collect();
+        for want in [("One", 7), ("two", 9), ("T", 11)] {
+            assert!(got.contains(&want), "{want:?}: {got:?}");
+        }
+        let one = parsed.symbols.iter().find(|s| s.name == "One").unwrap();
+        assert_eq!(one.doc_summary, "One does things.");
+    }
 }

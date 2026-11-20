@@ -213,3 +213,39 @@ pub fn collapse_spaces(s: &str) -> String {
     }
     out.trim().to_string()
 }
+
+/// Error recovery for line-oriented languages (Python, Go). When a file has a syntax error
+/// (an unclosed bracket while it is being edited), tree-sitter can fold everything after it
+/// into one `ERROR` node, and every later definition would vanish from the index. The
+/// source is then cut at top-level definition lines (`starts_definition`, at column 0) and
+/// each piece is parsed on its own. A piece is returned padded with blank lines, so its line
+/// numbers stay those of the whole file. Lines for which
+/// `leads` holds (decorators, doc comments) stay attached to the definition below them.
+pub fn recovery_segments(
+    source: &str,
+    starts_definition: fn(&str) -> bool,
+    leads: fn(&str) -> bool,
+) -> Vec<String> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut cuts: Vec<usize> = vec![0];
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 || !starts_definition(line) {
+            continue;
+        }
+        // Move the cut above the decorators / doc comments of this definition
+        let mut at = i;
+        while at > 0 && leads(lines[at - 1]) {
+            at -= 1;
+        }
+        if at > *cuts.last().unwrap_or(&0) {
+            cuts.push(at);
+        }
+    }
+    cuts.push(lines.len());
+    cuts.windows(2)
+        .map(|w| {
+            // One newline per skipped line keeps row numbers those of the whole file
+            "\n".repeat(w[0]) + &lines[w[0]..w[1]].concat()
+        })
+        .collect()
+}

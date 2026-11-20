@@ -90,6 +90,21 @@ enum Commands {
     Languages,
     /// Generate concise Markdown summary at .trackertop/GRAPH_REPORT.md
     Report,
+    /// Review the working tree (commits, staged, unstaged and untracked work) against a base
+    /// branch: which symbols were added, removed or modified, with file:line on both sides
+    Review {
+        /// Branch, tag or commit to compare against (default: origin/HEAD, main or master);
+        /// the review uses its merge base with HEAD
+        #[arg(long)]
+        base: Option<String>,
+        /// Output format: md, json or sarif
+        #[arg(long, default_value = "md")]
+        format: String,
+        /// Exit with status 1 when a finding at or above this severity (low, medium, high)
+        /// is raised, after printing the report
+        #[arg(long)]
+        fail_on: Option<String>,
+    },
     /// Configure AI agent integration (claude, cursor, codex, windsurf)
     Install {
         /// Target agent (claude, cursor, codex, windsurf)
@@ -332,6 +347,59 @@ fn main() -> Result<()> {
             index_repository(&repo_root, false)?;
             let md_path = generate_markdown_report(&repo_root)?;
             println!("Generated Markdown summary: {}", md_path.display());
+        }
+        Commands::Review {
+            base,
+            format,
+            fail_on,
+        } => {
+            use trackertop::review::rules::Severity;
+            // Validated before the (slow) review runs
+            let fail_on = fail_on
+                .map(|s| {
+                    Severity::parse(&s).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown severity `{s}` for --fail-on: use low, medium or high"
+                        )
+                    })
+                })
+                .transpose()?;
+            let format = format.to_ascii_lowercase();
+            if !matches!(format.as_str(), "md" | "markdown" | "json" | "sarif") {
+                anyhow::bail!("unknown format `{format}`: use md, json or sarif");
+            }
+            let base = match base {
+                Some(b) => b,
+                None => trackertop::review::default_base(&repo_root)?,
+            };
+            let cs = trackertop::review::review(&repo_root, &base)?;
+            match format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&cs)?),
+                "sarif" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&trackertop::review::sarif::render_sarif(
+                        &cs,
+                        &trackertop::review::snapshot::project_prefix(&repo_root)?,
+                    ))?
+                ),
+                _ => print!("{}", trackertop::review::render_markdown(&cs)),
+            }
+            if let Some(threshold) = fail_on {
+                let hits = cs
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity <= threshold)
+                    .count();
+                if hits > 0 {
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+                    eprintln!(
+                        "trackertop review: {hits} finding(s) at or above `{}` severity",
+                        threshold.as_str()
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Install { target, global } => {
             let actions = match target.to_ascii_lowercase().as_str() {

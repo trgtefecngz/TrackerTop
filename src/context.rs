@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::graph::CodeGraph;
 use crate::indexer::index_repository;
-use crate::model::{Symbol, SymbolKind, TokenStatsSummary};
+use crate::model::{ProjectNote, Symbol, SymbolKind, TokenStatsSummary};
 use crate::parser::default_registry;
 use crate::tokens::{count_tokens, truncate_to_tokens};
 use anyhow::Result;
@@ -254,7 +254,7 @@ impl TrackerEngine {
             out.push_str("\n## Saved Project Memory\n");
             out.push_str(&more_note(notes.len(), 6, "project notes"));
             for n in notes.into_iter().take(6) {
-                out.push_str(&format!("- {}\n", n.display_line()));
+                out.push_str(&format!("- {}\n", self.note_line(&cg, &n)));
             }
         }
 
@@ -335,7 +335,7 @@ impl TrackerEngine {
         {
             out.push_str(&more_note(notes.len(), 6, "notes for this file"));
             for n in notes.iter().take(6) {
-                out.push_str(&format!("{}\n", n.display_line()));
+                out.push_str(&format!("{}\n", self.note_line(&cg, n)));
             }
         }
 
@@ -377,6 +377,20 @@ impl TrackerEngine {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
 
+        if let Some((path, from, to)) = parse_line_range(symbol_query) {
+            let text = self.read_line_range(&cg, &path, from, to);
+            return self.finalize(
+                &db,
+                "read_symbol",
+                symbol_query,
+                text,
+                max_tokens,
+                cg.files.get(&path).map_or(0, |f| f.token_count),
+                1,
+                start,
+            );
+        }
+
         let Some(sym) = cg.resolve_symbol(symbol_query) else {
             return self.finalize(
                 &db,
@@ -404,6 +418,12 @@ impl TrackerEngine {
             sym.start_line,
             sym.end_line
         );
+        if let Some(c) = cg
+            .resolve(symbol_query)
+            .and_then(|r| r.caveat(symbol_query))
+        {
+            out.push_str(&format!("{c}\n"));
+        }
         if let Some(f) = cg.files.get(&sym.file_path) {
             let quality = default_registry().extractor_quality(&f.language);
             if quality != "tree-sitter" {
@@ -418,7 +438,7 @@ impl TrackerEngine {
         {
             out.push_str(&more_note(notes.len(), 4, "memory notes"));
             for n in notes.into_iter().take(4) {
-                out.push_str(&format!("{}\n", n.display_line()));
+                out.push_str(&format!("{}\n", self.note_line(&cg, &n)));
             }
         }
         out.push_str("```\n");
@@ -572,6 +592,12 @@ impl TrackerEngine {
             sym.start_line,
             depth.max(1)
         );
+        if let Some(c) = cg
+            .resolve(symbol_query)
+            .and_then(|r| r.caveat(symbol_query))
+        {
+            out.push_str(&format!("{c}\n"));
+        }
         out.push_str(&format!("Sig: `{}`\n", sym.signature));
 
         out.push_str(&format!("\n## Incoming / Callers ({})\n", callers.len()));
@@ -668,6 +694,12 @@ impl TrackerEngine {
             report.transitive_dependents.len(),
             report.related_tests.len(),
         );
+        if let Some(c) = cg
+            .resolve(symbol_query)
+            .and_then(|r| r.caveat(symbol_query))
+        {
+            out.push_str(&format!("{c}\n"));
+        }
 
         if !report.direct_dependents.is_empty() {
             out.push_str("\n## Direct Dependents (1-hop)\n");
@@ -1115,12 +1147,15 @@ impl TrackerEngine {
                 sym.start_line,
                 sym.end_line
             ));
+            if let Some(c) = cg.resolve(q).and_then(|r| r.caveat(q)) {
+                out.push_str(&format!("{c}\n"));
+            }
             if let Ok(notes) =
                 db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path])
             {
                 out.push_str(&more_note(notes.len(), 2, "memory notes"));
                 for n in notes.into_iter().take(2) {
-                    out.push_str(&format!("{}\n", n.display_line()));
+                    out.push_str(&format!("{}\n", self.note_line(&cg, &n)));
                 }
             }
             out.push_str("```\n");
@@ -1348,8 +1383,15 @@ impl TrackerEngine {
         kind: &str,
         reason: &str,
     ) -> Result<String> {
-        let db = Database::open_for_repo(&self.repo_root)?;
-        let (id, mirror_err) = db.add_note_full(target, note, kind, reason)?;
+        let (db, cg) = self.load_fresh()?;
+        // Provenance: which commit, and a hash of the target's code, so a later read can
+        // flag the note when that code has changed
+        let commit = crate::changes::git(&self.repo_root, &["rev-parse", "--short=12", "HEAD"])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let code_hash = self.note_code_hash(&cg, target).unwrap_or_default();
+        let (id, mirror_err) =
+            db.add_note_with_provenance(target, note, kind, reason, &commit, &code_hash)?;
         let target = if target.trim().is_empty() {
             "project"
         } else {
@@ -1368,9 +1410,88 @@ impl TrackerEngine {
         Ok(out)
     }
 
+    /// Hash of the code a note target names, as it is now: a review finding id
+    /// (`rule:path:symbol`), an indexed file path, or a symbol. `None` when the target is
+    /// not code (`project`) or cannot be found.
+    fn note_code_hash(&self, cg: &CodeGraph, target: &str) -> Option<String> {
+        let t = target.trim().replace('\\', "/");
+        if t.is_empty() || t.eq_ignore_ascii_case("project") {
+            return None;
+        }
+        let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex()[..16].to_string();
+        let file_text = |path: &str| std::fs::read_to_string(self.repo_root.join(path)).ok();
+        let symbol_text = |s: &Symbol| {
+            let text = file_text(&s.file_path)?;
+            Some(
+                text.lines()
+                    .skip(s.start_line.saturating_sub(1))
+                    .take(s.end_line + 1 - s.start_line.min(s.end_line + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        // A review finding id: rule:path:qualified_name
+        let mut parts = t.splitn(3, ':');
+        if let (Some(_rule), Some(path), Some(qname)) = (parts.next(), parts.next(), parts.next())
+            && !path.is_empty()
+            && (cg.files.contains_key(path) || self.repo_root.join(path).is_file())
+        {
+            let sym = cg.symbols_by_file.get(path).and_then(|ids| {
+                ids.iter()
+                    .filter_map(|id| cg.symbols.get(id))
+                    .find(|s| s.qualified_name == qname)
+            });
+            return match sym {
+                Some(s) => symbol_text(s).map(|x| hash(&x)),
+                // The symbol is gone (a removed function): its file stands in for it
+                None => file_text(path).map(|x| hash(&x)),
+            };
+        }
+        if cg.files.contains_key(&t) {
+            return file_text(&t).map(|x| hash(&x));
+        }
+        // Exact only: a fuzzy guess would hash some other symbol's code
+        let s = cg.resolve_exact(&t)?;
+        symbol_text(s).map(|x| hash(&x))
+    }
+
+    /// A note as shown next to code: its text, plus a warning when the code it was written
+    /// about has changed since, so an old decision or dismissed lead is re-checked rather
+    /// than trusted.
+    fn note_line(&self, cg: &CodeGraph, n: &ProjectNote) -> String {
+        let mut line = n.display_line();
+        if n.code_hash.is_empty() {
+            return line;
+        }
+        let at = if n.commit.is_empty() {
+            String::new()
+        } else {
+            format!(" at commit {}", n.commit)
+        };
+        match self.note_code_hash(cg, &n.target) {
+            Some(now) if now == n.code_hash => {}
+            Some(_) => line.push_str(&format!(
+                " [POSSIBLY OUTDATED: the code changed since this note was written{at}; \
+                 re-check before relying on it]"
+            )),
+            None => line.push_str(&format!(
+                " [POSSIBLY OUTDATED: `{}` is no longer found (renamed or removed?); written{at}]",
+                n.target
+            )),
+        }
+        line
+    }
+
+    /// Whether the code a note was written about is unchanged (true when the note has no
+    /// recorded hash: nothing to compare).
+    fn note_still_current(&self, cg: &CodeGraph, n: &ProjectNote) -> bool {
+        n.code_hash.is_empty()
+            || self.note_code_hash(cg, &n.target).as_deref() == Some(&n.code_hash)
+    }
+
     /// 14. Recalls saved notes, decisions and dismissed leads (all of them; no silent cap).
     pub fn recall(&self, query: Option<&str>) -> Result<String> {
-        let db = Database::open_for_repo(&self.repo_root)?;
+        let (db, cg) = self.load_fresh()?;
         let notes = db.list_notes(query)?;
         if notes.is_empty() {
             return Ok(match query {
@@ -1384,7 +1505,7 @@ impl TrackerEngine {
         }
         let mut out = format!("# SAVED MEMORY NOTES ({})\n", notes.len());
         for n in notes {
-            out.push_str(&format!("- {}\n", n.display_line()));
+            out.push_str(&format!("- {}\n", self.note_line(&cg, &n)));
         }
         Ok(out)
     }
@@ -1505,6 +1626,101 @@ impl TrackerEngine {
         )
     }
 
+    /// Local review of the branch and uncommitted work against `base` (default branch when
+    /// empty). Findings dismissed earlier with `remember(target=<id>, kind=dismissed)` are
+    /// not shown again; they are listed by id and reason so nothing disappears silently.
+    pub fn review_changes(&self, base: &str, max_tokens: usize) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let base_ref = if base.trim().is_empty() {
+            crate::review::default_base(&self.repo_root)?
+        } else {
+            base.trim().to_string()
+        };
+        let mut cs = crate::review::review(&self.repo_root, &base_ref)?;
+        let (mut db, cg) = self.load_fresh()?;
+        let notes = db.list_notes(None)?;
+        let mut dismissed: Vec<(String, String)> = Vec::new();
+        // A dismissal holds only while the code it was made about is unchanged; after that
+        // the finding is raised again, saying it was dismissed before
+        cs.findings.retain_mut(|f| {
+            match notes
+                .iter()
+                .find(|n| n.kind == "dismissed" && n.target.trim().eq_ignore_ascii_case(&f.id))
+            {
+                Some(n) if self.note_still_current(&cg, n) => {
+                    dismissed.push((f.id.clone(), n.reason.clone()));
+                    false
+                }
+                Some(n) => {
+                    f.evidence.push(format!(
+                        "dismissed earlier (note #{}: {}), but its code changed since: re-check",
+                        n.id, n.reason
+                    ));
+                    true
+                }
+                None => true,
+            }
+        });
+        let mut text = crate::review::render_markdown(&cs);
+        let mut extra = String::new();
+        if !dismissed.is_empty() {
+            extra.push_str(&format!(
+                "Dismissed earlier, not shown again ({}):\n",
+                dismissed.len()
+            ));
+            for (id, reason) in &dismissed {
+                extra.push_str(&format!("- `{id}`: {reason}\n"));
+            }
+        }
+        let raised: Vec<(String, String)> = cs
+            .findings
+            .iter()
+            .map(|f| {
+                let msg: String = f.message.chars().take(140).collect();
+                let cut = if msg.len() < f.message.len() {
+                    "…"
+                } else {
+                    ""
+                };
+                (f.id.clone(), format!("{msg}{cut} ({})", f.location))
+            })
+            .collect();
+        let previous = db.swap_review_findings(&base_ref, &raised)?;
+        extra.push_str(&review_delta(
+            previous.as_deref(),
+            &raised,
+            &dismissed,
+            &base_ref,
+        ));
+        if !cs.findings.is_empty() {
+            extra.push_str(
+                "After checking a finding that is not a problem: \
+                 remember(target=\"<id>\", kind=\"dismissed\", reason=\"...\").\n",
+            );
+        }
+        // Keep this next to the findings, ahead of the long symbol list a budget cuts first
+        match text.find("\n## Changed symbols") {
+            Some(at) => text.insert_str(at, &format!("\n{extra}")),
+            None => text.push_str(&extra),
+        }
+        let baseline: usize = cs
+            .files
+            .iter()
+            .filter_map(|f| cg.files.get(&f.path))
+            .map(|f| f.token_count)
+            .sum();
+        self.finalize(
+            &db,
+            "review_changes",
+            &base_ref,
+            text,
+            if max_tokens == 0 { 2500 } else { max_tokens },
+            baseline,
+            cs.files.len(),
+            start,
+        )
+    }
+
     /// 17. Build/test/lint/format commands, CI steps, toolchain versions, conventions and
     ///     agent instruction files, each marked detected (declared by the project) or guessed.
     pub fn project_playbook(&self, max_tokens: usize) -> Result<QueryOutput> {
@@ -1542,6 +1758,68 @@ impl TrackerEngine {
         let db = Database::open_for_repo(&self.repo_root)?;
         db.get_token_stats(20)
     }
+}
+
+/// "Since the previous review": findings resolved (raised before, gone now and not merely
+/// dismissed), new and unchanged, by stable id.
+fn review_delta(
+    previous: Option<&[(String, String)]>,
+    raised: &[(String, String)],
+    dismissed: &[(String, String)],
+    base_ref: &str,
+) -> String {
+    let Some(previous) = previous else {
+        return format!(
+            "Since the previous review: none recorded against `{base_ref}`; the next \
+             review_changes will list resolved / new / unchanged findings.\n"
+        );
+    };
+    let before: HashSet<&str> = previous.iter().map(|(id, _)| id.as_str()).collect();
+    let now: HashSet<&str> = raised.iter().map(|(id, _)| id.as_str()).collect();
+    let hidden: HashSet<&str> = dismissed.iter().map(|(id, _)| id.as_str()).collect();
+    let resolved: Vec<&(String, String)> = previous
+        .iter()
+        .filter(|(id, _)| !now.contains(id.as_str()) && !hidden.contains(id.as_str()))
+        .collect();
+    let new: Vec<&str> = raised
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !before.contains(id))
+        .collect();
+    let unchanged = raised.len() - new.len();
+    let mut s = format!(
+        "Since the previous review against `{base_ref}`: {} resolved, {} new, {unchanged} \
+         unchanged.\n",
+        resolved.len(),
+        new.len()
+    );
+    const SHOWN: usize = 10;
+    for (id, summary) in resolved.iter().take(SHOWN) {
+        s.push_str(&format!("- resolved `{id}`: was {summary}\n"));
+    }
+    s.push_str(&more_note(
+        resolved.len(),
+        SHOWN.min(resolved.len()),
+        "resolved",
+    ));
+    for id in new.iter().take(SHOWN) {
+        s.push_str(&format!("- new `{id}`\n"));
+    }
+    s.push_str(&more_note(new.len(), SHOWN.min(new.len()), "new"));
+    s
+}
+
+/// `path:Lstart-end`, `path:start-end` or `path:Lline` -> (path, start, end), 1-based.
+fn parse_line_range(query: &str) -> Option<(String, usize, usize)> {
+    let (path, range) = query.trim().rsplit_once(':')?;
+    let range = range.strip_prefix('L').unwrap_or(range);
+    let (a, b) = range.split_once('-').unwrap_or((range, range));
+    let b = b.strip_prefix('L').unwrap_or(b);
+    let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    if a == 0 || b < a || path.is_empty() || path.ends_with(':') {
+        return None;
+    }
+    Some((path.trim().replace('\\', "/"), a, b))
 }
 
 /// One line telling the agent that a list was cut, so a partial list never looks complete.
@@ -1601,6 +1879,53 @@ impl TrackerEngine {
 
     /// Explains a symbol lookup miss with the index's coverage, so "no such symbol in the
     /// index" is never read as "no such symbol in the repository".
+    /// Lines `from..=to` of an indexed file, numbered, with the innermost symbol around them.
+    fn read_line_range(&self, cg: &CodeGraph, path: &str, from: usize, to: usize) -> String {
+        let Some(rec) = cg.files.get(path) else {
+            return format!(
+                "NOT INDEXED: `{path}` is not in the index (missing, git-ignored, or a file \
+                 type TrackerTop does not index: {}). Pass a path relative to the project \
+                 root, e.g. `src/lib.rs:L10-40`.\n",
+                indexed_extensions()
+            );
+        };
+        let content = std::fs::read_to_string(self.repo_root.join(path)).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        if from > total {
+            return format!("OUT OF RANGE: {path} has {total} lines; asked for L{from}-{to}.\n");
+        }
+        let end = to.min(total);
+        let mut out = format!("# LINES {path}:L{from}-{end}");
+        let around = cg
+            .symbols_by_file
+            .get(&rec.path)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| cg.symbols.get(id))
+            .filter(|s| s.kind != SymbolKind::File && s.start_line <= from && s.end_line >= end)
+            .min_by_key(|s| s.end_line - s.start_line);
+        if let Some(s) = around {
+            out.push_str(&format!(
+                " (inside {} [{}] L{}-{})",
+                s.qualified_name,
+                s.kind.as_str(),
+                s.start_line,
+                s.end_line
+            ));
+        }
+        out.push('\n');
+        if end < to {
+            out.push_str(&format!("(clamped: the file has {total} lines)\n"));
+        }
+        out.push_str("```\n");
+        for (i, line) in lines[from - 1..end].iter().enumerate() {
+            out.push_str(&format!("{:>4} | {line}\n", from + i));
+        }
+        out.push_str("```\n");
+        out
+    }
+
     fn symbol_miss(cg: &CodeGraph, query: &str) -> String {
         format!(
             "NOT FOUND IN INDEX: no symbol matches `{query}` ({} symbols in {} indexed files; \

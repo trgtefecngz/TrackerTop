@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
+/// Revision of what the extractors produce (symbols, raw references). Bump it whenever an
+/// extractor change alters their output for unchanged source: an index written by another
+/// revision is re-parsed in full on its next run, instead of keeping stale edges for
+/// every file whose content did not change. (1: v0.8, Rust macro-argument and method calls;
+/// 2: Rust type uses inside function bodies; 3: Python on tree-sitter;
+/// 4: Go on tree-sitter; 5: Python/Go syntax-error recovery;
+/// 6: Rust paths: variants and associated items are not type uses.)
+pub const EXTRACTOR_REVISION: i64 = 6;
+
 #[derive(Debug, Clone)]
 pub struct IndexStats {
     pub total_files: usize,
@@ -121,23 +130,43 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
     index_repository_with_registry(repo_root, force, default_registry())
 }
 
+/// Indexes a temporary snapshot (for example a review's base commit checked out in a
+/// worktree) without adding it to the global project list shown in the desktop app.
+pub fn index_snapshot(root: &Path) -> Result<IndexStats> {
+    index_with(root, false, default_registry(), false)
+}
+
 /// Runs an incremental index using any custom `LanguageRegistry` (open core for community languages).
 pub fn index_repository_with_registry(
     repo_root: &Path,
     force: bool,
     registry: &LanguageRegistry,
 ) -> Result<IndexStats> {
+    index_with(repo_root, force, registry, true)
+}
+
+fn index_with(
+    repo_root: &Path,
+    force: bool,
+    registry: &LanguageRegistry,
+    register: bool,
+) -> Result<IndexStats> {
     let start = Instant::now();
     ensure_indexable_root(repo_root)?;
-    let _ = register_project(repo_root);
+    if register {
+        let _ = register_project(repo_root);
+    }
     let mut db = Database::open_for_repo(repo_root)?;
-    let existing = if force {
-        HashMap::new()
-    } else {
-        db.load_file_map()?
-    };
+    // Rows parsed by another extractor revision describe the code as that extractor saw
+    // it: re-parse everything, or unchanged files keep missing (or wrong) edges forever.
+    let outdated = db.extractor_revision()? != EXTRACTOR_REVISION;
+    let reparse_all = force || outdated;
+    // Loaded even when re-parsing everything, so deleted files are still detected.
+    let existing = db.load_file_map()?;
 
-    let discovered = discover_supported_files(repo_root, registry);
+    // A snapshot lives under the project's git-ignored `.trackertop/`: ignore rules from
+    // directories above it would hide every file, so only its own `.gitignore`s apply.
+    let discovered = discover_supported_files(repo_root, registry, register);
     let current_paths: HashSet<String> = discovered.iter().map(|(rel, _, _)| rel.clone()).collect();
 
     // Detect deleted files
@@ -179,7 +208,8 @@ pub fn index_repository_with_registry(
         // Never take the fast path on an untrusted record: an mtime that cannot be read here
         // falls back to the same value as the UNTRUSTED_MTIME sentinel and would otherwise
         // "match" it.
-        if let Some(prev) = existing.get(&rel_path)
+        if !reparse_all
+            && let Some(prev) = existing.get(&rel_path)
             && prev.mtime_secs != UNTRUSTED_MTIME
             && prev.mtime_secs == mtime
             && prev.size_bytes == size
@@ -213,7 +243,8 @@ pub fn index_repository_with_registry(
             let recorded_mtime =
                 trustworthy_mtime(&cand.abs_path, cand.mtime, cand.size, source.len() as u64);
 
-            if let Some(prev) = existing.get(&cand.rel_path)
+            if !reparse_all
+                && let Some(prev) = existing.get(&cand.rel_path)
                 && prev.hash == hash
             {
                 return Some(Outcome::Touched(cand.rel_path, recorded_mtime, cand.size));
@@ -248,6 +279,23 @@ pub fn index_repository_with_registry(
     }
 
     let parsed_files = parsed_batch.len();
+    // A full re-parse must not keep rows it could not refresh (unreadable, too large or
+    // unparsable now): they were produced by another extractor revision or are stale, and
+    // the index is about to be marked current. Without rows the file reads as not indexed.
+    let mut deleted = deleted;
+    if reparse_all {
+        let refreshed: HashSet<&str> = parsed_batch
+            .iter()
+            .map(|(r, _, _)| r.path.as_str())
+            .collect();
+        let gone: HashSet<&str> = deleted.iter().map(String::as_str).collect();
+        let stale: Vec<String> = existing
+            .keys()
+            .filter(|p| !refreshed.contains(p.as_str()) && !gone.contains(p.as_str()))
+            .cloned()
+            .collect();
+        deleted.extend(stale);
+    }
     let deleted_files = deleted.len();
 
     if deleted_files > 0 {
@@ -261,7 +309,7 @@ pub fn index_repository_with_registry(
     // upsert and its edge rebuild: repair them even if THIS run saw no file changes.
     let edges_stale = db.edges_generation()? != db.files_generation()?;
     let changed =
-        force || parsed_files > 0 || deleted_files > 0 || existing.is_empty() || edges_stale;
+        reparse_all || parsed_files > 0 || deleted_files > 0 || existing.is_empty() || edges_stale;
 
     let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
         const MAX_ATTEMPTS: usize = 5;
@@ -311,6 +359,11 @@ pub fn index_repository_with_registry(
         let (files, symbols, edges, tokens) = db.index_totals()?;
         (files, symbols, edges, tokens, db.index_generation()?)
     };
+    // Recorded only once every file was re-parsed and the edges committed: an interrupted
+    // run re-parses everything again next time.
+    if outdated {
+        db.set_extractor_revision(EXTRACTOR_REVISION)?;
+    }
 
     Ok(IndexStats {
         total_files,
@@ -329,9 +382,12 @@ pub fn index_repository_with_registry(
 fn discover_supported_files(
     repo_root: &Path,
     registry: &LanguageRegistry,
+    parent_ignores: bool,
 ) -> Vec<(String, PathBuf, Arc<dyn LanguageExtractor>)> {
     let mut results = Vec::new();
     let walker = WalkBuilder::new(repo_root)
+        .parents(parent_ignores)
+        .require_git(parent_ignores)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
@@ -516,13 +572,54 @@ fn resolve_edges(
                 // A qualified Rust call (`Type::f`, `module::f`) binds only inside that type or
                 // module. Falling back to the bare name would tie `Stroke::new` (an external
                 // type) to whatever `new` this project defines: no edge beats a wrong edge.
-                let rust_qualified = src_file.ends_with(".rs")
-                    && matches!(rref.kind, EdgeKind::Calls | EdgeKind::Tests)
-                    && target.contains("::");
-                if rust_qualified {
+                let is_call = matches!(rref.kind, EdgeKind::Calls | EdgeKind::Tests);
+                let is_rust = src_file.ends_with(".rs");
+                let rust_qualified = is_rust && is_call && target.contains("::");
+                // `.name` is a Rust method call on a value (see `extract_callable_name`)
+                let method_call = is_rust && is_call && target.starts_with('.');
+                if method_call || (is_call && !target.contains("::")) {
+                    let name = target.trim_start_matches('.');
+                    let syms = by_name.get(name).map(Vec::as_slice).unwrap_or_default();
+                    let syms = if syms.is_empty() {
+                        by_name_ci
+                            .get(&name.to_ascii_lowercase())
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                    } else {
+                        syms
+                    };
+                    let candidates = call_candidates(syms, method_call, is_rust);
+                    if let Some(best) = pick_nearest_symbol(&candidates, src_file) {
+                        resolved_targets.push(best.id.clone());
+                    }
+                } else if rust_qualified {
                     if let Some(best) =
                         resolve_qualified_rust_call(target, src_file, &by_qname, &by_name)
                     {
+                        resolved_targets.push(best.id.clone());
+                    }
+                }
+                // A Rust type use names a type: never a function, module or doc section
+                // that happens to share the name (an external type gets no edge)
+                else if is_rust && rref.kind == EdgeKind::UsesType {
+                    let types: Vec<&Symbol> = by_name
+                        .get(target)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|s| {
+                            matches!(
+                                s.kind,
+                                SymbolKind::Struct
+                                    | SymbolKind::Enum
+                                    | SymbolKind::Trait
+                                    | SymbolKind::TypeAlias
+                                    | SymbolKind::Class
+                            )
+                        })
+                        .collect();
+                    if let Some(best) = pick_nearest_symbol(&types, src_file) {
                         resolved_targets.push(best.id.clone());
                     }
                 }
@@ -598,6 +695,44 @@ fn join_rel(dir: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{dir}/{name}")
+    }
+}
+
+/// Which of the symbols sharing a callee's name a call can reach. Modules, doc sections and
+/// the like are never call targets (`pub mod review` must not catch a call to `review()`).
+/// A Rust method call on a value (`x.flush()`) only reaches methods: when the project has
+/// no method of that name it is a call into a library type, and gets no edge. For other
+/// languages, if no callable matches, the previous behaviour (any symbol) is kept.
+fn call_candidates<'a>(syms: &[&'a Symbol], method_call: bool, is_rust: bool) -> Vec<&'a Symbol> {
+    if method_call {
+        return syms
+            .iter()
+            .copied()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+    }
+    let callable: Vec<&Symbol> = syms
+        .iter()
+        .copied()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Function
+                    | SymbolKind::Macro
+                    | SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Class
+                    | SymbolKind::ShaderEntry
+            )
+            // A bare Rust `f()` cannot call a method: methods need a receiver (`x.f()`,
+            // resolved above) or a path (`Type::f()`, `Self::f()`)
+            || (s.kind == SymbolKind::Method && !is_rust)
+        })
+        .collect();
+    if callable.is_empty() && !is_rust {
+        syms.to_vec()
+    } else {
+        callable
     }
 }
 
