@@ -20,6 +20,8 @@ pub struct IndexStats {
     pub total_symbols: usize,
     pub total_edges: usize,
     pub total_repo_tokens: usize,
+    /// `Database::index_generation` after this run; changes whenever the graph data changed.
+    pub generation: i64,
     pub elapsed_ms: u128,
 }
 
@@ -190,30 +192,33 @@ pub fn index_repository_with_registry(
         db.upsert_parsed_files(&parsed_batch)?;
     }
 
-    let all_files = db.load_all_files()?;
-    let all_symbols = db.load_all_symbols()?;
-    let total_edges = if changed {
+    let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
+        let all_files = db.load_all_files()?;
+        let all_symbols = db.load_all_symbols()?;
         let all_refs = db.load_all_raw_refs()?;
         let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
         let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
         resolved.extend(crate::git::extract_cochange_edges(repo_root, &indexed_paths));
-        let count = resolved.len();
+        let edge_count = resolved.len();
         db.replace_edges(&resolved)?;
-        count
+        let generation = db.bump_index_generation()?;
+        let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
+        (all_files.len(), all_symbols.len(), edge_count, tokens, generation)
     } else {
-        db.load_all_edges()?.len()
+        // Nothing changed: aggregate in SQL instead of loading every row.
+        let (files, symbols, edges, tokens) = db.index_totals()?;
+        (files, symbols, edges, tokens, db.index_generation()?)
     };
 
-    let total_repo_tokens: usize = all_files.iter().map(|f| f.token_count).sum();
-
     Ok(IndexStats {
-        total_files: all_files.len(),
+        total_files,
         parsed_files,
         skipped_files,
         deleted_files,
-        total_symbols: all_symbols.len(),
+        total_symbols,
         total_edges,
         total_repo_tokens,
+        generation,
         elapsed_ms: start.elapsed().as_millis(),
     })
 }

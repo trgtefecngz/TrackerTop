@@ -7,6 +7,7 @@ use crate::tokens::{count_tokens, truncate_to_tokens};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Result of an AI-first query, including exact token-savings metrics.
@@ -22,20 +23,35 @@ pub struct QueryOutput {
 
 pub struct TrackerEngine {
     pub repo_root: PathBuf,
+    /// Last built graph, tagged with the DB `index_generation` it was built from.
+    /// Long-lived engines (the MCP server) reuse it until the index changes.
+    graph_cache: Mutex<Option<(i64, Arc<CodeGraph>)>>,
 }
 
 impl TrackerEngine {
     pub fn new(repo_root: &Path) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
+            graph_cache: Mutex::new(None),
         }
     }
 
-    fn load_fresh(&self) -> Result<(Database, CodeGraph)> {
+    fn load_fresh(&self) -> Result<(Database, Arc<CodeGraph>)> {
         // Fast incremental refresh (mtime + size check skips unchanged files in milliseconds)
-        index_repository(&self.repo_root, false)?;
+        let stats = index_repository(&self.repo_root, false)?;
         let db = Database::open_for_repo(&self.repo_root)?;
-        let graph = CodeGraph::load(&db)?;
+
+        let mut cache = self
+            .graph_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((generation, graph)) = cache.as_ref()
+            && *generation == stats.generation
+        {
+            return Ok((db, Arc::clone(graph)));
+        }
+        let graph = Arc::new(CodeGraph::load(&db)?);
+        *cache = Some((stats.generation, Arc::clone(&graph)));
         Ok((db, graph))
     }
 

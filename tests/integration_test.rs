@@ -407,3 +407,45 @@ func bootCluster() error {
     let go_call = engine.call_graph("Server::Start", 2, 800).unwrap();
     assert!(go_call.text.contains("bootCluster"));
 }
+
+/// The MCP engine caches the built graph between calls; it must still see edits made
+/// in this process AND re-indexes performed by another process (GUI / second MCP server).
+#[test]
+fn graph_cache_never_serves_stale_symbols() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn alpha_fn() -> u8 { 1 }\n").unwrap();
+
+    let engine = TrackerEngine::new(root);
+    let found = |e: &TrackerEngine, name: &str| {
+        !e.read_symbol(name, false, 0)
+            .unwrap()
+            .text
+            .contains("Symbol not found")
+    };
+
+    assert!(found(&engine, "alpha_fn"));
+    assert!(!found(&engine, "beta_fn"));
+    // Served from cache: still correct
+    assert!(found(&engine, "alpha_fn"));
+
+    // Edit in place (different size, so detection does not depend on mtime resolution)
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() -> u8 { 1 }\npub fn beta_fn() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    assert!(found(&engine, "beta_fn"));
+
+    // Another engine (stands in for another process) re-indexes first
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() -> u8 { 1 }\npub fn beta_fn() -> u8 { 2 }\npub fn gamma_fn() -> u8 { 3 }\n",
+    )
+    .unwrap();
+    let other = TrackerEngine::new(root);
+    assert!(found(&other, "gamma_fn"));
+    // `engine` sees no file changes itself, but the generation moved: must reload
+    assert!(found(&engine, "gamma_fn"));
+}

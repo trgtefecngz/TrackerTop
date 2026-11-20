@@ -125,9 +125,54 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_notes_target ON notes(target);
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
             ",
         )?;
         Ok(())
+    }
+
+    /// Monotonic counter bumped every time files/symbols/edges change. Lets long-lived
+    /// processes (MCP server, GUI) know whether an in-memory graph is still current, even
+    /// when ANOTHER process performed the re-index.
+    pub fn index_generation(&self) -> Result<i64> {
+        let v = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'index_generation'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        Ok(v)
+    }
+
+    pub fn bump_index_generation(&self) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES('index_generation', 1)
+             ON CONFLICT(key) DO UPDATE SET value = value + 1",
+            [],
+        )?;
+        self.index_generation()
+    }
+
+    /// Cheap aggregate counts used when nothing changed (avoids loading every row).
+    pub fn index_totals(&self) -> Result<(usize, usize, usize, usize)> {
+        let (files, tokens): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(token_count), 0) FROM files",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let symbols: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        Ok((files as usize, symbols as usize, edges as usize, tokens as usize))
     }
 
     pub fn load_file_map(&self) -> Result<HashMap<String, FileRecord>> {
