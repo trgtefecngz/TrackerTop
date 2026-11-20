@@ -11,13 +11,37 @@ TrackerTop is a tool for the AI agent itself. v0.7 makes an agent's work cheaper
 | 3 | Honest metrics: telemetry tagged by source (MCP client, CLI, UI, tests); conservative baseline next to the upper bound, savings as a range; log of what the agent asked for | Done |
 | 4 | Nested ("matryoshka") Code Graph view: project → communities → files → symbols, aggregated edges, stable group ids | Done |
 
-The graph-grounded PR review moves to v0.8.
+Released in v0.7.0 together with fixes from a pre-release review: qualified Rust calls no longer bind to namesakes, member notes no longer leak to other types, `changes_since` works in monorepo packages, and `run_checks` no longer reports passing output as failures or hides a crashed test binary.
 
-## v0.8: graph-grounded PR review (`trackertop review`)
+## Order after v0.7
+
+Everything below serves the agent first: catch mistakes before they are pushed, never answer from a guess, and do not lose what earlier sessions learned.
+
+| Release | Theme | Main deliverables |
+|---|---|---|
+| v0.8 | Local review | `trackertop review` engine and a `review_changes` MCP tool; note provenance and staleness; small tool gaps |
+| v0.9 | Precision | LSP bridge for exact call resolution; affected-test selection for `run_checks` |
+| v1.0 | Editing and continuity | Symbol-level editing; working memory across sessions (`resume`) |
+| Later | Breadth | Structural search/replace; version-exact dependency docs; more tree-sitter languages |
+
+## v0.8: local, graph-grounded review (`trackertop review`)
 
 ### Goal
 
-Review a pull request using the code graph TrackerTop already builds: what the change touches, what depends on it, what is untested, and what it likely breaks. It runs locally with `trackertop review` and on GitHub as an Action that comments on the PR.
+Review a change using the code graph TrackerTop already builds: what the change touches, what depends on it, what is untested, and what it likely breaks.
+
+**Local first.** The engine runs on the working tree, before a commit or push, in seconds, offline, and with no monthly review quota. The agent calls it as an MCP tool (`review_changes`) at the end of every task. A GitHub Action is only a thin wrapper around the same engine, for contributors who do not run TrackerTop and for CI gating; it comes last.
+
+### Also in v0.8
+
+- **Note provenance.** Each note stores the commit and a hash of the code it is attached to, and shows them when it is surfaced.
+- **Stale-note warning.** If that code changed after the note was written, the note is still shown, but flagged as possibly outdated. An old "dismissed" lead must never silently hide a bug in code that has since changed.
+- **Review uses decision memory.** Findings dismissed with `remember(kind=dismissed)` are not raised again, unless the code changed since (see stale-note warning).
+- **Small tool gaps found while dogfooding:**
+  - `read_symbol` on `mod tests` and on impl tails.
+  - "Who uses this type?" for enums and structs.
+  - Bound `run_checks` output memory.
+  - Python and Go on tree-sitter.
 
 ### Feature, not a separate tool
 
@@ -67,7 +91,7 @@ Phase 1 can only find structural problems. For logic bugs, an opt-in pass sends 
 
 ### Phase 3: GitHub integration
 
-- A reusable Action: `uses: trgtefecngz/TrackerTop/review-action@v0.7`.
+- A reusable Action: `uses: trgtefecngz/TrackerTop/review-action@v0.8`.
 - It posts **one comment and edits it in place** instead of piling up new ones, plus SARIF upload for inline annotations.
 - Re-review on demand with a `@trackertop review` comment (an `issue_comment` workflow), not on every push.
 - Commands: `@trackertop wrong <id>`, `@trackertop suppress <rule>`. Dismissed findings are remembered in the repo (`.trackertop/review-suppressions.json`) and never raised again.
@@ -94,8 +118,10 @@ The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, 
 | 1 | Tree-sitter TS/JS extractor | Done in v0.7 |
 | 2 | Diff → symbol mapping + base/head indexing | `review` lists changed symbols correctly for add/modify/delete/rename |
 | 3 | Deterministic rules + Markdown/JSON/SARIF | Each rule has fixture tests; runs offline in < 5 s on a 1k-file repo |
-| 4 | GitHub Action + single updating comment + commands | Works on this repository's own PRs |
-| 5 | Opt-in AI pass with verification | False-positive rate measured on this repo's PR history; budget enforced |
+| 4 | `review_changes` MCP tool + dismissed-lead memory | The agent can review its own uncommitted work; dismissed findings stay dismissed until their code changes |
+| 5 | Note provenance + stale-note warning | A note whose code changed is flagged; covered by tests |
+| 6 | Opt-in AI pass with verification | False-positive rate measured on this repo's PR history; budget enforced |
+| 7 | GitHub Action + single updating comment + commands | Thin wrapper over the engine; works on this repository's own PRs |
 
 ### Open questions
 
@@ -103,8 +129,20 @@ The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, 
 - Whether to support other model providers in phase 2, or only Claude.
 - Whether to cache the base-commit index in CI (actions/cache) or rebuild it on every run.
 
+## v0.9: precision
+
+- **LSP bridge.** When rust-analyzer, tsserver, pyright or gopls is available, ask it which function a call really reaches, and mark each edge as exact or heuristic. Tree-sitter stays the fallback. This removes the remaining guesswork in call edges (trait calls, methods on values, re-exports) instead of dropping those edges.
+- **Affected-test selection.** `run_checks` can run only the tests that reach the changed symbols, for fast feedback while working. The full suite still runs before a commit and in CI.
+
+## v1.0: editing and continuity
+
+- **Symbol-level editing.** `replace_symbol_body`, `insert_after_symbol` and `rename_symbol`. Rename updates every reference the graph knows about and reports the references it could not resolve. Edits stop failing on whitespace mismatches.
+- **Working memory (`resume`).** What the last sessions were doing, what was tried and failed, what is still open, and the decisions taken, in a short summary at the start of a session. The desktop app shows the same log, so a person can follow what the agent did and why.
+
 ## Later
 
+- Structural search and replace (syntax-aware patterns instead of text).
+- Version-exact dependency docs: API signatures for the versions in `Cargo.lock` / `package-lock.json`, read locally.
 - Watch mode: keep the index warm without a query.
 - More tree-sitter languages: C/C++, C#, Java.
 - Signed release binaries (Windows Authenticode, macOS notarization).

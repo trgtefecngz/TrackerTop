@@ -2,6 +2,52 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [0.8.0] - unreleased
+
+### Added: `trackertop review` (step 1)
+- `trackertop review [--base <ref>] [--format md|json]` lists which symbols your branch and uncommitted work added, removed or modified compared with the merge base, with `file:line` on both sides. The base is checked out and indexed separately under `.trackertop/review-base/`, without touching your branch, index or working tree.
+- Review findings, each with a stable id, severity, `file:line` and evidence:
+  - `broken-ref`: a removed symbol that a surviving caller still calls, verified against the working tree;
+  - `impact`: a modified function with many code dependents, with the tests that reach it;
+  - `untested`: new or modified code that no test reaches;
+  - `new-cycle`: an import cycle the change created between JS/TS/Python/Go files;
+  - `bloat`: a file that grew past 3,500 tokens;
+  - `orphan`: a function whose last caller this change removed or rewrote, reported only when its name appears nowhere else in the project's code (so a function passed as a value or named in a registry is never called unused);
+  - `cochange-miss`: a file that changed together with a file you touched in at least 4 commits and 60% of that file's recent history (at the base, bulk commits ignored), but not in this change. Reported as a habit with the commits it rests on, never as proof.
+- New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
+- `trackertop review --format sarif` writes SARIF 2.1.0 for code-scanning UIs (each finding keeps its stable id as a fingerprint), and `--fail-on low|medium|high` exits with status 1 when a finding at or above that severity is raised.
+- `review_changes` says what changed since the previous review against the same base: findings resolved (with what they were), new, and unchanged, by stable id. A dismissed finding is not counted as resolved.
+
+### Added: note provenance
+- Notes, decisions and dismissed leads record the commit and a hash of the code they are about. When that code changes, the note is still shown but marked **POSSIBLY OUTDATED**, so an old decision is re-checked instead of trusted. A dismissed review finding is raised again once its code changes.
+
+### Changed: `run_checks` memory
+- Command output is kept up to 16 MB from the start plus the last 8–16 MB, instead of the whole log in memory. When the middle is dropped, the report says so (**PARTIAL OUTPUT**), so a failure printed there is never silently lost.
+
+### Fixed: symbol lookups never guess silently
+- `read_symbol`, `read_symbols_batch`, `call_graph` and `impact_analysis` used to fall back to the best fuzzy match without saying so. For example, `src/review/rules.rs::tests` returned an unrelated test. Lookups now try an exact symbol id, `path::name`, an exact qualified name, then an exact name, in that order. When several symbols share the name, the answer says **AMBIGUOUS** and lists them; a fuzzy match is labelled as the closest match.
+
+### Added: line ranges in `read_symbol`
+- `read_symbol("src/lib.rs:L120-160")` reads a line range that no symbol covers, such as an impl tail or a test module's helpers, and names the innermost symbol around it. A range past the end of the file is clamped and says so; one that starts past the end, or a file that is not indexed, gets an explicit error.
+
+### Changed: Python and Go on tree-sitter
+- The Python and Go extractors now read a syntax tree instead of scanning lines. Text in strings and comments is no longer taken for a call, a `def` inside a docstring is no longer a symbol, and braces inside Go strings no longer end a function early.
+- A syntax error, such as an unclosed bracket in a file being edited, no longer hides every later definition. The file is re-parsed piece by piece from its top-level definitions. Python definitions inside `for`, `while` and `match` blocks are kept.
+- Fixed along the way: multi-line Python and Go signatures (the function used to end at its first line), grouped Go `type ( ... )` declarations (previously missed), generic Go receivers (`Stack[T]` is now `Stack`), and multi-line `from x import (...)` lists.
+
+### Fixed: stale graph after upgrading TrackerTop
+- The index records which extractor revision parsed it. An index written by another TrackerTop version is re-parsed in full on its next run. Before, files whose content had not changed kept the references an older extractor produced, so call-edge fixes never reached them: on this repository, `TrackerEngine::finalize_inner` showed 0 callers instead of 19.
+
+### Fixed: "who uses this type" (Rust)
+- Type uses inside function bodies are now edges: `match` arms on an enum (`Level::High`), struct literals, `let` annotations, type paths such as `Rec::new()`. Before, only signatures counted, so `impact_analysis` on `Severity` listed 6 direct users instead of 18.
+- A Rust type use only resolves to a type (struct, enum, trait, alias). It never binds to a function that shares the name, and an external type gets no edge.
+
+### Fixed: call edges (all tools)
+- Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
+- A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.
+- A call never resolves to a module or doc section of the same name (`review()` used to point at `pub mod review`).
+- A bare Rust call `f()` never resolves to a method, which needs `x.f()` or `Type::f()`.
+
 ## [0.7.0] - 2026-11-20
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
