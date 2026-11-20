@@ -58,7 +58,9 @@ pub fn registry_file_path() -> Option<PathBuf> {
     Some(home.join(".trackertop").join("projects.json"))
 }
 
-fn canonical_path_string(path: &Path) -> String {
+/// The key a project is stored under in `projects.json`. Anything that needs to find a
+/// project again (e.g. the UI selecting a freshly indexed one) must use this same function.
+pub fn canonical_path_string(path: &Path) -> String {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // Strip the Windows verbatim prefix (keeping UNC shares intact) for display and dedup
     crate::fsutil::display_path(&canon)

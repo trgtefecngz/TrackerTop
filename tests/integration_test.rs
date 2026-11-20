@@ -130,10 +130,11 @@ function Start-Pipeline {
     assert!(stats.total_symbols >= 15);
     assert!(stats.total_edges >= 10);
 
-    // Second incremental run should skip all unchanged files
+    // Second incremental run must not re-parse unchanged files. (Files written within the
+    // last second may be re-hashed once: their mtime is not trusted yet, see racy handling.)
     let stats2 = index_repository(root, false).unwrap();
     assert_eq!(stats2.parsed_files, 0);
-    assert_eq!(stats2.skipped_files, 6);
+    assert_eq!(stats2.total_files, 6);
 
     // Query via TrackerEngine & verify MCP JSON-RPC responses
     let engine = TrackerEngine::new(root);
@@ -616,4 +617,62 @@ fn edge_set(root: &std::path::Path) -> Vec<(String, String, String)> {
         .collect();
     rows.sort();
     rows
+}
+
+/// "Racy" edit: two same-size versions of a file written within the same second share the
+/// same (second-resolution) mtime and size. The second version must still be indexed.
+#[test]
+fn same_second_same_size_edit_is_not_missed() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    let stamp = std::time::SystemTime::now();
+    let write_with_stamp = |body: &str| {
+        std::fs::write(&file, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    };
+
+    write_with_stamp("pub fn alpha_v1() -> u8 { 1 }\n");
+    index_repository(root, false).unwrap();
+    // Same length, same mtime: invisible to a naive mtime+size fast path
+    write_with_stamp("pub fn omega_v2() -> u8 { 2 }\n");
+    let second = index_repository(root, false).unwrap();
+
+    assert_eq!(second.parsed_files, 1, "racy edit was skipped");
+    let engine = TrackerEngine::new(root);
+    assert!(
+        !engine
+            .read_symbol("omega_v2", false, 0)
+            .unwrap()
+            .text
+            .contains("Symbol not found")
+    );
+}
+
+/// Once a file's mtime is safely in the past, the mtime+size fast path skips it again
+/// (racy handling must not turn into re-hashing every file on every run).
+#[test]
+fn settled_files_take_the_fast_path_again() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    std::fs::write(&file, "pub fn settled_fn() -> u8 { 1 }\n").unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+
+    index_repository(root, false).unwrap();
+    let again = index_repository(root, false).unwrap();
+    assert_eq!(again.skipped_files, 1);
 }

@@ -116,14 +116,25 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
         Ok(()) => Ok(()),
         // Another installer published its (equally pristine) copy first: keep that one.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) if bak.exists() => Ok(()),
-        // No hard-link support on this filesystem.
-        Err(_) => std::fs::rename(&tmp, &bak),
+        // No hard-link support on this filesystem (e.g. FAT32).
+        Err(_) => publish_by_locked_rename(&tmp, &bak).map(|_| ()),
     };
     let _ = std::fs::remove_file(&tmp);
     published.with_context(|| format!("failed to publish backup {}", bak.display()))?;
     sync_parent_dir(&bak);
     Ok(Some(bak))
+}
+
+/// Fallback publish for filesystems without hard links. `rename` replaces an existing
+/// destination, so the exists-check and the rename run under an OS lock: two racing
+/// installers can never both publish. Returns whether THIS call published the backup.
+fn publish_by_locked_rename(tmp: &Path, bak: &Path) -> Result<bool> {
+    let _guard = FileLock::acquire(bak, Duration::from_secs(3))?;
+    if bak.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(tmp, bak)?;
+    Ok(true)
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
@@ -293,11 +304,50 @@ mod tests {
             for _ in 0..8 {
                 s.spawn(|| backup_file(&p).unwrap());
             }
-            // Meanwhile the config changes; only a copy of "original" may ever be kept
-            s.spawn(|| std::fs::write(&p, "original").unwrap());
+            // Meanwhile the config is rewritten (atomically, like TrackerTop itself does, so
+            // no copy can observe a truncated file); only "original" may ever be kept.
+            s.spawn(|| atomic_write(&p, b"original").unwrap());
         });
         let bak = dir.path().join("settings.json.trackertop.bak");
         assert_eq!(std::fs::read_to_string(bak).unwrap(), "original");
+    }
+
+    #[test]
+    fn fallback_publish_lets_exactly_one_racer_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("cfg.json.trackertop.bak");
+        let tmps: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let t = dir
+                    .path()
+                    .join(format!("cfg.json.trackertop.bak.tmp-test-{i}"));
+                std::fs::write(&t, format!("copy-{i}")).unwrap();
+                t
+            })
+            .collect();
+
+        let winners: Vec<usize> = std::thread::scope(|s| {
+            let handles: Vec<_> = tmps
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let bak = &bak;
+                    s.spawn(move || publish_by_locked_rename(t, bak).unwrap().then_some(i))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(winners.len(), 1, "exactly one racer may publish");
+        let kept = std::fs::read_to_string(&bak).unwrap();
+        assert_eq!(
+            kept,
+            format!("copy-{}", winners[0]),
+            "winner's copy was overwritten"
+        );
     }
 
     #[test]

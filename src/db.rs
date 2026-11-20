@@ -138,9 +138,14 @@ impl Database {
         Ok(())
     }
 
-    /// Monotonic counter bumped every time files/symbols/edges change. Lets long-lived
-    /// processes (MCP server, GUI) know whether an in-memory graph is still current, even
-    /// when ANOTHER process performed the re-index.
+    /// Monotonic counter bumped each time a complete, consistent graph is committed (by
+    /// [`Database::replace_edges_if_current`], in the same transaction as the edges). Lets
+    /// long-lived processes (MCP server, GUI) know whether an in-memory graph is still
+    /// current, even when ANOTHER process performed the re-index.
+    ///
+    /// File/symbol writes alone do not bump it: until the matching edge rebuild commits,
+    /// the previous graph stays the newest consistent one (the stale state is tracked by
+    /// `files_generation` vs `edges_generation` and repaired by the next index run).
     pub fn index_generation(&self) -> Result<i64> {
         read_meta(&self.conn, "index_generation")
     }

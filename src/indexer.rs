@@ -76,6 +76,43 @@ fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
 
 use crate::fsutil::display_path;
 
+/// Sentinel stored instead of a real mtime when it cannot be trusted; it never equals a real
+/// file's mtime, so the next run re-reads (and re-hashes) that file.
+const UNTRUSTED_MTIME: i64 = 0;
+
+/// The mtime to record for a file that was stat'ed (`mtime`, `size`) and then read
+/// (`read_len` bytes). Returns [`UNTRUSTED_MTIME`] when the fast path could later skip a real
+/// change ("racy" files, same idea as git's racy-git handling):
+/// - the file changed while it was being read (size/mtime differ afterwards, or the bytes
+///   read do not match the stat'ed size): the stored hash may describe a half-written file;
+/// - its mtime is within a second of now: a further same-size edit in the same second would
+///   keep the same (second-resolution) mtime and size and be skipped forever.
+fn trustworthy_mtime(abs_path: &Path, mtime: i64, size: u64, read_len: u64) -> i64 {
+    if read_len != size {
+        return UNTRUSTED_MTIME;
+    }
+    let Ok(after) = std::fs::metadata(abs_path) else {
+        return UNTRUSTED_MTIME;
+    };
+    let mtime_after = after
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(UNTRUSTED_MTIME);
+    if after.len() != size || mtime_after != mtime {
+        return UNTRUSTED_MTIME;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if (now - 1..=now + 1).contains(&mtime) {
+        return UNTRUSTED_MTIME;
+    }
+    mtime
+}
+
 /// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
 /// Only new or changed files (detected via mtime + blake3 hash) are re-parsed.
 pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
@@ -167,11 +204,13 @@ pub fn index_repository_with_registry(
         .filter_map(|cand| {
             let source = std::fs::read_to_string(&cand.abs_path).ok()?;
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+            let recorded_mtime =
+                trustworthy_mtime(&cand.abs_path, cand.mtime, cand.size, source.len() as u64);
 
             if let Some(prev) = existing.get(&cand.rel_path)
                 && prev.hash == hash
             {
-                return Some(Outcome::Touched(cand.rel_path, cand.mtime, cand.size));
+                return Some(Outcome::Touched(cand.rel_path, recorded_mtime, cand.size));
             }
 
             let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
@@ -181,7 +220,7 @@ pub fn index_repository_with_registry(
                 path: cand.rel_path,
                 language: cand.extractor.id().to_string(),
                 hash,
-                mtime_secs: cand.mtime,
+                mtime_secs: recorded_mtime,
                 size_bytes: cand.size,
                 line_count,
                 token_count,

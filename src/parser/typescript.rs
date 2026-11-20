@@ -247,9 +247,11 @@ impl LanguageExtractor for TypeScriptExtractor {
             {
                 // `it("works", runCase);` has no body of its own: searching for the next `{`
                 // would swallow the following functions/classes into this test. Judge the
-                // line without a trailing `// comment`, and keep Allman-style tests whose
-                // `{` opens on the next line (`it("x", function ()` + newline + `{`).
-                let code = strip_ts_line_comment(trimmed).trim_end();
+                // line by its code only (no comments, no string contents), and keep
+                // Allman-style tests whose `{` opens on the next line
+                // (`it("x", function ()` + newline + `{`).
+                let code_view = ts_code_only(trimmed);
+                let code = code_view.trim_end();
                 let next_line_opens_body = lines[i + 1..]
                     .iter()
                     .map(|l| l.trim())
@@ -349,31 +351,50 @@ fn extract_class_methods(
     }
 }
 
-/// Removes a trailing `// comment`, ignoring `//` inside '…', "…" and `…` string literals
-/// (e.g. `it("fetches http://x", run); // note` keeps the URL).
-fn strip_ts_line_comment(line: &str) -> &str {
+/// The structural "code only" view of one line, used to judge where a statement ends:
+/// - `// …` and `/* … */` comments are removed (comment text, including quotes inside it,
+///   cannot affect the result);
+/// - the contents of '…', "…" and `…` string literals are dropped (the quotes are kept), so
+///   braces, `//` or `;` inside strings (`it("parses {x}", run);`) are not seen as code.
+///
+/// An unterminated `/*` hides the rest of the line, like the real lexer would.
+fn ts_code_only(line: &str) -> String {
     let bytes = line.as_bytes();
-    let mut quote: Option<u8> = None;
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        match quote {
-            Some(q) => {
-                if b == b'\\' {
-                    i += 1; // skip the escaped character
-                } else if b == q {
-                    quote = None;
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                // Skip to the closing `*/`, or to the end of the line
+                let close = line[i + 2..].find("*/").map(|p| i + 2 + p + 2);
+                match close {
+                    Some(next) => i = next,
+                    None => break,
+                }
+                continue;
+            }
+            b'"' | b'\'' | b'`' => {
+                out.push(b);
+                i += 1;
+                while i < bytes.len() && bytes[i] != b {
+                    if bytes[i] == b'\\' {
+                        i += 1; // skip the escaped character
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    out.push(b); // closing quote
                 }
             }
-            None => match b {
-                b'"' | b'\'' | b'`' => quote = Some(b),
-                b'/' if bytes.get(i + 1) == Some(&b'/') => return &line[..i],
-                _ => {}
-            },
+            _ => out.push(b),
         }
         i += 1;
     }
-    line
+    // Only ASCII bytes were removed/kept around multi-byte chars inside strings or comments,
+    // and multi-byte sequences outside them are copied whole, so this is valid UTF-8.
+    String::from_utf8(out).unwrap_or_default()
 }
 
 fn strip_ts_modifiers(mut s: &str) -> (String, &str) {
@@ -614,12 +635,38 @@ mod tests {
     }
 
     #[test]
-    fn line_comment_stripping_respects_string_literals() {
+    fn code_only_view_ignores_comments_and_string_contents() {
+        assert_eq!(ts_code_only("it(\"a//b\", f); // c"), "it(\"\", f); ");
+        assert_eq!(ts_code_only("x = `//`;"), "x = ``;");
+        assert_eq!(ts_code_only("f('it\\'s'); //x"), "f(''); ");
+        assert_eq!(ts_code_only("it(\"parses {x}\", f);"), "it(\"\", f);");
         assert_eq!(
-            strip_ts_line_comment("it(\"a//b\", f); // c"),
-            "it(\"a//b\", f); "
+            ts_code_only("it(\"x\", f); /* it's done */"),
+            "it(\"\", f); "
         );
-        assert_eq!(strip_ts_line_comment("x = `//`;"), "x = `//`;");
-        assert_eq!(strip_ts_line_comment("f('it\\'s'); //x"), "f('it\\'s'); ");
+        assert_eq!(ts_code_only("a /* c */ b"), "a  b");
+        assert_eq!(ts_code_only("it(\"x\", f); /* open"), "it(\"\", f); ");
+        assert_eq!(ts_code_only("s = \"çğü{\"; t"), "s = \"\"; t");
+    }
+
+    #[test]
+    fn one_line_test_with_brace_in_name_or_block_comment_does_not_swallow() {
+        for header in [
+            "it(\"parses {x}\", runCase);",
+            "it(\"plain\", runCase); /* it's shared */",
+        ] {
+            let src = format!("{header}\nfunction helperAfter() {{\n  return 1;\n}}\n");
+            let out = parse(&src);
+            let test = out
+                .symbols
+                .iter()
+                .find(|s| s.kind == SymbolKind::Test)
+                .unwrap();
+            assert_eq!(test.end_line, 1, "test swallowed following code: {header}");
+            assert!(
+                out.symbols.iter().any(|s| s.name == "helperAfter"),
+                "{header}"
+            );
+        }
     }
 }
