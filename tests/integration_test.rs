@@ -880,3 +880,29 @@ fn lookups_distinguish_not_indexed_from_not_found() {
         "{batch}"
     );
 }
+
+#[test]
+fn outlines_state_whether_spans_come_from_a_syntax_tree() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn precise() {}\n").unwrap();
+    std::fs::write(root.join("src/a.ts"), "export function tsFn() {}\n").unwrap();
+    std::fs::write(
+        root.join("run.ps1"),
+        "function Invoke-Thing {\n  Write-Host 1\n}\n",
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+    for path in ["src/lib.rs", "src/a.ts"] {
+        let out = engine.file_outline(path, 800).unwrap().text;
+        assert!(out.contains("; tree-sitter)"), "{out}");
+    }
+    let ps = engine.file_outline("run.ps1", 800).unwrap().text;
+    assert!(ps.contains("heuristic extractor"), "{ps}");
+    let sym = engine.read_symbol("Invoke-Thing", false, 800).unwrap().text;
+    assert!(sym.contains("Span: heuristic extractor"), "{sym}");
+    let precise = engine.read_symbol("precise", false, 800).unwrap().text;
+    assert!(!precise.contains("Span:"), "{precise}");
+}

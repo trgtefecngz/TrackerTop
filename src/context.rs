@@ -274,11 +274,12 @@ impl TrackerEngine {
         };
 
         let mut out = format!(
-            "# OUTLINE {} ({}, {} lines, {} full tok)\n",
+            "# OUTLINE {} ({}, {} lines, {} full tok; {})\n",
             file.path,
             default_registry().display_name_for(&file.language),
             file.line_count,
-            file.token_count
+            file.token_count,
+            default_registry().extractor_quality(&file.language)
         );
 
         let mut syms: Vec<&Symbol> = cg
@@ -358,6 +359,12 @@ impl TrackerEngine {
             sym.start_line,
             sym.end_line
         );
+        if let Some(f) = cg.files.get(&sym.file_path) {
+            let quality = default_registry().extractor_quality(&f.language);
+            if quality != "tree-sitter" {
+                out.push_str(&format!("Span: {quality}\n"));
+            }
+        }
         if !sym.doc_summary.is_empty() {
             out.push_str(&format!("Doc: {}\n", sym.doc_summary));
         }

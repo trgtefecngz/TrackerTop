@@ -23,6 +23,10 @@ impl LanguageExtractor for HtmlExtractor {
         &["html", "htm"]
     }
 
+    fn is_syntax_tree(&self) -> bool {
+        true
+    }
+
     fn color_hex(&self) -> &'static str {
         "#38bdf8"
     }

@@ -35,6 +35,10 @@ impl LanguageExtractor for TypeScriptExtractor {
         &["ts", "tsx", "js", "jsx", "mjs", "cjs"]
     }
 
+    fn is_syntax_tree(&self) -> bool {
+        true
+    }
+
     fn color_hex(&self) -> &'static str {
         "#60a5fa"
     }

@@ -23,6 +23,10 @@ impl LanguageExtractor for RustExtractor {
         &["rs"]
     }
 
+    fn is_syntax_tree(&self) -> bool {
+        true
+    }
+
     fn color_hex(&self) -> &'static str {
         "#fb923c"
     }
