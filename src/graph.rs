@@ -672,7 +672,7 @@ fn detect_file_communities(
     label_of
 }
 
-fn infer_community_label(files: &[String]) -> String {
+pub(crate) fn infer_community_label(files: &[String]) -> String {
     if files.len() == 1 {
         return files[0].clone();
     }
@@ -681,9 +681,11 @@ fn infer_community_label(files: &[String]) -> String {
         let dir = f.rsplit_once('/').map(|(d, _)| d).unwrap_or("root");
         *dir_counts.entry(dir).or_insert(0) += 1;
     }
+    // Ties are broken by the lexicographically smallest directory so the label is the same on
+    // every run (HashMap iteration order alone would make it random).
     dir_counts
         .into_iter()
-        .max_by_key(|(_, c)| *c)
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(d, _)| d.to_string())
         .unwrap_or_else(|| "cluster".to_string())
 }

@@ -9,6 +9,7 @@ pub mod indexer;
 pub mod install;
 pub mod mcp;
 pub mod model;
+pub mod nested;
 pub mod parser;
 pub mod playbook;
 pub mod registry;
