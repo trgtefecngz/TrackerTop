@@ -1,28 +1,83 @@
 //! Small filesystem helpers shared by the installer and the global project registry.
 
 use anyhow::{Context, Result, bail};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-/// Writes `contents` to `path` atomically: data goes to a sibling temp file first and is
-/// then renamed over the target, so readers never observe a half-written file.
+/// Writes `contents` to `path` atomically: data goes to a sibling temp file, is flushed to
+/// disk (`fsync`), and is then renamed over the target. Readers never observe a half-written
+/// file, and the target never ends up empty: after a crash it holds either the old or the new
+/// contents. On Unix the parent directory is fsynced too, so the rename itself is durable
+/// (on Windows/NTFS the rename is a journaled metadata operation). A failed write never leaves
+/// the temp file lying around.
+///
+/// Replacing an existing file keeps its Unix permission bits (a `chmod 600` config stays
+/// private; the temp copy is owner-only until then). A new file gets the usual umask default,
+/// like `std::fs::write`.
+///
+/// If `path` is a symlink (e.g. a config managed from a dotfiles repo), the file it points to
+/// is rewritten and the link is left in place; renaming over the link itself would silently
+/// turn it into a regular file and leave the real config unchanged.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let resolved;
+    let path = if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        resolved = std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "{} is a symlink whose target cannot be resolved; nothing was written",
+                path.display()
+            )
+        })?;
+        resolved.as_path()
+    } else {
+        path
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    // pid + per-process counter: unique even when several threads write the same target.
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = sibling_path(path, &format!("tmp-{}-{seq}", std::process::id()));
-    std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let replacing = path.is_file();
+    let (tmp, mut file) = create_temp_sibling(path, "tmp", replacing)
+        .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
+    let written = (|| -> std::io::Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        if replacing {
+            copy_unix_permissions(path, &tmp)?;
+        }
+        Ok(())
+    })();
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("failed to write {}", tmp.display()));
+    }
     if let Err(e) = rename_with_retry(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to replace {}", path.display()));
     }
+    sync_parent_dir(path);
     Ok(())
 }
+
+/// Makes a completed rename durable on Unix. Best effort: some filesystems reject fsync on
+/// directories, and the new contents are already in place either way.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    // A bare relative name ("cfg.json") has an empty parent: that is the current directory.
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -47,14 +102,134 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Copies an existing file to `<name>.trackertop.bak` before TrackerTop modifies it.
+///
+/// Guarantees:
+/// - **First backup wins:** an existing `.trackertop.bak` is never overwritten, so running the
+///   installer again cannot replace the pristine pre-TrackerTop copy with a modified one.
+/// - **Never partial:** the copy is written and fsynced under a temporary name and only then
+///   published as `.trackertop.bak`, so a crash mid-copy cannot leave a truncated file that a
+///   later run would trust as the recovery copy.
+/// - **Race-free publish:** publishing uses a hard link, which fails if the backup already
+///   exists, so two racing installers cannot both "win". On filesystems without hard links
+///   (e.g. FAT32) it falls back to an exists-check + rename.
 pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
     if !path.is_file() {
         return Ok(None);
     }
     let bak = sibling_path(path, "trackertop.bak");
-    std::fs::copy(path, &bak)
-        .with_context(|| format!("failed to back up {} to {}", path.display(), bak.display()))?;
+    if std::fs::symlink_metadata(&bak).is_ok() {
+        ensure_backup_is_regular_file(&bak)?;
+        return Ok(Some(bak));
+    }
+
+    let (tmp, mut out) = create_temp_sibling(path, "trackertop.bak.tmp", true)
+        .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
+    let copied = (|| -> std::io::Result<()> {
+        let mut src = File::open(path)?;
+        std::io::copy(&mut src, &mut out)?;
+        out.sync_all()?;
+        copy_unix_permissions(path, &tmp)
+    })();
+    drop(out);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e)
+            .with_context(|| format!("failed to back up {} to {}", path.display(), bak.display()));
+    }
+
+    let published = publish_backup(&tmp, &bak, true);
+    let _ = std::fs::remove_file(&tmp);
+    published.with_context(|| format!("failed to publish backup {}", bak.display()))?;
+    // Whoever published (us or a racing installer), it must be a real file.
+    ensure_backup_is_regular_file(&bak)?;
+    sync_parent_dir(&bak);
     Ok(Some(bak))
+}
+
+/// A directory, symlink or other non-file at the backup path is NOT a recovery copy:
+/// refuse, so callers abort before modifying the config instead of proceeding unprotected.
+fn ensure_backup_is_regular_file(bak: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(bak)
+        .with_context(|| format!("failed to inspect backup {}", bak.display()))?;
+    if !meta.file_type().is_file() {
+        bail!(
+            "{} exists but is not a regular file, so it cannot serve as a backup. \
+             Move it away and run the installer again; nothing was changed",
+            bak.display()
+        );
+    }
+    Ok(())
+}
+
+/// Publishes the finished temp copy as the backup unless one already exists. Returns whether
+/// THIS call published it.
+///
+/// The whole check-and-publish runs under one OS lock, so it is race-free whichever way a
+/// racer publishes: with a hard link (no-clobber on its own) or, on filesystems without hard
+/// links (e.g. FAT32), with `rename`, which would otherwise replace an existing backup.
+fn publish_backup(tmp: &Path, bak: &Path, try_hard_link: bool) -> Result<bool> {
+    let _guard = FileLock::acquire(bak, Duration::from_secs(3))?;
+    if std::fs::symlink_metadata(bak).is_ok() {
+        return Ok(false);
+    }
+    if try_hard_link {
+        match std::fs::hard_link(tmp, bak) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(_) => {} // no hard-link support: fall through to rename
+        }
+    }
+    std::fs::rename(tmp, bak)?;
+    Ok(true)
+}
+
+/// Creates a brand-new temp file next to `path` (`<name>.<label>-<pid>-<n>`).
+///
+/// `create_new` refuses any existing entry at that name, including a planted symlink, so the
+/// write can never be redirected elsewhere; on a collision (a leftover from a crashed run
+/// with a reused pid) the next counter value is tried. With `private`, the file is created
+/// owner-only on Unix so a private config's contents are never exposed while being copied.
+fn create_temp_sibling(
+    path: &Path,
+    label: &str,
+    private: bool,
+) -> std::io::Result<(PathBuf, File)> {
+    const ATTEMPTS: usize = 64;
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = sibling_path(path, &format!("{label}-{}-{seq}", std::process::id()));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        match opts.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("no free temp file name")))
+}
+
+/// Gives the backup the same Unix permission bits as the original config, so a backup is
+/// never more readable than the file it protects. (On Windows the copy inherits the folder's
+/// ACLs, like the original next to it.)
+fn copy_unix_permissions(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+    }
+    Ok(())
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
@@ -65,46 +240,54 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{name}.{suffix}"))
 }
 
-/// Cross-process advisory lock implemented with an exclusive lock file.
-/// The lock file is removed when the guard is dropped.
+/// Human-readable form of a canonicalized path: strips the Windows verbatim prefix
+/// (`\\?\C:\x` -> `C:\x`) and restores UNC shares (`\\?\UNC\srv\share` -> `\\srv\share`).
+pub fn display_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+}
+
+/// Cross-process exclusive lock on `<path>.lock`, held through an operating-system file lock
+/// (`LockFileEx` on Windows, `flock` on Unix).
+///
+/// The OS releases the lock when the holder exits or crashes, so there is no stale-lock
+/// detection to get wrong: no spinning on undeletable lock files, no two processes breaking
+/// the same stale lock, and no holder deleting a lock someone else now owns. The lock file
+/// itself stays on disk and is reused.
 pub struct FileLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl FileLock {
-    /// Tries to acquire `<path>.lock` for up to `wait`. Lock files older than `stale_after`
-    /// (left behind by a crashed process) are broken automatically.
-    pub fn acquire(path: &Path, wait: Duration, stale_after: Duration) -> Result<Self> {
+    /// Waits up to `wait` for the lock.
+    pub fn acquire(path: &Path, wait: Duration) -> Result<Self> {
         let lock_path = sibling_path(path, "lock");
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open lock {}", lock_path.display()))?;
         let deadline = Instant::now() + wait;
         loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let is_stale = std::fs::metadata(&lock_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .is_some_and(|age| age > stale_after);
-                    if is_stale {
-                        let _ = std::fs::remove_file(&lock_path);
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         bail!("timed out waiting for lock {}", lock_path.display());
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(e) => {
+                Err(TryLockError::Error(e)) => {
                     return Err(e)
-                        .with_context(|| format!("failed to create lock {}", lock_path.display()));
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
                 }
             }
         }
@@ -113,7 +296,8 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Closing the handle releases it too; unlock explicitly to release it immediately.
+        let _ = self.file.unlock();
     }
 }
 
@@ -133,13 +317,193 @@ mod tests {
     }
 
     #[test]
+    fn failed_atomic_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Target is a non-empty directory: the final rename must fail
+        let target = dir.path().join("cfg.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"x").unwrap();
+
+        assert!(atomic_write(&target, b"data").is_err());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["cfg.json".to_string()], "temp file left behind");
+    }
+
+    #[test]
+    fn backup_keeps_the_first_pristine_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "original").unwrap();
+        let bak = backup_file(&p).unwrap().unwrap();
+        std::fs::write(&p, "modified by trackertop").unwrap();
+        backup_file(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(bak).unwrap(), "original");
+    }
+
+    #[test]
     fn file_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("reg.json");
-        let long = Duration::from_secs(60);
-        let guard = FileLock::acquire(&p, Duration::from_millis(10), long).unwrap();
-        assert!(FileLock::acquire(&p, Duration::from_millis(50), long).is_err());
+        let guard = FileLock::acquire(&p, Duration::from_millis(10)).unwrap();
+        assert!(FileLock::acquire(&p, Duration::from_millis(50)).is_err());
         drop(guard);
-        assert!(FileLock::acquire(&p, Duration::from_millis(10), long).is_ok());
+        assert!(FileLock::acquire(&p, Duration::from_millis(10)).is_ok());
+    }
+
+    #[test]
+    fn leftover_lock_file_from_a_crashed_process_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("reg.json");
+        // Old-style lock file nobody holds an OS lock on
+        std::fs::write(dir.path().join("reg.json.lock"), b"").unwrap();
+        assert!(FileLock::acquire(&p, Duration::from_millis(10)).is_ok());
+    }
+
+    #[test]
+    fn interrupted_backup_is_never_trusted_as_the_pristine_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "original config").unwrap();
+        // Leftover from a run that crashed mid-copy: truncated data under a temp name only
+        std::fs::write(
+            dir.path().join("settings.json.trackertop.bak.tmp-999-0"),
+            "orig",
+        )
+        .unwrap();
+        let bak = dir.path().join("settings.json.trackertop.bak");
+        assert!(
+            !bak.exists(),
+            "a crash before publishing must leave no .bak at all"
+        );
+
+        backup_file(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "original config");
+        // This run's own temp file is cleaned up
+        let own_tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .any(|n| n.contains(&format!("tmp-{}-", std::process::id())));
+        assert!(!own_tmp_left);
+    }
+
+    #[test]
+    fn racing_backups_never_overwrite_the_first_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "original").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| backup_file(&p).unwrap());
+            }
+            // Meanwhile the config is rewritten (atomically, like TrackerTop itself does, so
+            // no copy can observe a truncated file); only "original" may ever be kept.
+            s.spawn(|| atomic_write(&p, b"original").unwrap());
+        });
+        let bak = dir.path().join("settings.json.trackertop.bak");
+        assert_eq!(std::fs::read_to_string(bak).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_is_never_more_readable_than_the_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secrets.json");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bak = backup_file(&p).unwrap().unwrap();
+        let mode = std::fs::metadata(bak).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-settings.json");
+        let link = dir.path().join("settings.json");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        atomic_write(&link, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_permissions_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&p, br#"{"hooks":{}}"#).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a private config must stay private after a rewrite"
+        );
+    }
+
+    /// Racers mixing both publish strategies (hard link and the rename fallback, e.g. a
+    /// transient hard-link failure) must still produce exactly one winner.
+    #[test]
+    fn mixed_publish_strategies_let_exactly_one_racer_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("cfg.json.trackertop.bak");
+        let tmps: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let t = dir
+                    .path()
+                    .join(format!("cfg.json.trackertop.bak.tmp-test-{i}"));
+                std::fs::write(&t, format!("copy-{i}")).unwrap();
+                t
+            })
+            .collect();
+
+        let winners: Vec<usize> = std::thread::scope(|s| {
+            let handles: Vec<_> = tmps
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let bak = &bak;
+                    s.spawn(move || publish_backup(t, bak, i % 2 == 0).unwrap().then_some(i))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(winners.len(), 1, "exactly one racer may publish");
+        let kept = std::fs::read_to_string(&bak).unwrap();
+        assert_eq!(
+            kept,
+            format!("copy-{}", winners[0]),
+            "winner's copy was overwritten"
+        );
+    }
+
+    #[test]
+    fn display_path_strips_verbatim_prefixes() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\Users\me")), r"C:\Users\me");
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share")),
+            r"\\server\share"
+        );
+        assert_eq!(display_path(Path::new("/home/me")), "/home/me");
     }
 }

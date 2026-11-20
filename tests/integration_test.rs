@@ -130,10 +130,32 @@ function Start-Pipeline {
     assert!(stats.total_symbols >= 15);
     assert!(stats.total_edges >= 10);
 
-    // Second incremental run should skip all unchanged files
+    // Second incremental run must not re-parse unchanged files. (Files written within the
+    // last second may be re-hashed once: their mtime is not trusted yet, see racy handling.)
     let stats2 = index_repository(root, false).unwrap();
     assert_eq!(stats2.parsed_files, 0);
-    assert_eq!(stats2.skipped_files, 6);
+
+    // Once every file's mtime is safely in the past, the mtime+size fast path must skip ALL
+    // of them again (no re-hashing of unchanged files on every run).
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    let files = walk_files(root);
+    assert_eq!(
+        files.len(),
+        6,
+        "fixture must contain exactly the 6 indexed files"
+    );
+    for entry in files {
+        std::fs::File::options()
+            .write(true)
+            .open(&entry)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    index_repository(root, false).unwrap(); // records the now-trustworthy mtimes
+    let stats3 = index_repository(root, false).unwrap();
+    assert_eq!(stats3.parsed_files, 0);
+    assert_eq!(stats3.skipped_files, 6);
 
     // Query via TrackerEngine & verify MCP JSON-RPC responses
     let engine = TrackerEngine::new(root);
@@ -469,12 +491,13 @@ fn touched_but_unchanged_files_are_not_rehashed_every_run() {
     let first = index_repository(root, false).unwrap();
     assert_eq!(first.total_files, 1);
 
-    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    // Touch to a different, settled (past) timestamp without changing the content
+    let touched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
     std::fs::File::options()
         .write(true)
         .open(&file)
         .unwrap()
-        .set_modified(later)
+        .set_modified(touched_at)
         .unwrap();
 
     let touched = index_repository(root, false).unwrap();
@@ -489,4 +512,212 @@ fn touched_but_unchanged_files_are_not_rehashed_every_run() {
         again.skipped_files, 1,
         "refreshed mtime lets the fast path skip the file"
     );
+}
+
+fn write_call_graph_repo(root: &std::path::Path, extra_fns: usize) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let mut b = String::from("pub fn leaf() -> u8 { 1 }\n");
+    for k in 0..extra_fns {
+        b.push_str(&format!("pub fn extra_{k}() -> u8 {{ leaf() }}\n"));
+    }
+    std::fs::write(root.join("src/b.rs"), b).unwrap();
+    let mut a = String::from("mod b;\npub fn root() -> u8 { b::leaf() }\n");
+    for k in 0..extra_fns {
+        a.push_str(&format!("pub fn call_{k}() -> u8 {{ b::extra_{k}() }}\n"));
+    }
+    std::fs::write(root.join("src/lib.rs"), a).unwrap();
+}
+
+/// A run that wrote file rows but died before rebuilding edges must not lose those edges
+/// forever: the next (otherwise no-op) run notices and repairs them.
+#[test]
+fn interrupted_edge_rebuild_is_repaired_on_next_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_call_graph_repo(root, 3);
+    let full = index_repository(root, false).unwrap();
+    assert!(full.total_edges > 0);
+
+    // Simulate the crash window: file rows advanced, edges wiped and never rebuilt.
+    // White-box on purpose; the row-count asserts make a schema change fail loudly here
+    // instead of silently turning this into a no-op test.
+    let conn = open_existing_index(root);
+    let bumped = conn
+        .execute(
+            "UPDATE meta SET value = value + 1 WHERE key = 'files_generation'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        bumped, 1,
+        "meta.files_generation row missing: schema changed?"
+    );
+    let wiped = conn.execute("DELETE FROM edges", []).unwrap();
+    assert_eq!(
+        wiped, full.total_edges,
+        "edges table out of sync with stats"
+    );
+    drop(conn);
+
+    let repaired = index_repository(root, false).unwrap();
+    assert_eq!(repaired.parsed_files, 0);
+    assert_eq!(repaired.total_edges, full.total_edges);
+}
+
+/// End-to-end convergence check: several indexers racing while files change must end on the
+/// same edge set as a clean full rebuild.
+///
+/// Scheduling decides which interleavings actually happen, so this test alone does not prove
+/// the stale-snapshot guard; `db::tests::stale_edge_snapshot_cannot_overwrite_newer_state`
+/// (deterministic) and `interrupted_edge_rebuild_is_repaired_on_next_run` do.
+#[test]
+fn concurrent_indexers_never_leave_stale_edges() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_call_graph_repo(&root, 1);
+    index_repository(&root, false).unwrap();
+
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let root = root.clone();
+            let errors = &errors;
+            s.spawn(move || {
+                for _ in 0..6 {
+                    if let Err(e) = index_repository(&root, false) {
+                        errors.lock().unwrap().push(format!("{e:#}"));
+                    }
+                }
+            });
+        }
+        for n in 2..8 {
+            write_call_graph_repo(&root, n);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    // The only acceptable failure is the documented retryable "index kept changing" error.
+    for e in errors.into_inner().unwrap() {
+        assert!(
+            e.contains("kept changing"),
+            "unexpected indexing error: {e}"
+        );
+    }
+
+    let settled = index_repository(&root, false).unwrap();
+    let settled_edges = edge_set(&root);
+    let clean = index_repository(&root, true).unwrap();
+    assert_eq!(settled.total_symbols, clean.total_symbols);
+    // Compare the actual edges, not just their count: a wrong set with the same size must fail.
+    assert_eq!(settled_edges, edge_set(&root));
+    assert_eq!(settled_edges.len(), clean.total_edges);
+}
+
+/// Opens the index of an already-indexed repo WITHOUT creating it, so a moved or renamed
+/// store fails with a clear message instead of an empty database and "no such table".
+fn open_existing_index(root: &std::path::Path) -> rusqlite::Connection {
+    let path = root.join(".trackertop/index.db");
+    assert!(
+        path.is_file(),
+        "index store not found at {}",
+        path.display()
+    );
+    rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap()
+}
+
+/// Sorted `(source, target, kind)` rows of the persisted edge set.
+fn edge_set(root: &std::path::Path) -> Vec<(String, String, String)> {
+    let conn = open_existing_index(root);
+    let mut stmt = conn
+        .prepare("SELECT source_id, target_id, kind FROM edges")
+        .unwrap();
+    let mut rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// "Racy" edit: two same-size versions of a file written within the same second share the
+/// same (second-resolution) mtime and size. The second version must still be indexed.
+#[test]
+fn same_second_same_size_edit_is_not_missed() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    // A stamp that is never "in the past" during this test, so both writes are racy no matter
+    // how slow the machine is (a stamp of `now` would depend on the first index finishing
+    // within a second).
+    let stamp = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let write_with_stamp = |body: &str| {
+        std::fs::write(&file, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    };
+
+    write_with_stamp("pub fn alpha_v1() -> u8 { 1 }\n");
+    index_repository(root, false).unwrap();
+    // Same length, same mtime: invisible to a naive mtime+size fast path
+    write_with_stamp("pub fn omega_v2() -> u8 { 2 }\n");
+    let second = index_repository(root, false).unwrap();
+
+    assert_eq!(second.parsed_files, 1, "racy edit was skipped");
+    let engine = TrackerEngine::new(root);
+    assert!(
+        !engine
+            .read_symbol("omega_v2", false, 0)
+            .unwrap()
+            .text
+            .contains("Symbol not found")
+    );
+}
+
+/// Once a file's mtime is safely in the past, the mtime+size fast path skips it again
+/// (racy handling must not turn into re-hashing every file on every run).
+#[test]
+fn settled_files_take_the_fast_path_again() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    std::fs::write(&file, "pub fn settled_fn() -> u8 { 1 }\n").unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+
+    index_repository(root, false).unwrap();
+    let again = index_repository(root, false).unwrap();
+    assert_eq!(again.skipped_files, 1);
+}
+
+/// All regular files under `root`, excluding TrackerTop's own `.trackertop/` store.
+fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n == ".trackertop") {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }

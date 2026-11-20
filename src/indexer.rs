@@ -74,9 +74,45 @@ fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn display_path(path: &Path) -> String {
-    let s = path.display().to_string();
-    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+use crate::fsutil::display_path;
+
+/// Sentinel stored instead of a real mtime when it cannot be trusted; it never equals a real
+/// file's mtime, so the next run re-reads (and re-hashes) that file.
+const UNTRUSTED_MTIME: i64 = 0;
+
+/// The mtime to record for a file that was stat'ed (`mtime`, `size`) and then read
+/// (`read_len` bytes). Returns [`UNTRUSTED_MTIME`] when the fast path could later skip a real
+/// change ("racy" files, same idea as git's racy-git handling):
+/// - the file changed while it was being read (size/mtime differ afterwards, or the bytes
+///   read do not match the stat'ed size): the stored hash may describe a half-written file;
+/// - its mtime is not at least a second in the past (git's racy rule): a further same-size
+///   edit in the same second would keep the same (second-resolution) mtime and size and be
+///   skipped forever. Future mtimes (clock skew, archives) are included; they are simply
+///   re-hashed until they are in the past, which costs a hash but can never miss an edit.
+fn trustworthy_mtime(abs_path: &Path, mtime: i64, size: u64, read_len: u64) -> i64 {
+    if read_len != size {
+        return UNTRUSTED_MTIME;
+    }
+    let Ok(after) = std::fs::metadata(abs_path) else {
+        return UNTRUSTED_MTIME;
+    };
+    let mtime_after = after
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(UNTRUSTED_MTIME);
+    if after.len() != size || mtime_after != mtime {
+        return UNTRUSTED_MTIME;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if mtime >= now - 1 {
+        return UNTRUSTED_MTIME;
+    }
+    mtime
 }
 
 /// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
@@ -140,7 +176,11 @@ pub fn index_repository_with_registry(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // Never take the fast path on an untrusted record: an mtime that cannot be read here
+        // falls back to the same value as the UNTRUSTED_MTIME sentinel and would otherwise
+        // "match" it.
         if let Some(prev) = existing.get(&rel_path)
+            && prev.mtime_secs != UNTRUSTED_MTIME
             && prev.mtime_secs == mtime
             && prev.size_bytes == size
         {
@@ -170,11 +210,13 @@ pub fn index_repository_with_registry(
         .filter_map(|cand| {
             let source = std::fs::read_to_string(&cand.abs_path).ok()?;
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+            let recorded_mtime =
+                trustworthy_mtime(&cand.abs_path, cand.mtime, cand.size, source.len() as u64);
 
             if let Some(prev) = existing.get(&cand.rel_path)
                 && prev.hash == hash
             {
-                return Some(Outcome::Touched(cand.rel_path, cand.mtime, cand.size));
+                return Some(Outcome::Touched(cand.rel_path, recorded_mtime, cand.size));
             }
 
             let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
@@ -184,7 +226,7 @@ pub fn index_repository_with_registry(
                 path: cand.rel_path,
                 language: cand.extractor.id().to_string(),
                 hash,
-                mtime_secs: cand.mtime,
+                mtime_secs: recorded_mtime,
                 size_bytes: cand.size,
                 line_count,
                 token_count,
@@ -207,7 +249,6 @@ pub fn index_repository_with_registry(
 
     let parsed_files = parsed_batch.len();
     let deleted_files = deleted.len();
-    let changed = force || parsed_files > 0 || deleted_files > 0 || existing.is_empty();
 
     if deleted_files > 0 {
         db.delete_files(&deleted)?;
@@ -216,27 +257,55 @@ pub fn index_repository_with_registry(
         db.upsert_parsed_files(&parsed_batch)?;
     }
 
+    // Edges lag behind the file rows when a previous run crashed or lost a race between its
+    // upsert and its edge rebuild: repair them even if THIS run saw no file changes.
+    let edges_stale = db.edges_generation()? != db.files_generation()?;
+    let changed =
+        force || parsed_files > 0 || deleted_files > 0 || existing.is_empty() || edges_stale;
+
     let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
-        let all_files = db.load_all_files()?;
-        let all_symbols = db.load_all_symbols()?;
-        let all_refs = db.load_all_raw_refs()?;
-        let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
-        let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
-        resolved.extend(crate::git::extract_cochange_edges(
-            repo_root,
-            &indexed_paths,
-        ));
-        let edge_count = resolved.len();
-        db.replace_edges(&resolved)?;
-        let generation = db.bump_index_generation()?;
-        let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
-        (
-            all_files.len(),
-            all_symbols.len(),
-            edge_count,
-            tokens,
-            generation,
-        )
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempt = 0;
+        // Git co-change edges depend only on git history and the set of indexed paths, not on
+        // file contents, so a retry reuses them unless the path set itself changed.
+        let mut cochange: Option<(HashSet<String>, Vec<Edge>)> = None;
+        loop {
+            attempt += 1;
+            // Snapshot marker first, then the data: if another process writes file rows
+            // in between, `replace_edges_if_current` refuses and we re-resolve.
+            let built_from = db.files_generation()?;
+            let all_files = db.load_all_files()?;
+            let all_symbols = db.load_all_symbols()?;
+            let all_refs = db.load_all_raw_refs()?;
+            let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
+            let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
+            let reusable = cochange
+                .as_ref()
+                .is_some_and(|(paths, _)| *paths == indexed_paths);
+            if !reusable {
+                let edges = crate::git::extract_cochange_edges(repo_root, &indexed_paths);
+                cochange = Some((indexed_paths, edges));
+            }
+            if let Some((_, edges)) = &cochange {
+                resolved.extend(edges.iter().cloned());
+            }
+            if let Some(committed) = db.replace_edges_if_current(&resolved, built_from)? {
+                let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
+                break (
+                    all_files.len(),
+                    all_symbols.len(),
+                    committed.edge_count,
+                    tokens,
+                    committed.generation,
+                );
+            }
+            if attempt >= MAX_ATTEMPTS {
+                bail!(
+                    "the index kept changing while rebuilding the graph \
+                     (another TrackerTop process is indexing); please retry"
+                );
+            }
+        }
     } else {
         // Nothing changed: aggregate in SQL instead of loading every row.
         let (files, symbols, edges, tokens) = db.index_totals()?;

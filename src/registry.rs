@@ -58,11 +58,12 @@ pub fn registry_file_path() -> Option<PathBuf> {
     Some(home.join(".trackertop").join("projects.json"))
 }
 
-fn canonical_path_string(path: &Path) -> String {
+/// The key a project is stored under in `projects.json`. Anything that needs to find a
+/// project again (e.g. the UI selecting a freshly indexed one) must use this same function.
+pub fn canonical_path_string(path: &Path) -> String {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let s = canon.to_string_lossy().to_string();
-    // Strip Windows extended-length prefix `\\?\` for clean display and dedup
-    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    // Strip the Windows verbatim prefix (keeping UNC shares intact) for display and dedup
+    crate::fsutil::display_path(&canon)
 }
 
 fn is_temp_path(path: &Path) -> bool {
@@ -73,8 +74,6 @@ fn is_temp_path(path: &Path) -> bool {
 
 /// How long to wait for another TrackerTop process holding the registry lock.
 const REGISTRY_LOCK_WAIT: Duration = Duration::from_secs(3);
-/// A lock file older than this was left behind by a crashed process and is broken.
-const REGISTRY_LOCK_STALE: Duration = Duration::from_secs(30);
 /// An already-registered project only gets `last_seen` rewritten this often, so the
 /// per-query re-index of every MCP call does not rewrite `projects.json` each time.
 const LAST_SEEN_REFRESH_SECS: i64 = 300;
@@ -104,7 +103,54 @@ fn parse_registry(text: &str) -> Option<RegistryFile> {
     if text.trim().is_empty() {
         return Some(RegistryFile::default());
     }
-    serde_json::from_str(text).ok()
+    let mut reg: RegistryFile = serde_json::from_str(text).ok()?;
+    migrate_legacy_keys(&mut reg);
+    Some(reg)
+}
+
+/// v0.5.0 stored network-share projects as `UNC\server\share` (it only stripped `\\?\`);
+/// the key is now `\\server\share`. Rewrite old keys and, if both forms ended up in the
+/// file, keep the most recently seen entry so a project never shows up twice.
+fn migrate_legacy_keys(reg: &mut RegistryFile) {
+    for p in &mut reg.projects {
+        if let Some(rest) = p.path.strip_prefix(r"UNC\") {
+            p.path = format!(r"\\{rest}");
+        }
+    }
+    let mut kept: Vec<ProjectEntry> = Vec::with_capacity(reg.projects.len());
+    for p in reg.projects.drain(..) {
+        match kept
+            .iter_mut()
+            .find(|k| same_project_path(&k.path, &p.path))
+        {
+            Some(k) => {
+                // Keep the most recent entry, but never lose when the project was first added
+                let first_added = if is_earlier(&p.added_at, &k.added_at) {
+                    p.added_at.clone()
+                } else {
+                    k.added_at.clone()
+                };
+                if is_earlier(&k.last_seen, &p.last_seen) {
+                    *k = p;
+                }
+                k.added_at = first_added;
+            }
+            None => kept.push(p),
+        }
+    }
+    reg.projects = kept;
+}
+
+/// Compares two RFC 3339 timestamps by the instant they denote, not their text
+/// (`01:00+01:00` is earlier than `00:30+00:00`). Unparseable values fall back to text order.
+fn is_earlier(a: &str, b: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(a),
+        DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(x), Ok(y)) => x < y,
+        _ => a < b,
+    }
 }
 
 /// Reads the registry. Missing/empty file -> empty registry; I/O error or corruption -> `Err`.
@@ -141,7 +187,7 @@ fn load_registry_file() -> RegistryFile {
 /// for manual recovery) instead of being silently overwritten. An I/O error while reading
 /// (e.g. antivirus briefly holding the file) aborts the update and leaves the file alone.
 fn update_registry_at(path: &Path, mutate: impl FnOnce(&mut RegistryFile) -> bool) -> Result<()> {
-    let _lock = FileLock::acquire(path, REGISTRY_LOCK_WAIT, REGISTRY_LOCK_STALE)?;
+    let _lock = FileLock::acquire(path, REGISTRY_LOCK_WAIT)?;
     let parsed = read_registry_text(path)?.map(|text| parse_registry(&text));
     let mut reg = match parsed {
         None => RegistryFile::default(),
@@ -395,5 +441,33 @@ mod tests {
             same_project_path("/home/me/Repo", "/home/me/repo"),
             cfg!(any(windows, target_os = "macos"))
         );
+    }
+
+    #[test]
+    fn legacy_unc_keys_are_migrated_and_deduplicated() {
+        let text = r#"{"projects":[
+            {"path":"UNC\\srv\\share\\app","name":"app","added_at":"2026-09-01T00:00:00+00:00","last_seen":"2026-11-01T00:00:00+00:00"},
+            {"path":"\\\\srv\\share\\app","name":"app","added_at":"2026-11-02T00:00:00+00:00","last_seen":"2026-11-02T00:00:00+00:00"},
+            {"path":"C:\\work\\other","name":"other","added_at":"2026-10-01T00:00:00+00:00","last_seen":"2026-11-01T00:00:00+00:00"}
+        ]}"#;
+        let reg = parse_registry(text).unwrap();
+        let paths: Vec<&str> = reg.projects.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, vec![r"\\srv\share\app", r"C:\work\other"]);
+        // Newest activity wins, but the original "added" date survives the merge
+        assert_eq!(reg.projects[0].last_seen, "2026-11-02T00:00:00+00:00");
+        assert_eq!(reg.projects[0].added_at, "2026-09-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn timestamps_compare_by_instant_not_text() {
+        // Textually larger, but 30 minutes EARLIER in real time
+        assert!(is_earlier(
+            "2026-11-02T01:00:00+01:00",
+            "2026-11-02T00:30:00+00:00"
+        ));
+        assert!(!is_earlier(
+            "2026-11-02T00:30:00+00:00",
+            "2026-11-02T01:00:00+01:00"
+        ));
     }
 }

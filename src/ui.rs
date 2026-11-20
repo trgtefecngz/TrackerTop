@@ -235,11 +235,8 @@ impl TrackerTopApp {
                         stats.total_files, stats.total_symbols, stats.total_edges, stats.elapsed_ms
                     ),
                     select_path: if select_after {
-                        let s = std::fs::canonicalize(&repo_path)
-                            .unwrap_or(repo_path)
-                            .to_string_lossy()
-                            .to_string();
-                        Some(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+                        // Same key the registry stores, by construction
+                        Some(crate::registry::canonical_path_string(&repo_path))
                     } else {
                         None
                     },

@@ -5,7 +5,7 @@ use crate::model::{
 use crate::tokens::estimate_usd_saved;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -138,28 +138,28 @@ impl Database {
         Ok(())
     }
 
-    /// Monotonic counter bumped every time files/symbols/edges change. Lets long-lived
-    /// processes (MCP server, GUI) know whether an in-memory graph is still current, even
-    /// when ANOTHER process performed the re-index.
+    /// Monotonic counter bumped each time a complete, consistent graph is committed (by
+    /// [`Database::replace_edges_if_current`], in the same transaction as the edges). Lets
+    /// long-lived processes (MCP server, GUI) know whether an in-memory graph is still
+    /// current, even when ANOTHER process performed the re-index.
+    ///
+    /// File/symbol writes alone do not bump it: until the matching edge rebuild commits,
+    /// the previous graph stays the newest consistent one (the stale state is tracked by
+    /// `files_generation` vs `edges_generation` and repaired by the next index run).
     pub fn index_generation(&self) -> Result<i64> {
-        let v = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'index_generation'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        Ok(v)
+        read_meta(&self.conn, "index_generation")
     }
 
-    pub fn bump_index_generation(&self) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES('index_generation', 1)
-             ON CONFLICT(key) DO UPDATE SET value = value + 1",
-            [],
-        )?;
-        self.index_generation()
+    /// Bumped (inside the same transaction) whenever file/symbol/raw-ref rows change.
+    pub fn files_generation(&self) -> Result<i64> {
+        read_meta(&self.conn, "files_generation")
+    }
+
+    /// The `files_generation` the current edge set was built from. When it lags behind
+    /// `files_generation` (a crash or a lost race between upsert and edge rebuild), the next
+    /// index run rebuilds the edges.
+    pub fn edges_generation(&self) -> Result<i64> {
+        read_meta(&self.conn, "edges_generation")
     }
 
     /// Cheap aggregate counts used when nothing changed (avoids loading every row).
@@ -234,6 +234,7 @@ impl Database {
                 stmt.execute(params![p])?;
             }
         }
+        bump_meta(&tx, "files_generation")?;
         tx.commit()?;
         Ok(())
     }
@@ -310,24 +311,46 @@ impl Database {
                 }
             }
         }
+        bump_meta(&tx, "files_generation")?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn replace_edges(&mut self, edges: &[Edge]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM edges", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO edges (source_id, target_id, kind, weight)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for e in edges {
-                stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
-            }
+    /// Replaces the edge set ONLY if no file rows changed since `built_from`
+    /// (`files_generation` read before loading the data the edges were resolved from).
+    ///
+    /// Without this check, a slower concurrent indexer could overwrite a newer, complete
+    /// edge set with one resolved from a stale snapshot, and since later runs see no file
+    /// changes, the missing edges would never come back. Returns `None` when the snapshot
+    /// is stale; the caller re-resolves and retries. On success it also records
+    /// `edges_generation` and bumps `index_generation`, all in one transaction, and returns
+    /// what THIS transaction committed (not a later read another process could change).
+    pub fn replace_edges_if_current(
+        &mut self,
+        edges: &[Edge],
+        built_from: i64,
+    ) -> Result<Option<CommittedGraph>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A read error must abort, never be mistaken for a matching generation.
+        let current = read_meta(&tx, "files_generation")?;
+        if current != built_from {
+            return Ok(None); // dropping `tx` rolls back
         }
+        let edge_count = write_edges(&tx, edges)?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('edges_generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [built_from],
+        )?;
+        bump_meta(&tx, "index_generation")?;
+        let generation = read_meta(&tx, "index_generation")?;
         tx.commit()?;
-        Ok(())
+        Ok(Some(CommittedGraph {
+            generation,
+            edge_count,
+        }))
     }
 
     pub fn load_all_files(&self) -> Result<Vec<FileRecord>> {
@@ -602,9 +625,126 @@ impl Database {
     }
 }
 
+/// Reads a `meta` counter. A missing row is 0 (fresh or pre-0.5.1 index); any real SQLite
+/// error is returned instead of being turned into a value that could match by accident.
+fn read_meta(conn: &Connection, key: &str) -> Result<i64> {
+    let v = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get::<_, i64>(0)
+        })
+        .optional()?;
+    Ok(v.unwrap_or(0))
+}
+
+/// Increments a `meta` counter. Pass a `Transaction` to make it part of that transaction.
+fn bump_meta(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, 1)
+         ON CONFLICT(key) DO UPDATE SET value = value + 1",
+        [key],
+    )?;
+    Ok(())
+}
+
+/// Replaces all edges and returns how many rows are actually stored. Duplicate edges
+/// (same source, target and kind) collapse into one row, so `edges.len()` can over-count;
+/// the strongest weight is kept, independent of the order the resolver produced them in.
+fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<usize> {
+    conn.execute("DELETE FROM edges", [])?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO edges (source_id, target_id, kind, weight)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(source_id, target_id, kind)
+         DO UPDATE SET weight = max(weight, excluded.weight)",
+    )?;
+    for e in edges {
+        stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
+    }
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+    Ok(stored as usize)
+}
+
+/// Result of a successful [`Database::replace_edges_if_current`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedGraph {
+    /// `index_generation` this commit produced.
+    pub generation: i64,
+    /// Edge rows actually stored (after de-duplication).
+    pub edge_count: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_rec(path: &str, hash: &str) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: hash.to_string(),
+            mtime_secs: 1,
+            size_bytes: 1,
+            line_count: 1,
+            token_count: 1,
+        }
+    }
+
+    #[test]
+    fn stale_edge_snapshot_cannot_overwrite_newer_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut slow = Database::open_for_repo(repo.path()).unwrap();
+        let mut fast = Database::open_for_repo(repo.path()).unwrap();
+
+        // `slow` snapshots the files, then `fast` writes newer file rows
+        let snapshot = slow.files_generation().unwrap();
+        fast.upsert_parsed_files(&[(file_rec("src/a.rs", "h1"), vec![], vec![])])
+            .unwrap();
+
+        assert!(
+            slow.replace_edges_if_current(&[], snapshot)
+                .unwrap()
+                .is_none()
+        );
+        assert_ne!(
+            slow.edges_generation().unwrap(),
+            slow.files_generation().unwrap(),
+            "edges are marked stale so the next index run rebuilds them"
+        );
+
+        let fresh = slow.files_generation().unwrap();
+        let committed = slow.replace_edges_if_current(&[], fresh).unwrap().unwrap();
+        assert_eq!(slow.edges_generation().unwrap(), fresh);
+        assert_eq!(committed.generation, slow.index_generation().unwrap());
+    }
+
+    #[test]
+    fn reported_edge_count_matches_stored_rows_after_dedup() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut db = Database::open_for_repo(repo.path()).unwrap();
+        let e = |s: &str, weight: f32| Edge {
+            source_id: s.to_string(),
+            target_id: "t".to_string(),
+            kind: EdgeKind::Calls,
+            weight,
+        };
+        // Duplicate (source, target, kind) collapses into a single stored row that keeps the
+        // strongest weight, whichever order the duplicates arrive in.
+        let edges = [e("a", 2.0), e("a", 0.5), e("b", 1.0)];
+        let built_from = db.files_generation().unwrap();
+        let committed = db
+            .replace_edges_if_current(&edges, built_from)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.edge_count, 2);
+        assert_eq!(db.index_totals().unwrap().2, 2);
+        let a = db
+            .load_all_edges()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.source_id == "a")
+            .unwrap();
+        assert_eq!(a.weight, 2.0);
+    }
 
     #[test]
     fn cache_dir_gets_self_ignoring_gitignore() {
