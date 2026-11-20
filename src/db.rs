@@ -16,6 +16,9 @@ pub struct Database {
 
 impl Database {
     pub fn open_for_repo(repo_root: &Path) -> Result<Self> {
+        // Single choke point: no command (index, query, stats, ...) may create
+        // `.trackertop/` in the home directory, a drive root or a bare Desktop.
+        crate::indexer::ensure_indexable_root(repo_root)?;
         let dir = repo_root.join(".trackertop");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
