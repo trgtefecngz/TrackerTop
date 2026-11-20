@@ -74,10 +74,7 @@ fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn display_path(path: &Path) -> String {
-    let s = path.display().to_string();
-    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
-}
+use crate::fsutil::display_path;
 
 /// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
 /// Only new or changed files (detected via mtime + blake3 hash) are re-parsed.
@@ -207,7 +204,6 @@ pub fn index_repository_with_registry(
 
     let parsed_files = parsed_batch.len();
     let deleted_files = deleted.len();
-    let changed = force || parsed_files > 0 || deleted_files > 0 || existing.is_empty();
 
     if deleted_files > 0 {
         db.delete_files(&deleted)?;
@@ -216,27 +212,46 @@ pub fn index_repository_with_registry(
         db.upsert_parsed_files(&parsed_batch)?;
     }
 
+    // Edges lag behind the file rows when a previous run crashed or lost a race between its
+    // upsert and its edge rebuild: repair them even if THIS run saw no file changes.
+    let edges_stale = db.edges_generation()? != db.files_generation()?;
+    let changed =
+        force || parsed_files > 0 || deleted_files > 0 || existing.is_empty() || edges_stale;
+
     let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
-        let all_files = db.load_all_files()?;
-        let all_symbols = db.load_all_symbols()?;
-        let all_refs = db.load_all_raw_refs()?;
-        let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
-        let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
-        resolved.extend(crate::git::extract_cochange_edges(
-            repo_root,
-            &indexed_paths,
-        ));
-        let edge_count = resolved.len();
-        db.replace_edges(&resolved)?;
-        let generation = db.bump_index_generation()?;
-        let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
-        (
-            all_files.len(),
-            all_symbols.len(),
-            edge_count,
-            tokens,
-            generation,
-        )
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            // Snapshot marker first, then the data: if another process writes file rows
+            // in between, `replace_edges_if_current` refuses and we re-resolve.
+            let built_from = db.files_generation()?;
+            let all_files = db.load_all_files()?;
+            let all_symbols = db.load_all_symbols()?;
+            let all_refs = db.load_all_raw_refs()?;
+            let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
+            let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
+            resolved.extend(crate::git::extract_cochange_edges(
+                repo_root,
+                &indexed_paths,
+            ));
+            if db.replace_edges_if_current(&resolved, built_from)? {
+                let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
+                break (
+                    all_files.len(),
+                    all_symbols.len(),
+                    resolved.len(),
+                    tokens,
+                    db.index_generation()?,
+                );
+            }
+            if attempt >= MAX_ATTEMPTS {
+                bail!(
+                    "the index kept changing while rebuilding the graph \
+                     (another TrackerTop process is indexing); please retry"
+                );
+            }
+        }
     } else {
         // Nothing changed: aggregate in SQL instead of loading every row.
         let (files, symbols, edges, tokens) = db.index_totals()?;

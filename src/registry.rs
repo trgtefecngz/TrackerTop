@@ -60,9 +60,8 @@ pub fn registry_file_path() -> Option<PathBuf> {
 
 fn canonical_path_string(path: &Path) -> String {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let s = canon.to_string_lossy().to_string();
-    // Strip Windows extended-length prefix `\\?\` for clean display and dedup
-    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    // Strip the Windows verbatim prefix (keeping UNC shares intact) for display and dedup
+    crate::fsutil::display_path(&canon)
 }
 
 fn is_temp_path(path: &Path) -> bool {
@@ -73,8 +72,6 @@ fn is_temp_path(path: &Path) -> bool {
 
 /// How long to wait for another TrackerTop process holding the registry lock.
 const REGISTRY_LOCK_WAIT: Duration = Duration::from_secs(3);
-/// A lock file older than this was left behind by a crashed process and is broken.
-const REGISTRY_LOCK_STALE: Duration = Duration::from_secs(30);
 /// An already-registered project only gets `last_seen` rewritten this often, so the
 /// per-query re-index of every MCP call does not rewrite `projects.json` each time.
 const LAST_SEEN_REFRESH_SECS: i64 = 300;
@@ -141,7 +138,7 @@ fn load_registry_file() -> RegistryFile {
 /// for manual recovery) instead of being silently overwritten. An I/O error while reading
 /// (e.g. antivirus briefly holding the file) aborts the update and leaves the file alone.
 fn update_registry_at(path: &Path, mutate: impl FnOnce(&mut RegistryFile) -> bool) -> Result<()> {
-    let _lock = FileLock::acquire(path, REGISTRY_LOCK_WAIT, REGISTRY_LOCK_STALE)?;
+    let _lock = FileLock::acquire(path, REGISTRY_LOCK_WAIT)?;
     let parsed = read_registry_text(path)?.map(|text| parse_registry(&text));
     let mut reg = match parsed {
         None => RegistryFile::default(),

@@ -490,3 +490,72 @@ fn touched_but_unchanged_files_are_not_rehashed_every_run() {
         "refreshed mtime lets the fast path skip the file"
     );
 }
+
+fn write_call_graph_repo(root: &std::path::Path, extra_fns: usize) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let mut b = String::from("pub fn leaf() -> u8 { 1 }\n");
+    for k in 0..extra_fns {
+        b.push_str(&format!("pub fn extra_{k}() -> u8 {{ leaf() }}\n"));
+    }
+    std::fs::write(root.join("src/b.rs"), b).unwrap();
+    let mut a = String::from("mod b;\npub fn root() -> u8 { b::leaf() }\n");
+    for k in 0..extra_fns {
+        a.push_str(&format!("pub fn call_{k}() -> u8 {{ b::extra_{k}() }}\n"));
+    }
+    std::fs::write(root.join("src/lib.rs"), a).unwrap();
+}
+
+/// A run that wrote file rows but died before rebuilding edges must not lose those edges
+/// forever: the next (otherwise no-op) run notices and repairs them.
+#[test]
+fn interrupted_edge_rebuild_is_repaired_on_next_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_call_graph_repo(root, 3);
+    let full = index_repository(root, false).unwrap();
+    assert!(full.total_edges > 0);
+
+    // Simulate the crash window: file rows advanced, edges wiped and never rebuilt
+    let conn = rusqlite::Connection::open(root.join(".trackertop/index.db")).unwrap();
+    conn.execute_batch(
+        "UPDATE meta SET value = value + 1 WHERE key = 'files_generation';
+         DELETE FROM edges;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let repaired = index_repository(root, false).unwrap();
+    assert_eq!(repaired.parsed_files, 0);
+    assert_eq!(repaired.total_edges, full.total_edges);
+}
+
+/// Several indexers racing while files change must converge on the same edge set as a
+/// clean full rebuild (previously a slow indexer could overwrite newer edges forever).
+#[test]
+fn concurrent_indexers_never_leave_stale_edges() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_call_graph_repo(&root, 1);
+    index_repository(&root, false).unwrap();
+
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let root = root.clone();
+            s.spawn(move || {
+                for _ in 0..6 {
+                    // Lost races surface as a retryable error, never as silent corruption
+                    let _ = index_repository(&root, false);
+                }
+            });
+        }
+        for n in 2..8 {
+            write_call_graph_repo(&root, n);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let settled = index_repository(&root, false).unwrap();
+    let clean = index_repository(&root, true).unwrap();
+    assert_eq!(settled.total_edges, clean.total_edges);
+    assert_eq!(settled.total_symbols, clean.total_symbols);
+}

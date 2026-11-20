@@ -245,7 +245,15 @@ impl LanguageExtractor for TypeScriptExtractor {
             if (trimmed.starts_with("test(") || trimmed.starts_with("it("))
                 && let Some(test_name) = extract_quoted_path(trimmed)
             {
-                let end_idx = find_brace_end(&lines, i);
+                // `it("works", runCase);` has no body of its own: searching for the next `{`
+                // would swallow the following functions/classes into this test.
+                let statement_ends_here =
+                    !trimmed.contains('{') && (trimmed.ends_with(';') || trimmed.ends_with(')'));
+                let end_idx = if statement_ends_here {
+                    i
+                } else {
+                    find_brace_end(&lines, i)
+                };
                 let block = lines[i..=end_idx].join("\n");
                 let sym_id = make_symbol_id(file_path, &test_name, line_no);
                 out.symbols.push(Symbol {
@@ -259,7 +267,8 @@ impl LanguageExtractor for TypeScriptExtractor {
                     end_line: end_idx + 1,
                     token_count: count_tokens(&block),
                     visibility: "test".to_string(),
-                    doc_summary: String::new(),
+                    // Consume the doc comment so it is not attached to the next symbol
+                    doc_summary: std::mem::take(&mut pending_doc),
                     parent_id: Some(file_id.clone()),
                 });
                 collect_ts_calls(
@@ -496,4 +505,50 @@ fn is_ts_builtin(name: &str) -> bool {
             | "it"
             | "test"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> ParsedFile {
+        TypeScriptExtractor.parse("src/a.test.ts", src).unwrap()
+    }
+
+    #[test]
+    fn one_line_test_call_does_not_swallow_following_functions() {
+        let src = "it(\"runs shared case\", runCase);\n\
+                   \n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse(src);
+        let test = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!((test.start_line, test.end_line), (1, 1));
+        assert!(
+            out.symbols.iter().any(|s| s.name == "helperAfter"),
+            "function after a one-line test must still be extracted"
+        );
+    }
+
+    #[test]
+    fn doc_comment_above_test_belongs_to_the_test() {
+        let src = "// verifies the happy path\n\
+                   test(\"happy\", () => {\n  expect(run()).toBe(1);\n});\n\
+                   function plain() {\n  return 2;\n}\n";
+        let out = parse(src);
+        let test = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert!(test.doc_summary.contains("happy path"));
+        let plain = out.symbols.iter().find(|s| s.name == "plain").unwrap();
+        assert!(
+            plain.doc_summary.is_empty(),
+            "comment leaked to the next symbol"
+        );
+    }
 }
