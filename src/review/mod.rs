@@ -7,6 +7,7 @@
 //! files correct, and gives later rules (broken references, new cycles, untested code)
 //! both graphs to work with.
 
+pub mod rules;
 pub mod snapshot;
 
 use crate::changes::{FileDiff, FileStatus, diff_since, git, touched};
@@ -75,6 +76,8 @@ pub struct ChangeSet {
     pub base_commit: String,
     pub files: Vec<FileChange>,
     pub symbols: Vec<ChangedSymbol>,
+    /// Rule findings, most severe first (empty until `rules::run_rules` runs).
+    pub findings: Vec<rules::Finding>,
 }
 
 impl ChangeSet {
@@ -250,6 +253,7 @@ pub fn collect_changes(
         base_commit: base_commit.to_string(),
         files,
         symbols,
+        findings: Vec::new(),
     }
 }
 
@@ -288,14 +292,9 @@ pub fn review(repo_root: &Path, base_ref: &str) -> Result<ChangeSet> {
     let head = CodeGraph::load(&Database::open_for_repo(repo_root)?)?;
     let (_, base) = snapshot::base_graph(repo_root, &base_commit)?;
     let (diffs, untracked) = diff_since(repo_root, &base_commit, &[])?;
-    Ok(collect_changes(
-        &diffs,
-        &untracked,
-        &head,
-        &base,
-        base_ref,
-        &base_commit,
-    ))
+    let mut cs = collect_changes(&diffs, &untracked, &head, &base, base_ref, &base_commit);
+    cs.findings = rules::run_rules(&cs, &head, &base, repo_root);
+    Ok(cs)
 }
 
 fn fmt_span(s: &Span) -> String {
@@ -328,6 +327,45 @@ pub fn render_markdown(cs: &ChangeSet) -> String {
         cs.count(Change::Added),
         cs.count(Change::Removed)
     ));
+
+    out.push_str(&format!("\n## Findings ({})\n", cs.findings.len()));
+    if cs.findings.is_empty() {
+        out.push_str("None from the rules that ran (broken-ref, impact, untested).\n");
+    }
+    // High and medium findings are always listed; low ones are capped, with the count of
+    // the rest stated (all of them are in `--format json`)
+    const LOW_SHOWN: usize = 15;
+    let lows = cs
+        .findings
+        .iter()
+        .filter(|f| f.severity == rules::Severity::Low)
+        .count();
+    let mut low_seen = 0usize;
+    for f in &cs.findings {
+        if f.severity == rules::Severity::Low {
+            low_seen += 1;
+            if low_seen > LOW_SHOWN {
+                continue;
+            }
+        }
+        out.push_str(&format!(
+            "- [{}] {} at {}: {}\n  id: `{}`\n",
+            f.severity.as_str(),
+            f.rule,
+            f.location,
+            f.message,
+            f.id
+        ));
+        for e in &f.evidence {
+            out.push_str(&format!("  - {e}\n"));
+        }
+    }
+    if lows > LOW_SHOWN {
+        out.push_str(&format!(
+            "({} more low-severity findings not shown; all are in `--format json`)\n",
+            lows - LOW_SHOWN
+        ));
+    }
 
     if !cs.symbols.is_empty() {
         out.push_str("\n## Changed symbols\n");

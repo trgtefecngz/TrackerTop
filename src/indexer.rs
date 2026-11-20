@@ -538,10 +538,27 @@ fn resolve_edges(
                 // A qualified Rust call (`Type::f`, `module::f`) binds only inside that type or
                 // module. Falling back to the bare name would tie `Stroke::new` (an external
                 // type) to whatever `new` this project defines: no edge beats a wrong edge.
-                let rust_qualified = src_file.ends_with(".rs")
-                    && matches!(rref.kind, EdgeKind::Calls | EdgeKind::Tests)
-                    && target.contains("::");
-                if rust_qualified {
+                let is_call = matches!(rref.kind, EdgeKind::Calls | EdgeKind::Tests);
+                let is_rust = src_file.ends_with(".rs");
+                let rust_qualified = is_rust && is_call && target.contains("::");
+                // `.name` is a Rust method call on a value (see `extract_callable_name`)
+                let method_call = is_rust && is_call && target.starts_with('.');
+                if method_call || (is_call && !target.contains("::")) {
+                    let name = target.trim_start_matches('.');
+                    let syms = by_name.get(name).map(Vec::as_slice).unwrap_or_default();
+                    let syms = if syms.is_empty() {
+                        by_name_ci
+                            .get(&name.to_ascii_lowercase())
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                    } else {
+                        syms
+                    };
+                    let candidates = call_candidates(syms, method_call, is_rust);
+                    if let Some(best) = pick_nearest_symbol(&candidates, src_file) {
+                        resolved_targets.push(best.id.clone());
+                    }
+                } else if rust_qualified {
                     if let Some(best) =
                         resolve_qualified_rust_call(target, src_file, &by_qname, &by_name)
                     {
@@ -620,6 +637,42 @@ fn join_rel(dir: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{dir}/{name}")
+    }
+}
+
+/// Which of the symbols sharing a callee's name a call can reach. Modules, doc sections and
+/// the like are never call targets (`pub mod review` must not catch a call to `review()`).
+/// A Rust method call on a value (`x.flush()`) only reaches methods: when the project has
+/// no method of that name it is a call into a library type, and gets no edge. For other
+/// languages, if no callable matches, the previous behaviour (any symbol) is kept.
+fn call_candidates<'a>(syms: &[&'a Symbol], method_call: bool, is_rust: bool) -> Vec<&'a Symbol> {
+    if method_call {
+        return syms
+            .iter()
+            .copied()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+    }
+    let callable: Vec<&Symbol> = syms
+        .iter()
+        .copied()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Macro
+                    | SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Class
+                    | SymbolKind::ShaderEntry
+            )
+        })
+        .collect();
+    if callable.is_empty() && !is_rust {
+        syms.to_vec()
+    } else {
+        callable
     }
 }
 

@@ -348,7 +348,9 @@ fn collect_calls(
                 if let Some(func) = child.child_by_field_name("function") {
                     let raw = node_text(func, bytes).trim();
                     let target = extract_callable_name(raw, self_ty);
-                    if is_interesting_call(&target) && seen.insert(target.clone()) {
+                    if is_interesting_call(target.trim_start_matches('.'))
+                        && seen.insert(target.clone())
+                    {
                         out.refs.push(RawReference {
                             source_symbol_id: source_id.to_string(),
                             target_name: target,
@@ -371,10 +373,69 @@ fn collect_calls(
                     }
                 }
             }
+            // Macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are unparsed token
+            // trees, not expressions: recognize `path(...)` and `.method(...)` in them, or
+            // most calls made by tests would be invisible
+            "token_tree" => {
+                for raw in token_tree_calls(child, bytes) {
+                    let target = extract_callable_name(&raw, self_ty);
+                    if is_interesting_call(target.trim_start_matches('.'))
+                        && seen.insert(target.clone())
+                    {
+                        out.refs.push(RawReference {
+                            source_symbol_id: source_id.to_string(),
+                            target_name: target,
+                            kind: edge_kind,
+                            line: child.start_position().row + 1,
+                        });
+                    }
+                }
+            }
             _ => {}
         }
         collect_calls(child, bytes, source_id, edge_kind, self_ty, seen, out);
     }
+}
+
+/// Callee paths written directly inside one token tree (nested trees are visited by the
+/// caller): an identifier path followed by a `( ... )` tree. `a::b::f(` gives `a::b::f`,
+/// `x.f(` gives `x.f`. A path after `fn`, `struct`, `enum` or `macro_rules!` is a
+/// definition, not a call.
+fn token_tree_calls(tt: Node, bytes: &[u8]) -> Vec<String> {
+    let mut cursor = tt.walk();
+    let toks: Vec<Node> = tt.children(&mut cursor).collect();
+    let mut out = Vec::new();
+    for i in 1..toks.len() {
+        if toks[i].kind() != "token_tree" || !node_text(toks[i], bytes).starts_with('(') {
+            continue;
+        }
+        let is_name = |n: Node| matches!(n.kind(), "identifier" | "self" | "super" | "crate");
+        if !is_name(toks[i - 1]) {
+            continue;
+        }
+        let mut start = i - 1;
+        while start >= 2 && toks[start - 1].kind() == "::" && is_name(toks[start - 2]) {
+            start -= 2;
+        }
+        if start >= 1
+            && matches!(
+                node_text(toks[start - 1], bytes),
+                "fn" | "struct" | "enum" | "union" | "trait" | "type"
+            )
+        {
+            continue;
+        }
+        let path: String = toks[start..i]
+            .iter()
+            .map(|n| node_text(*n, bytes))
+            .collect();
+        if start >= 1 && toks[start - 1].kind() == "." {
+            out.push(format!(".{path}"));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
 
 fn collect_type_refs(
@@ -411,14 +472,15 @@ fn clean_rust_type_name(raw: &str) -> String {
 
 /// Callee name of a call expression, keeping the one qualifier that says which symbol it is.
 /// The resolver binds a qualified name only inside that type or module, never by bare name:
-/// - `x.foo()` -> `foo` (a method on a value; the receiver's type is unknown)
+/// - `x.foo()` -> `.foo` (a method on a value; the receiver's type is unknown, so it
+///   resolves only to methods)
 /// - `Type::f()`, `a::Type::f()`, `Vec::<u8>::f()` -> `Type::f`; `Self::f()` -> `<impl type>::f`
 /// - `module::f()`, `a::module::f()` -> `module::f`
 /// - `crate::f()`, `super::f()`, `self::f()`, `f()` -> `f`
 fn extract_callable_name(raw: &str, self_ty: Option<&str>) -> String {
     let clean = strip_turbofish(raw);
     if let Some(dot) = clean.rfind('.') {
-        return clean[dot + 1..].trim().to_string();
+        return format!(".{}", clean[dot + 1..].trim());
     }
     let clean = clean.trim();
     if let Some((path, func)) = clean.rsplit_once("::") {
@@ -675,19 +737,49 @@ fn collect_asset_string_refs(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_callable_name, strip_turbofish};
+    use super::{RustExtractor, extract_callable_name, strip_turbofish};
+    use crate::model::EdgeKind;
+    use crate::parser::LanguageExtractor;
+
+    #[test]
+    fn calls_inside_macro_arguments_are_edges() {
+        let src = r#"
+fn helper(x: i32) -> i32 { x }
+#[test]
+fn checks_helper() {
+    assert_eq!(helper(1), 1);
+    assert!(store::load("a").is_ok(), "{}", fmt_it(2));
+    let v = vec![Store::open(3), item.flush()];
+}
+macro_rules! make { () => { fn generated() {} }; }
+"#;
+        let parsed = RustExtractor.parse("src/lib.rs", src).unwrap();
+        let mut tests: Vec<&str> = parsed
+            .refs
+            .iter()
+            .filter(|r| r.kind == EdgeKind::Tests)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        tests.sort();
+        // `is_ok` is a std method TrackerTop deliberately ignores; `generated` is a definition
+        assert_eq!(
+            tests,
+            [".flush", "Store::open", "fmt_it", "helper", "store::load"],
+            "{tests:?}"
+        );
+    }
 
     #[test]
     fn callee_names_keep_the_qualifier_that_identifies_them() {
         let cases = [
             ("foo", None, "foo"),
-            ("self.state.update", None, "update"),
+            ("self.state.update", None, ".update"),
             ("Stroke::new", None, "Stroke::new"),
             ("egui::Stroke::new", None, "Stroke::new"),
             ("Vec::<u8>::with_capacity", None, "Vec::with_capacity"),
             ("HashMap::<String, Vec<u8>>::new", None, "HashMap::new"),
             ("parse::<u32>", None, "parse"),
-            ("x.collect::<Vec<_>>", None, "collect"),
+            ("x.collect::<Vec<_>>", None, ".collect"),
             ("Self::new", Some("App"), "App::new"),
             ("Self::new", None, "Self::new"),
             ("std::fs::read", None, "fs::read"),

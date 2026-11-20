@@ -1455,3 +1455,85 @@ fn review_lists_changed_symbols_for_every_kind_of_change() {
     let again = review(&root, "main").unwrap();
     assert_eq!(again.symbols, cs.symbols);
 }
+
+/// Review rules on a fixture: `broken-ref` only when a surviving caller still calls the
+/// removed symbol (verified against the working tree), `impact` for a widely used
+/// function, `untested` for new code no test reaches. Stable ids.
+#[test]
+fn review_rules_flag_broken_refs_impact_and_untested_code() {
+    use trackertop::review::review;
+    use trackertop::review::rules::Severity;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let mut lib = String::from(
+        "pub struct Store;\nimpl Store {\n    pub fn open() -> Store { Store }\n}\n\
+         pub fn old_api() -> i32 { 1 }\npub fn renamed_away() -> i32 { 2 }\n\
+         pub fn hub(x: i32) -> i32 {\n    x + 1\n}\n",
+    );
+    for k in 0..10 {
+        lib.push_str(&format!("pub fn user_{k}() -> i32 {{ hub({k}) }}\n"));
+    }
+    lib.push_str(
+        "pub fn keeps_calling() -> i32 {\n    old_api() + 1\n}\n\
+         pub fn opens() {\n    let _s = Store::open();\n}\n\
+         pub fn was_updated() -> i32 {\n    renamed_away()\n}\n\
+         #[test]\nfn hub_works() {\n    assert_eq!(hub(1), 2);\n}\n",
+    );
+    std::fs::write(root.join("src/lib.rs"), &lib).unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+
+    let new_lib = lib
+        .replace("pub fn old_api() -> i32 { 1 }\n", "")
+        .replace("    pub fn open() -> Store { Store }\n", "")
+        .replace(
+            "pub fn renamed_away() -> i32 { 2 }\n",
+            "pub fn new_name() -> i32 { 2 }\n",
+        )
+        .replace("    renamed_away()\n", "    new_name()\n")
+        .replace("    x + 1\n", "    x + 2\n")
+        + "pub fn brand_new() -> i32 {\n    7\n}\n";
+    std::fs::write(root.join("src/lib.rs"), new_lib).unwrap();
+
+    let cs = review(root, "main").unwrap();
+    let ids: Vec<&str> = cs.findings.iter().map(|f| f.id.as_str()).collect();
+    let get = |id: &str| cs.findings.iter().find(|f| f.id == id);
+
+    let broken = get("broken-ref:src/lib.rs:old_api").unwrap_or_else(|| panic!("{ids:?}"));
+    assert_eq!(broken.severity, Severity::High);
+    assert!(
+        broken.evidence[0].starts_with("src/lib.rs:")
+            && broken.evidence[0].contains("old_api() + 1"),
+        "{:?}",
+        broken.evidence
+    );
+    let open = get("broken-ref:src/lib.rs:Store::open").unwrap_or_else(|| panic!("{ids:?}"));
+    assert_eq!(open.severity, Severity::High);
+    // Removed, but its only caller was updated: not a broken reference
+    assert!(
+        get("broken-ref:src/lib.rs:renamed_away").is_none(),
+        "{ids:?}"
+    );
+
+    let hub = get("impact:src/lib.rs:hub").unwrap_or_else(|| panic!("{ids:?}"));
+    assert!(hub.message.contains("10 direct"), "{}", hub.message);
+    assert!(
+        hub.evidence.iter().any(|e| e.contains("hub_works")),
+        "{:?}",
+        hub.evidence
+    );
+
+    assert!(get("untested:src/lib.rs:brand_new").is_some(), "{ids:?}");
+    // hub is reached by a test through `assert_eq!(hub(1), 2)`
+    assert!(get("untested:src/lib.rs:hub").is_none(), "{ids:?}");
+
+    // Stable: a second run yields the same ids
+    let again = review(root, "main").unwrap();
+    assert_eq!(
+        again.findings.iter().map(|f| &f.id).collect::<Vec<_>>(),
+        cs.findings.iter().map(|f| &f.id).collect::<Vec<_>>()
+    );
+}

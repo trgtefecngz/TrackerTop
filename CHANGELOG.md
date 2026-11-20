@@ -6,6 +6,15 @@ All notable changes to TrackerTop are documented here.
 
 ### Added: `trackertop review` (step 1)
 - `trackertop review [--base <ref>] [--format md|json]` lists which symbols your branch and uncommitted work added, removed or modified compared with the merge base, with `file:line` on both sides. The base is checked out and indexed separately under `.trackertop/review-base/`, without touching your branch, index or working tree.
+- Review findings, each with a stable id, severity, `file:line` and evidence:
+  - `broken-ref`: a removed symbol that a surviving caller still calls, verified against the working tree;
+  - `impact`: a modified function with many code dependents, with the tests that reach it;
+  - `untested`: new or modified code that no test reaches.
+
+### Fixed: call edges (all tools)
+- Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
+- A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.
+- A call never resolves to a module or doc section of the same name (`review()` used to point at `pub mod review`).
 
 ## [0.7.0] - 2026-11-20
 
