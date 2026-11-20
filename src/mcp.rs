@@ -203,7 +203,9 @@ fn dispatch_tool_call(
                 .get("note")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "Missing required argument `note`".to_string()))?;
-            engine.remember(target, note)
+            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("note");
+            let reason = args.get("reason").and_then(Value::as_str).unwrap_or("");
+            engine.remember_kind(target, note, kind, reason)
         }
         "recall" => {
             let query = args.get("query").and_then(Value::as_str);
@@ -413,12 +415,14 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "remember",
-            "description": "Saves a persistent architectural note attached to a symbol, file path, or 'project'. Automatically surfaced in future sessions when reading that target.",
+            "description": "Saves a persistent note attached to a symbol, file path, or 'project': an architectural rule (kind=note), a decision and why it was made (kind=decision), or a review lead / suspected bug that was checked and rejected (kind=dismissed). Shown automatically whenever that symbol or file is read in later sessions (read_symbol, read_symbols_batch, file_outline), so settled questions are not re-investigated. Also kept as Markdown in .trackertop/notes/.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Symbol name, file path, or 'project'" },
-                    "note": { "type": "string", "description": "Concise architectural rule, gotcha, or invariant" }
+                    "target": { "type": "string", "description": "Symbol name, qualified name, file path, or 'project'" },
+                    "note": { "type": "string", "description": "Concise rule, gotcha, decision, or the dismissed lead" },
+                    "kind": { "type": "string", "enum": ["note", "decision", "dismissed"], "description": "note (default), decision, or dismissed" },
+                    "reason": { "type": "string", "description": "Why (required for decision and dismissed)" }
                 },
                 "required": ["note"]
             }

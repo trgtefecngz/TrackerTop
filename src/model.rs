@@ -229,4 +229,27 @@ pub struct ProjectNote {
     pub target: String, // "project", file path, or symbol name
     pub content: String,
     pub created_at: String,
+    /// `note`, `decision` or `dismissed` (a review lead that was checked and rejected).
+    pub kind: String,
+    /// Why: required for decisions and dismissed leads, empty for plain notes.
+    pub reason: String,
+}
+
+impl ProjectNote {
+    /// One line as surfaced next to code: `Decision #3 [target]: text (why: reason)`.
+    pub fn display_line(&self) -> String {
+        let label = match self.kind.as_str() {
+            "decision" => "Decision",
+            "dismissed" => "Dismissed lead",
+            _ => "Note",
+        };
+        if self.reason.is_empty() {
+            format!("{label} #{} [{}]: {}", self.id, self.target, self.content)
+        } else {
+            format!(
+                "{label} #{} [{}]: {} (why: {})",
+                self.id, self.target, self.content, self.reason
+            )
+        }
+    }
 }

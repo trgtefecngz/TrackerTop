@@ -1085,3 +1085,58 @@ fn project_playbook_is_served_over_mcp() {
         "{text}"
     );
 }
+
+#[test]
+fn decisions_and_dismissed_leads_surface_when_code_is_read() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn run() {}\n\npub fn run_checks() {}\n",
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let saved = engine
+        .remember_kind(
+            "run",
+            "keep run() synchronous",
+            "decision",
+            "callers hold a lock",
+        )
+        .unwrap();
+    assert!(saved.contains("Saved decision #"), "{saved}");
+    engine
+        .remember_kind(
+            "src/lib.rs",
+            "possible race in run_checks",
+            "dismissed",
+            "single-threaded by design, verified",
+        )
+        .unwrap();
+    assert!(engine.remember_kind("run", "x", "decision", "").is_err());
+
+    let run = engine.read_symbol("run", false, 2_000).unwrap().text;
+    assert!(
+        run.contains("Decision #1 [run]: keep run() synchronous (why: callers hold a lock)"),
+        "{run}"
+    );
+    let checks = engine.read_symbol("run_checks", false, 2_000).unwrap().text;
+    assert!(
+        !checks.contains("keep run() synchronous"),
+        "note on `run` leaked: {checks}"
+    );
+    assert!(
+        checks.contains("Dismissed lead #2 [src/lib.rs]: possible race in run_checks"),
+        "{checks}"
+    );
+    let outline = engine.file_outline("src/lib.rs", 2_000).unwrap().text;
+    assert!(outline.contains("Decision #1 [run]"), "{outline}");
+    assert!(outline.contains("Dismissed lead #2"), "{outline}");
+
+    let recalled = engine.recall(Some("dismissed")).unwrap();
+    assert!(recalled.contains("# SAVED MEMORY NOTES (1)"), "{recalled}");
+    assert!(root.join(".trackertop/notes/00001-decision.md").is_file());
+}

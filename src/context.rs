@@ -224,7 +224,7 @@ impl TrackerEngine {
             out.push_str("\n## Saved Project Memory\n");
             out.push_str(&more_note(notes.len(), 6, "project notes"));
             for n in notes.into_iter().take(6) {
-                out.push_str(&format!("- [{}] {}\n", n.target, n.content));
+                out.push_str(&format!("- {}\n", n.display_line()));
             }
         }
 
@@ -293,6 +293,21 @@ impl TrackerEngine {
             })
             .unwrap_or_default();
         syms.sort_by_key(|s| s.start_line);
+
+        // Notes, decisions and dismissed leads on this file or any of its symbols
+        let mut targets: Vec<&str> = vec![file.path.as_str()];
+        for s in &syms {
+            targets.push(&s.name);
+            targets.push(&s.qualified_name);
+        }
+        if let Ok(notes) = db.find_notes_for_targets(&targets)
+            && !notes.is_empty()
+        {
+            out.push_str(&more_note(notes.len(), 6, "notes for this file"));
+            for n in notes.iter().take(6) {
+                out.push_str(&format!("{}\n", n.display_line()));
+            }
+        }
 
         for s in syms {
             let doc = if s.doc_summary.is_empty() {
@@ -373,7 +388,7 @@ impl TrackerEngine {
         {
             out.push_str(&more_note(notes.len(), 4, "memory notes"));
             for n in notes.into_iter().take(4) {
-                out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
+                out.push_str(&format!("{}\n", n.display_line()));
             }
         }
         out.push_str("```\n");
@@ -1075,7 +1090,7 @@ impl TrackerEngine {
             {
                 out.push_str(&more_note(notes.len(), 2, "memory notes"));
                 for n in notes.into_iter().take(2) {
-                    out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
+                    out.push_str(&format!("{}\n", n.display_line()));
                 }
             }
             out.push_str("```\n");
@@ -1290,30 +1305,56 @@ impl TrackerEngine {
         )
     }
 
-    /// 13. Persists an architectural memory note attached to a symbol, file, or `"project"`.
+    /// 13. Persists a note, decision or dismissed review lead attached to a symbol, file, or
+    ///     `"project"`. Decisions and dismissed leads require a reason.
     pub fn remember(&self, target: &str, note: &str) -> Result<String> {
-        let db = Database::open_for_repo(&self.repo_root)?;
-        let id = db.add_note(target, note)?;
-        Ok(format!(
-            "Saved memory note #{id} for `{}` — future sessions will see it automatically.",
-            if target.trim().is_empty() {
-                "project"
-            } else {
-                target.trim()
-            }
-        ))
+        self.remember_kind(target, note, "note", "")
     }
 
-    /// 14. Recalls saved architectural memory notes.
+    pub fn remember_kind(
+        &self,
+        target: &str,
+        note: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<String> {
+        let db = Database::open_for_repo(&self.repo_root)?;
+        let (id, mirror_err) = db.add_note_full(target, note, kind, reason)?;
+        let target = if target.trim().is_empty() {
+            "project"
+        } else {
+            target.trim()
+        };
+        let mut out = format!(
+            "Saved {kind} #{id} for `{target}`. It is shown automatically when that symbol or \
+             file is read (read_symbol, read_symbols_batch, file_outline) and in recall."
+        );
+        if let Some(e) = mirror_err {
+            out.push_str(&format!(
+                "\nWARNING: stored in the index DB, but the Markdown copy in .trackertop/notes/ \
+                 was not written ({e}); it will not survive an index rebuild."
+            ));
+        }
+        Ok(out)
+    }
+
+    /// 14. Recalls saved notes, decisions and dismissed leads (all of them; no silent cap).
     pub fn recall(&self, query: Option<&str>) -> Result<String> {
         let db = Database::open_for_repo(&self.repo_root)?;
         let notes = db.list_notes(query)?;
         if notes.is_empty() {
-            return Ok("No saved memory notes yet. Use `remember(target, note)` to store architectural facts.".to_string());
+            return Ok(match query {
+                Some(q) if !q.trim().is_empty() => {
+                    format!("No saved notes match `{q}` (searched target, text, reason and kind).")
+                }
+                _ => "No saved memory notes yet. Use `remember(target, note)` to store \
+                      architectural facts, decisions and dismissed review leads."
+                    .to_string(),
+            });
         }
         let mut out = format!("# SAVED MEMORY NOTES ({})\n", notes.len());
         for n in notes {
-            out.push_str(&format!("- #{} [{}]: {}\n", n.id, n.target, n.content));
+            out.push_str(&format!("- {}\n", n.display_line()));
         }
         Ok(out)
     }

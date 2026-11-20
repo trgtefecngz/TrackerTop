@@ -32,7 +32,11 @@ impl Database {
             );
         }
         let db_path = dir.join("index.db");
-        Self::open_path(&db_path)
+        let db = Self::open_path(&db_path)?;
+        // A rebuilt/deleted index DB gets its notes back from the Markdown copies. Best
+        // effort: a damaged note file must not block indexing.
+        let _ = db.import_notes_from_markdown();
+        Ok(db)
     }
 
     pub fn open_path(db_path: &Path) -> Result<Self> {
@@ -135,6 +139,32 @@ impl Database {
             );
             ",
         )?;
+        // v0.7: decision memory. Added in place so existing notes keep working (kind 'note').
+        self.ensure_column("notes", "kind", "TEXT NOT NULL DEFAULT 'note'")?;
+        self.ensure_column("notes", "reason", "TEXT NOT NULL DEFAULT ''")?;
+        Ok(())
+    }
+
+    /// Adds `column` to `table` if it does not exist yet (idempotent, safe on old DBs).
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let exists = {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            names.iter().any(|n| n == column)
+        };
+        if !exists {
+            match self.conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            ) {
+                Ok(_) => {}
+                // Another process added it between our check and the ALTER
+                Err(e) if e.to_string().contains("duplicate column") => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
 
@@ -561,6 +591,29 @@ impl Database {
     }
 
     pub fn add_note(&self, target: &str, content: &str) -> Result<i64> {
+        self.add_note_full(target, content, "note", "")
+            .map(|(id, _)| id)
+    }
+
+    /// Stores a note, decision or dismissed lead and mirrors it as Markdown in
+    /// `.trackertop/notes/` (readable, and re-imported if the index DB is rebuilt).
+    /// Returns the id and, if the Markdown mirror could not be written, why.
+    pub fn add_note_full(
+        &self,
+        target: &str,
+        content: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<(i64, Option<String>)> {
+        if !matches!(kind, "note" | "decision" | "dismissed") {
+            anyhow::bail!("unknown note kind `{kind}`: use note, decision or dismissed");
+        }
+        if kind != "note" && reason.trim().is_empty() {
+            anyhow::bail!("a {kind} needs a `reason` so later sessions know why");
+        }
+        if content.trim().is_empty() {
+            anyhow::bail!("the note text is empty");
+        }
         let ts = Utc::now().to_rfc3339();
         let clean_target = if target.trim().is_empty() {
             "project"
@@ -568,15 +621,87 @@ impl Database {
             target.trim()
         };
         self.conn.execute(
-            "INSERT INTO notes (target, content, created_at) VALUES (?1, ?2, ?3)",
-            params![clean_target, content.trim(), ts],
+            "INSERT INTO notes (target, content, created_at, kind, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![clean_target, content.trim(), ts, kind, reason.trim()],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        let note = ProjectNote {
+            id,
+            target: clean_target.to_string(),
+            content: content.trim().to_string(),
+            created_at: ts,
+            kind: kind.to_string(),
+            reason: reason.trim().to_string(),
+        };
+        let mirror_err = self
+            .write_note_markdown(&note)
+            .err()
+            .map(|e| format!("{e:#}"));
+        Ok((id, mirror_err))
     }
 
+    fn notes_dir(&self) -> Option<PathBuf> {
+        self.db_path.parent().map(|d| d.join("notes"))
+    }
+
+    fn write_note_markdown(&self, n: &ProjectNote) -> Result<()> {
+        let dir = self
+            .notes_dir()
+            .context("index DB has no parent directory")?;
+        std::fs::create_dir_all(&dir)?;
+        let mut body = format!(
+            "---\nid: {}\nkind: {}\ntarget: {}\ncreated_at: {}\n---\n\n{}\n",
+            n.id,
+            n.kind,
+            n.target.replace('\n', " "),
+            n.created_at,
+            n.content
+        );
+        if !n.reason.is_empty() {
+            body.push_str(&format!("\nReason: {}\n", n.reason));
+        }
+        std::fs::write(dir.join(format!("{:05}-{}.md", n.id, n.kind)), body)
+            .context("failed to write the Markdown copy of the note")
+    }
+
+    /// Restores notes from `.trackertop/notes/*.md` when the notes table is empty (a rebuilt
+    /// or deleted index DB). Returns how many notes were imported.
+    pub fn import_notes_from_markdown(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))?;
+        let Some(dir) = self.notes_dir() else {
+            return Ok(0);
+        };
+        if count > 0 || !dir.is_dir() {
+            return Ok(0);
+        }
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .collect();
+        files.sort();
+        let mut imported = 0;
+        for f in files {
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            if let Some(n) = parse_note_markdown(&text) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO notes (id, target, content, created_at, kind, reason) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![n.id, n.target, n.content, n.created_at, n.kind, n.reason],
+                )?;
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+
+    /// All notes, newest first (no cap: a capped list would silently hide old decisions).
     pub fn list_notes(&self, filter: Option<&str>) -> Result<Vec<ProjectNote>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, target, content, created_at FROM notes ORDER BY id DESC LIMIT 100",
+            "SELECT id, target, content, created_at, kind, reason FROM notes ORDER BY id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -585,6 +710,8 @@ impl Database {
                     target: r.get(1)?,
                     content: r.get(2)?,
                     created_at: r.get(3)?,
+                    kind: r.get(4)?,
+                    reason: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -597,6 +724,8 @@ impl Database {
                     .filter(|n| {
                         n.target.to_ascii_lowercase().contains(&ql)
                             || n.content.to_ascii_lowercase().contains(&ql)
+                            || n.reason.to_ascii_lowercase().contains(&ql)
+                            || n.kind == ql
                     })
                     .collect());
             }
@@ -604,23 +733,31 @@ impl Database {
         Ok(rows)
     }
 
+    /// Notes attached to any of `targets` (symbol names, qualified names, file paths).
+    /// Matching is exact, or by whole path / `::` segments (`Store::load` matches a note on
+    /// `load`; `src/a.rs` matches a note on `a.rs`), never by arbitrary substring, so a
+    /// note on `run` does not surface for `run_checks`.
     pub fn find_notes_for_targets(&self, targets: &[&str]) -> Result<Vec<ProjectNote>> {
         let all = self.list_notes(None)?;
-        let lower_targets: Vec<String> = targets.iter().map(|t| t.to_ascii_lowercase()).collect();
         Ok(all
             .into_iter()
-            .filter(|n| {
-                let nt = n.target.to_ascii_lowercase();
-                lower_targets
-                    .iter()
-                    .any(|t| nt == *t || t.contains(&nt) || nt.contains(t))
-            })
+            .filter(|n| targets.iter().any(|t| note_target_matches(&n.target, t)))
             .collect())
     }
 
     pub fn delete_note(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+        if let Some(dir) = self.notes_dir()
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            let prefix = format!("{id:05}-");
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -752,5 +889,168 @@ mod tests {
         let _db = Database::open_for_repo(repo.path()).unwrap();
         let ignore = std::fs::read_to_string(repo.path().join(".trackertop/.gitignore")).unwrap();
         assert!(ignore.lines().any(|l| l.trim() == "*"));
+    }
+}
+
+/// Whether a note attached to `note_target` belongs to `target` (a symbol name, qualified
+/// name or repo-relative path). Exact (case-insensitive), or equal to a whole trailing
+/// `::` segment run or a whole trailing path component run.
+pub fn note_target_matches(note_target: &str, target: &str) -> bool {
+    let n = note_target.trim().to_ascii_lowercase().replace('\\', "/");
+    let t = target.trim().to_ascii_lowercase().replace('\\', "/");
+    if n.is_empty() || t.is_empty() {
+        return false;
+    }
+    n == t
+        || t.ends_with(&format!("::{n}"))
+        || n.ends_with(&format!("::{t}"))
+        || t.ends_with(&format!("/{n}"))
+}
+
+/// Parses a note written by `write_note_markdown`.
+fn parse_note_markdown(text: &str) -> Option<ProjectNote> {
+    let rest = text.strip_prefix("---\n")?;
+    let (front, body) = rest.split_once("\n---\n")?;
+    let field = |k: &str| {
+        front.lines().find_map(|l| {
+            l.strip_prefix(&format!("{k}: "))
+                .map(|v| v.trim().to_string())
+        })
+    };
+    let body = body.trim();
+    let (content, reason) = match body.rsplit_once("\n\nReason: ") {
+        Some((c, r)) => (c.trim().to_string(), r.trim().to_string()),
+        None => (body.to_string(), String::new()),
+    };
+    Some(ProjectNote {
+        id: field("id")?.parse().ok()?,
+        target: field("target")?,
+        content,
+        created_at: field("created_at").unwrap_or_default(),
+        kind: field("kind").unwrap_or_else(|| "note".to_string()),
+        reason,
+    })
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::*;
+
+    #[test]
+    fn old_notes_table_is_migrated_in_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, \
+                 content TEXT NOT NULL, created_at TEXT NOT NULL);
+                 INSERT INTO notes (target, content, created_at) VALUES ('alpha', 'old rule', 't');",
+            )
+            .unwrap();
+        }
+        let db = Database::open_path(&path).unwrap();
+        let notes = db.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].kind.as_str(), notes[0].reason.as_str()),
+            ("note", "")
+        );
+        // Opening again is a no-op (idempotent migration)
+        drop(db);
+        assert_eq!(
+            Database::open_path(&path)
+                .unwrap()
+                .list_notes(None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn note_targets_match_exactly_or_by_whole_segments() {
+        assert!(note_target_matches("load", "load"));
+        assert!(note_target_matches("load", "Store::load"));
+        assert!(note_target_matches("Store::load", "load"));
+        assert!(note_target_matches("context.rs", "src/context.rs"));
+        assert!(note_target_matches(r"SRC\Context.rs", "src/context.rs"));
+        assert!(!note_target_matches("run", "run_checks"));
+        assert!(!note_target_matches("run", "src/runner.rs"));
+        assert!(!note_target_matches("load", "Store::reload"));
+        assert!(!note_target_matches("", "x"));
+    }
+
+    #[test]
+    fn notes_are_mirrored_as_markdown_and_restored_after_a_db_rebuild() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db = Database::open_for_repo(repo).unwrap();
+        let (id, err) = db
+            .add_note_full(
+                "Store::load",
+                "keep the cache",
+                "decision",
+                "cold start is slow",
+            )
+            .unwrap();
+        assert!(err.is_none(), "{err:?}");
+        let (gone, _) = db.add_note_full("x", "temp", "note", "").unwrap();
+        let md = repo.join(format!(".trackertop/notes/{id:05}-decision.md"));
+        let text = std::fs::read_to_string(&md).unwrap();
+        assert!(text.contains("kind: decision") && text.contains("Reason: cold start is slow"));
+        db.delete_note(gone).unwrap();
+        assert!(
+            !repo
+                .join(format!(".trackertop/notes/{gone:05}-note.md"))
+                .exists()
+        );
+        drop(db);
+
+        std::fs::remove_file(repo.join(".trackertop/index.db")).unwrap();
+        let _ = std::fs::remove_file(repo.join(".trackertop/index.db-wal"));
+        let _ = std::fs::remove_file(repo.join(".trackertop/index.db-shm"));
+        let db = Database::open_for_repo(repo).unwrap();
+        let notes = db.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let n = &notes[0];
+        assert_eq!(
+            (
+                n.id,
+                n.kind.as_str(),
+                n.target.as_str(),
+                n.content.as_str(),
+                n.reason.as_str()
+            ),
+            (
+                id,
+                "decision",
+                "Store::load",
+                "keep the cache",
+                "cold start is slow"
+            )
+        );
+    }
+
+    #[test]
+    fn decisions_need_reasons_and_kinds_are_validated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open_for_repo(tmp.path()).unwrap();
+        assert!(db.add_note_full("a", "x", "decision", " ").is_err());
+        assert!(db.add_note_full("a", "x", "dismissed", "").is_err());
+        assert!(db.add_note_full("a", "x", "opinion", "why").is_err());
+        assert!(db.add_note_full("a", "  ", "note", "").is_err());
+    }
+
+    #[test]
+    fn old_notes_are_not_hidden_by_a_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open_for_repo(tmp.path()).unwrap();
+        db.add_note("alpha", "the very first rule").unwrap();
+        for i in 0..120 {
+            db.add_note(&format!("t{i}"), "filler").unwrap();
+        }
+        let found = db.find_notes_for_targets(&["alpha"]).unwrap();
+        assert_eq!(found.len(), 1);
     }
 }

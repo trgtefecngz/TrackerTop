@@ -6,6 +6,16 @@ All notable changes to TrackerTop are documented here.
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
+### Added: decision memory
+- `remember` takes a `kind` (`note`, `decision` or `dismissed`, the last for a review lead that was checked and rejected) and a `reason`, which is required for decisions and dismissed leads.
+- Notes are shown, labelled with kind and reason, wherever the related code is read: `read_symbol`, `read_symbols_batch`, `file_outline` (notes on the file or any of its symbols) and `repo_map`. Settled questions are not investigated again.
+- Every note is also written as Markdown in `.trackertop/notes/`. If the index database is deleted or rebuilt, the notes are restored from those files.
+- The existing notes table is migrated in place; old notes become kind `note`.
+
+### Fixed: memory notes
+- A note surfaced for any target that merely contained its text, so a note on `run` appeared on `run_checks` and `src/runner.rs`. Targets now match exactly or by whole `::` or path segments.
+- Only the newest 100 notes were ever searched, so older notes silently stopped appearing. There is no cap now.
+
 ### Added: `project_playbook`
 - New MCP tool to call once at the start of work.
 - It lists how to build, test, lint and format the project, and what CI actually runs (shell plumbing and release workflows are left out).
