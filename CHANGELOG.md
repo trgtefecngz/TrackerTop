@@ -32,6 +32,7 @@ All notable changes to TrackerTop are documented here.
 
 ### Changed: Python and Go on tree-sitter
 - The Python and Go extractors now read a syntax tree instead of scanning lines. Text in strings and comments is no longer taken for a call, a `def` inside a docstring is no longer a symbol, and braces inside Go strings no longer end a function early.
+- A syntax error, such as an unclosed bracket in a file being edited, no longer hides every later definition. The file is re-parsed piece by piece from its top-level definitions. Python definitions inside `for`, `while` and `match` blocks are kept.
 - Fixed along the way: multi-line Python and Go signatures (the function used to end at its first line), grouped Go `type ( ... )` declarations (previously missed), generic Go receivers (`Stack[T]` is now `Stack`), and multi-line `from x import (...)` lists.
 
 ### Fixed: stale graph after upgrading TrackerTop
