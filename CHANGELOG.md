@@ -15,6 +15,7 @@ All notable changes to TrackerTop are documented here.
   - `orphan`: a function whose last caller this change removed or rewrote, reported only when its name appears nowhere else in the project's code (so a function passed as a value or named in a registry is never called unused);
   - `cochange-miss`: a file that changed together with a file you touched in at least 4 commits and 60% of that file's recent history (at the base, bulk commits ignored), but not in this change. Reported as a habit with the commits it rests on, never as proof.
 - New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
+- `trackertop review --format sarif` writes SARIF 2.1.0 for code-scanning UIs (each finding keeps its stable id as a fingerprint), and `--fail-on low|medium|high` exits with status 1 when a finding at or above that severity is raised.
 - `review_changes` says what changed since the previous review against the same base: findings resolved (with what they were), new, and unchanged, by stable id. A dismissed finding is not counted as resolved.
 
 ### Added: note provenance

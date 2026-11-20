@@ -10,6 +10,7 @@
 pub mod cochange;
 pub mod orphan;
 pub mod rules;
+pub mod sarif;
 pub mod snapshot;
 
 use crate::changes::{FileDiff, FileStatus, diff_since, git, touched};

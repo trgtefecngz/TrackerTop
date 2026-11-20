@@ -97,9 +97,13 @@ enum Commands {
         /// the review uses its merge base with HEAD
         #[arg(long)]
         base: Option<String>,
-        /// Output format: md or json
+        /// Output format: md, json or sarif
         #[arg(long, default_value = "md")]
         format: String,
+        /// Exit with status 1 when a finding at or above this severity (low, medium, high)
+        /// is raised, after printing the report
+        #[arg(long)]
+        fail_on: Option<String>,
     },
     /// Configure AI agent integration (claude, cursor, codex, windsurf)
     Install {
@@ -344,16 +348,54 @@ fn main() -> Result<()> {
             let md_path = generate_markdown_report(&repo_root)?;
             println!("Generated Markdown summary: {}", md_path.display());
         }
-        Commands::Review { base, format } => {
+        Commands::Review {
+            base,
+            format,
+            fail_on,
+        } => {
+            use trackertop::review::rules::Severity;
+            // Validated before the (slow) review runs
+            let fail_on = fail_on
+                .map(|s| {
+                    Severity::parse(&s).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown severity `{s}` for --fail-on: use low, medium or high"
+                        )
+                    })
+                })
+                .transpose()?;
+            let format = format.to_ascii_lowercase();
+            if !matches!(format.as_str(), "md" | "markdown" | "json" | "sarif") {
+                anyhow::bail!("unknown format `{format}`: use md, json or sarif");
+            }
             let base = match base {
                 Some(b) => b,
                 None => trackertop::review::default_base(&repo_root)?,
             };
             let cs = trackertop::review::review(&repo_root, &base)?;
-            match format.to_ascii_lowercase().as_str() {
-                "md" | "markdown" => print!("{}", trackertop::review::render_markdown(&cs)),
+            match format.as_str() {
                 "json" => println!("{}", serde_json::to_string_pretty(&cs)?),
-                other => anyhow::bail!("unknown format `{other}`: use md or json"),
+                "sarif" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&trackertop::review::sarif::render_sarif(&cs))?
+                ),
+                _ => print!("{}", trackertop::review::render_markdown(&cs)),
+            }
+            if let Some(threshold) = fail_on {
+                let hits = cs
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity <= threshold)
+                    .count();
+                if hits > 0 {
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+                    eprintln!(
+                        "trackertop review: {hits} finding(s) at or above `{}` severity",
+                        threshold.as_str()
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Install { target, global } => {
