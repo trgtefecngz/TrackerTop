@@ -446,10 +446,13 @@ fn before_code_brace(line: &str) -> &str {
     while i < bytes.len() {
         match bytes[i] {
             b'{' => return &line[..i],
-            q @ (b'"' | b'\'' | b'`') => match find_unescaped(bytes, i + 1, q) {
-                Some(close) => i = close,
-                None => return line,
-            },
+            q @ (b'"' | b'\'' | b'`') => {
+                // An unmatched quote is plain text (same rule as the code-only scanner), so it
+                // cannot make the signature run on through the test body.
+                if let Some(close) = find_unescaped(bytes, i + 1, q) {
+                    i = close;
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -462,6 +465,11 @@ fn before_code_brace(line: &str) -> &str {
 /// bracket, a separator, or a keyword like `return`, an operand is expected, so `/` opens a
 /// regex; after an identifier, number or `)` / `]`, it divides.
 fn regex_can_start(code_so_far: &[u8]) -> bool {
+    // `</` right after `<` is a JSX/TSX closing tag (`</p>`), not a regex; treating it as one
+    // would hide the code up to the next `/`.
+    if code_so_far.last() == Some(&b'<') {
+        return false;
+    }
     let trimmed = code_so_far.trim_ascii_end();
     let Some(&last) = trimmed.last() else {
         return true;
@@ -469,14 +477,26 @@ fn regex_can_start(code_so_far: &[u8]) -> bool {
     if b"(,=:[!&|?{};+-*%<>~^".contains(&last) {
         return true;
     }
-    // Keywords after which an expression follows
+    // Keywords after which an expression (operand) follows
     let word_start = trimmed
         .iter()
         .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$'))
         .map_or(0, |p| p + 1);
     matches!(
         &trimmed[word_start..],
-        b"return" | b"typeof" | b"case" | b"in" | b"of" | b"delete" | b"void" | b"yield" | b"await"
+        b"return"
+            | b"throw"
+            | b"typeof"
+            | b"instanceof"
+            | b"case"
+            | b"in"
+            | b"of"
+            | b"delete"
+            | b"void"
+            | b"yield"
+            | b"await"
+            | b"else"
+            | b"do"
     )
 }
 
@@ -954,5 +974,46 @@ function helperAfter() {
             .find(|s| s.kind == SymbolKind::Test)
             .unwrap();
         assert!(t.signature.contains("parses {x}"), "{}", t.signature);
+    }
+
+    #[test]
+    fn regex_after_throw_and_other_keywords_is_not_code() {
+        assert_eq!(ts_code_only("throw /)/;"), "throw //;");
+        assert_eq!(
+            ts_code_only("x instanceof /(/.constructor"),
+            "x instanceof //.constructor"
+        );
+        assert_eq!(ts_code_only("else /)/.test(s)"), "else //.test(s)");
+
+        let src = r#"it("throws", () => {
+  if (bad) throw /)/;
+  check();
+});
+function helperAfter() {
+  return 1;
+}
+"#;
+        assert_eq!(test_span(src), (1, 4, true));
+    }
+
+    #[test]
+    fn jsx_closing_tag_is_not_a_regex() {
+        // `</p>` must not be read as a regex running to the next `/`, hiding `{name}` and `(`
+        assert_eq!(
+            ts_code_only("<p>{a}</p> <b>{call(x)}</b>"),
+            "<p>{a}</p> <b>{call(x)}</b>"
+        );
+    }
+
+    #[test]
+    fn unmatched_quote_does_not_drag_the_body_into_the_signature() {
+        let out = parse("it(\"don't panic\" + ', () => {\n  run();\n});\n");
+        if let Some(t) = out.symbols.iter().find(|s| s.kind == SymbolKind::Test) {
+            assert!(!t.signature.contains("run()"), "{}", t.signature);
+        }
+        assert_eq!(
+            before_code_brace("it(\"x\" + ', () => { run(); }"),
+            "it(\"x\" + ', () => "
+        );
     }
 }
