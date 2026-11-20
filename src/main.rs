@@ -114,7 +114,8 @@ enum Commands {
         #[arg(long)]
         global: bool,
     },
-    /// Lightweight SessionStart hook output reminding AI agents to prefer TrackerTop MCP tools
+    /// SessionStart hook output: the TrackerTop hint plus a short "where work stands"
+    /// briefing (reads the hook's stdin JSON; never fails, falls back to the hint)
     HookHint,
 }
 
@@ -417,8 +418,14 @@ fn main() -> Result<()> {
             }
         }
         Commands::HookHint => {
+            let input = trackertop::hook::read_hook_stdin();
             println!(
-                "TrackerTop MCP is active for this workspace. Prefer `repo_map`, `task_context`, `smart_grep`, `file_outline`, `read_symbol`, `read_symbols_batch`, and `diff_impact` BEFORE raw grep or reading full files (saves 80-99% tokens)."
+                "{}",
+                trackertop::hook::hook_output(
+                    &input,
+                    cli.repo.clone(),
+                    trackertop::hook::BRIEFING_DEADLINE
+                )
             );
         }
     }

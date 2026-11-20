@@ -1,6 +1,6 @@
 use crate::model::{
-    Edge, EdgeKind, FileRecord, ProjectNote, SourceBreakdown, Symbol, SymbolKind, TelemetryEntry,
-    TokenStatsSummary, ToolSavingsBreakdown,
+    Edge, EdgeKind, FileRecord, JournalEntry, NOTE_KINDS, ProjectNote, SourceBreakdown, Symbol,
+    SymbolKind, TelemetryEntry, TokenStatsSummary, ToolSavingsBreakdown, note_kind_needs_reason,
 };
 use crate::tokens::estimate_usd_saved;
 use anyhow::{Context, Result};
@@ -8,6 +8,9 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Journal rows kept per project (older ones are pruned as new calls come in).
+pub const JOURNAL_KEEP_ROWS: i64 = 20_000;
 
 pub struct Database {
     conn: Connection,
@@ -145,8 +148,23 @@ impl Database {
                 summary TEXT NOT NULL,
                 PRIMARY KEY (base_ref, id)
             );
+
+            -- v0.9: work journal, one row per MCP tool call (what was asked, how it went)
+            CREATE TABLE IF NOT EXISTS journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                session TEXT NOT NULL,
+                source TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                query TEXT NOT NULL,
+                outcome TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_session ON journal(session);
             ",
         )?;
+        // v0.9: which agent session wrote a note, and when a finding was last raised
+        self.ensure_column("notes", "session", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("review_findings", "reviewed_at", "TEXT NOT NULL DEFAULT ''")?;
         // v0.7: decision memory. Added in place so existing notes keep working (kind 'note').
         self.ensure_column("notes", "kind", "TEXT NOT NULL DEFAULT 'note'")?;
         self.ensure_column("notes", "reason", "TEXT NOT NULL DEFAULT ''")?;
@@ -229,15 +247,88 @@ impl Database {
             "DELETE FROM review_findings WHERE base_ref = ?1",
             [base_ref],
         )?;
+        let now = Utc::now().to_rfc3339();
         for (id, summary) in findings {
             tx.execute(
-                "INSERT OR REPLACE INTO review_findings(base_ref, id, summary) VALUES(?1, ?2, ?3)",
-                [base_ref, id.as_str(), summary.as_str()],
+                "INSERT OR REPLACE INTO review_findings(base_ref, id, summary, reviewed_at) \
+                 VALUES(?1, ?2, ?3, ?4)",
+                [base_ref, id.as_str(), summary.as_str(), now.as_str()],
             )?;
         }
         bump_meta(&tx, &format!("reviewed:{base_ref}"))?;
         tx.commit()?;
         Ok(seen.then_some(previous))
+    }
+
+    /// Findings the latest review against each base raised: `(base_ref, id, summary,
+    /// reviewed_at)`, newest review first. Dismissals made after that review are not
+    /// subtracted here (the caller has the notes).
+    pub fn review_findings(&self) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT base_ref, id, summary, reviewed_at FROM review_findings \
+             ORDER BY reviewed_at DESC, base_ref, id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Appends one tool call to the work journal and keeps the newest
+    /// [`JOURNAL_KEEP_ROWS`] rows, so the table cannot grow without bound.
+    pub fn record_journal(
+        &self,
+        session: &str,
+        source: &str,
+        tool: &str,
+        query: &str,
+        outcome: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO journal (timestamp, session, source, tool, query, outcome) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Utc::now().to_rfc3339(),
+                session,
+                source,
+                tool,
+                query,
+                outcome
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        if id % 100 == 0 {
+            self.conn.execute(
+                "DELETE FROM journal WHERE id <= ?1",
+                params![id - JOURNAL_KEEP_ROWS],
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// The newest `limit` journal rows, newest first, and how many rows exist in total.
+    pub fn recent_journal(&self, limit: usize) -> Result<(Vec<JournalEntry>, usize)> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, session, source, tool, query, outcome FROM journal \
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(JournalEntry {
+                    id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    session: r.get(2)?,
+                    source: r.get(3)?,
+                    tool: r.get(4)?,
+                    query: r.get(5)?,
+                    outcome: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total as usize))
     }
 
     /// Bumped (inside the same transaction) whenever file/symbol/raw-ref rows change.
@@ -739,11 +830,29 @@ impl Database {
         commit: &str,
         code_hash: &str,
     ) -> Result<(i64, Option<String>)> {
-        if !matches!(kind, "note" | "decision" | "dismissed") {
-            anyhow::bail!("unknown note kind `{kind}`: use note, decision or dismissed");
+        self.add_note_in_session(target, content, kind, reason, commit, code_hash, "")
+    }
+
+    /// Like `add_note_with_provenance`, also recording which agent session wrote it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_note_in_session(
+        &self,
+        target: &str,
+        content: &str,
+        kind: &str,
+        reason: &str,
+        commit: &str,
+        code_hash: &str,
+        session: &str,
+    ) -> Result<(i64, Option<String>)> {
+        if !NOTE_KINDS.contains(&kind) {
+            anyhow::bail!(
+                "unknown note kind `{kind}`: use one of {}",
+                NOTE_KINDS.join(", ")
+            );
         }
-        if kind != "note" && reason.trim().is_empty() {
-            anyhow::bail!("a {kind} needs a `reason` so later sessions know why");
+        if note_kind_needs_reason(kind) && reason.trim().is_empty() {
+            anyhow::bail!("a {kind} entry needs a `reason` so later sessions know why");
         }
         if content.trim().is_empty() {
             anyhow::bail!("the note text is empty");
@@ -755,8 +864,8 @@ impl Database {
             target.trim()
         };
         self.conn.execute(
-            "INSERT INTO notes (target, content, created_at, kind, reason, commit_id, code_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO notes (target, content, created_at, kind, reason, commit_id, code_hash, \
+             session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 clean_target,
                 content.trim(),
@@ -764,7 +873,8 @@ impl Database {
                 kind,
                 reason.trim(),
                 commit,
-                code_hash
+                code_hash,
+                session
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -777,6 +887,7 @@ impl Database {
             reason: reason.trim().to_string(),
             commit: commit.to_string(),
             code_hash: code_hash.to_string(),
+            session: session.to_string(),
         };
         let mirror_err = self
             .write_note_markdown(&note)
@@ -798,13 +909,14 @@ impl Database {
         // `Reason:` paragraph is only for people reading the file.
         let mut body = format!(
             "---\nid: {}\nkind: {}\ntarget: {}\ncreated_at: {}\ncommit: {}\ncode_hash: {}\n\
-             reason: {}\n---\n\n{}\n",
+             session: {}\nreason: {}\n---\n\n{}\n",
             n.id,
             n.kind,
             n.target.replace('\n', " "),
             n.created_at,
             n.commit,
             n.code_hash,
+            n.session,
             serde_json::to_string(&n.reason)?,
             n.content
         );
@@ -840,8 +952,8 @@ impl Database {
             if let Some(n) = parse_note_markdown(&text) {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO notes \
-                     (id, target, content, created_at, kind, reason, commit_id, code_hash) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (id, target, content, created_at, kind, reason, commit_id, code_hash, \
+                     session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         n.id,
                         n.target,
@@ -850,7 +962,8 @@ impl Database {
                         n.kind,
                         n.reason,
                         n.commit,
-                        n.code_hash
+                        n.code_hash,
+                        n.session
                     ],
                 )?;
                 imported += 1;
@@ -862,8 +975,8 @@ impl Database {
     /// All notes, newest first (no cap: a capped list would silently hide old decisions).
     pub fn list_notes(&self, filter: Option<&str>) -> Result<Vec<ProjectNote>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, target, content, created_at, kind, reason, commit_id, code_hash \
-             FROM notes ORDER BY id DESC",
+            "SELECT id, target, content, created_at, kind, reason, commit_id, code_hash, \
+             session FROM notes ORDER BY id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -876,6 +989,7 @@ impl Database {
                     reason: r.get(5)?,
                     commit: r.get(6)?,
                     code_hash: r.get(7)?,
+                    session: r.get(8)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1121,6 +1235,7 @@ fn parse_note_markdown(text: &str) -> Option<ProjectNote> {
         reason,
         commit: field("commit").unwrap_or_default(),
         code_hash: field("code_hash").unwrap_or_default(),
+        session: field("session").unwrap_or_default(),
     })
 }
 
