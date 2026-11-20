@@ -185,6 +185,21 @@ impl Database {
         read_meta(&self.conn, "index_generation")
     }
 
+    /// The extractor revision the stored symbols and raw references were parsed with
+    /// (0: an index written before revisions were recorded).
+    pub fn extractor_revision(&self) -> Result<i64> {
+        read_meta(&self.conn, "extractor_revision")
+    }
+
+    pub fn set_extractor_revision(&self, revision: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES('extractor_revision', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [revision],
+        )?;
+        Ok(())
+    }
+
     /// Bumped (inside the same transaction) whenever file/symbol/raw-ref rows change.
     pub fn files_generation(&self) -> Result<i64> {
         read_meta(&self.conn, "files_generation")

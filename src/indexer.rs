@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
+/// Revision of what the extractors produce (symbols, raw references). Bump it whenever an
+/// extractor change alters their output for unchanged source: an index written by another
+/// revision is re-parsed in full on its next run, instead of keeping stale edges for
+/// every file whose content did not change. (1: v0.8, Rust macro-argument and method calls.)
+pub const EXTRACTOR_REVISION: i64 = 1;
+
 #[derive(Debug, Clone)]
 pub struct IndexStats {
     pub total_files: usize,
@@ -148,11 +154,12 @@ fn index_with(
         let _ = register_project(repo_root);
     }
     let mut db = Database::open_for_repo(repo_root)?;
-    let existing = if force {
-        HashMap::new()
-    } else {
-        db.load_file_map()?
-    };
+    // Rows parsed by another extractor revision describe the code as that extractor saw
+    // it: re-parse everything, or unchanged files keep missing (or wrong) edges forever.
+    let outdated = db.extractor_revision()? != EXTRACTOR_REVISION;
+    let reparse_all = force || outdated;
+    // Loaded even when re-parsing everything, so deleted files are still detected.
+    let existing = db.load_file_map()?;
 
     // A snapshot lives under the project's git-ignored `.trackertop/`: ignore rules from
     // directories above it would hide every file, so only its own `.gitignore`s apply.
@@ -198,7 +205,8 @@ fn index_with(
         // Never take the fast path on an untrusted record: an mtime that cannot be read here
         // falls back to the same value as the UNTRUSTED_MTIME sentinel and would otherwise
         // "match" it.
-        if let Some(prev) = existing.get(&rel_path)
+        if !reparse_all
+            && let Some(prev) = existing.get(&rel_path)
             && prev.mtime_secs != UNTRUSTED_MTIME
             && prev.mtime_secs == mtime
             && prev.size_bytes == size
@@ -232,7 +240,8 @@ fn index_with(
             let recorded_mtime =
                 trustworthy_mtime(&cand.abs_path, cand.mtime, cand.size, source.len() as u64);
 
-            if let Some(prev) = existing.get(&cand.rel_path)
+            if !reparse_all
+                && let Some(prev) = existing.get(&cand.rel_path)
                 && prev.hash == hash
             {
                 return Some(Outcome::Touched(cand.rel_path, recorded_mtime, cand.size));
@@ -280,7 +289,7 @@ fn index_with(
     // upsert and its edge rebuild: repair them even if THIS run saw no file changes.
     let edges_stale = db.edges_generation()? != db.files_generation()?;
     let changed =
-        force || parsed_files > 0 || deleted_files > 0 || existing.is_empty() || edges_stale;
+        reparse_all || parsed_files > 0 || deleted_files > 0 || existing.is_empty() || edges_stale;
 
     let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
         const MAX_ATTEMPTS: usize = 5;
@@ -330,6 +339,11 @@ fn index_with(
         let (files, symbols, edges, tokens) = db.index_totals()?;
         (files, symbols, edges, tokens, db.index_generation()?)
     };
+    // Recorded only once every file was re-parsed and the edges committed: an interrupted
+    // run re-parses everything again next time.
+    if outdated {
+        db.set_extractor_revision(EXTRACTOR_REVISION)?;
+    }
 
     Ok(IndexStats {
         total_files,
