@@ -9,7 +9,9 @@ All notable changes to TrackerTop are documented here.
 - Review findings, each with a stable id, severity, `file:line` and evidence:
   - `broken-ref`: a removed symbol that a surviving caller still calls, verified against the working tree;
   - `impact`: a modified function with many code dependents, with the tests that reach it;
-  - `untested`: new or modified code that no test reaches.
+  - `untested`: new or modified code that no test reaches;
+  - `new-cycle`: an import cycle the change created between JS/TS/Python/Go files;
+  - `bloat`: a file that grew past 3,500 tokens.
 - New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
 
 ### Added: note provenance
@@ -19,6 +21,7 @@ All notable changes to TrackerTop are documented here.
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
 - A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.
 - A call never resolves to a module or doc section of the same name (`review()` used to point at `pub mod review`).
+- A bare Rust call `f()` never resolves to a method, which needs `x.f()` or `Type::f()`.
 
 ## [0.7.0] - 2026-11-20
 

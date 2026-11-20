@@ -660,13 +660,15 @@ fn call_candidates<'a>(syms: &[&'a Symbol], method_call: bool, is_rust: bool) ->
             matches!(
                 s.kind,
                 SymbolKind::Function
-                    | SymbolKind::Method
                     | SymbolKind::Macro
                     | SymbolKind::Struct
                     | SymbolKind::Enum
                     | SymbolKind::Class
                     | SymbolKind::ShaderEntry
             )
+            // A bare Rust `f()` cannot call a method: methods need a receiver (`x.f()`,
+            // resolved above) or a path (`Type::f()`, `Self::f()`)
+            || (s.kind == SymbolKind::Method && !is_rust)
         })
         .collect();
     if callable.is_empty() && !is_rust {

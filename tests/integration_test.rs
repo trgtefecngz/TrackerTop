@@ -1647,3 +1647,67 @@ fn notes_are_flagged_when_their_code_changes() {
     assert!(out.contains("dismissed earlier"), "{out}");
     assert!(!out.contains("Dismissed earlier, not shown again"), "{out}");
 }
+
+/// `new-cycle`: an import cycle the change creates (JS/TS) is reported with the new
+/// dependency as evidence; one that already existed at the base is not.
+#[test]
+fn review_reports_import_cycles_the_change_creates() {
+    use trackertop::review::review;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.ts"),
+        "import { b } from \"./b\";\nexport function a(): number {\n  return b() + 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.ts"),
+        "export function b(): number {\n  return 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/c.ts"),
+        "import { d } from \"./d\";\nexport function c(): number {\n  return d();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/d.ts"),
+        "import { c } from \"./c\";\nexport function d(): number {\n  return c();\n}\n",
+    )
+    .unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+    std::fs::write(
+        root.join("src/b.ts"),
+        "import { a } from \"./a\";\nexport function b(): number {\n  return a() - 1;\n}\n",
+    )
+    .unwrap();
+    // c <-> d already form a cycle at the base; touching c must not report it
+    std::fs::write(
+        root.join("src/c.ts"),
+        "import { d } from \"./d\";\nexport function c(): number {\n  return d() + 0;\n}\n",
+    )
+    .unwrap();
+
+    let cs = review(root, "main").unwrap();
+    let cycles: Vec<_> = cs
+        .findings
+        .iter()
+        .filter(|f| f.rule == "new-cycle")
+        .collect();
+    assert_eq!(cycles.len(), 1, "{:#?}", cs.findings);
+    assert_eq!(cycles[0].id, "new-cycle:src/a.ts:2-files");
+    assert!(
+        cycles[0].message.contains("src/a.ts, src/b.ts"),
+        "{}",
+        cycles[0].message
+    );
+    assert!(
+        cycles[0].evidence.iter().any(|e| e.starts_with("src/b.ts")),
+        "{:?}",
+        cycles[0].evidence
+    );
+}
