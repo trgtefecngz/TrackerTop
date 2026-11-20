@@ -213,7 +213,9 @@ impl LanguageExtractor for TypeScriptExtractor {
             {
                 let name = read_ts_ident(after);
                 if !name.is_empty() {
-                    let end_idx = if trimmed.contains('{') {
+                    // Judge the body by code only: a `{` inside a string on this line must
+                    // not start a brace search that swallows the following code.
+                    let end_idx = if ts_code_only(trimmed).contains('{') {
                         find_brace_end(&lines, i)
                     } else {
                         i
@@ -344,44 +346,99 @@ fn extract_class_methods(
 /// - the contents of '…', "…" and `…` string literals are dropped (the quotes are kept), so
 ///   braces, `//` or `;` inside strings (`it("parses {x}", run);`) are not seen as code.
 ///
-/// An unterminated `/*` hides the rest of the line, like the real lexer would.
+/// Single-line convenience wrapper around [`ts_code_line`] (no state carried in or out).
 fn ts_code_only(line: &str) -> String {
+    let mut carry = ScanCarry::Code;
+    ts_code_line(line, &mut carry)
+}
+
+/// Lexer state that survives a line break: only template literals and block comments can
+/// span lines ('…' and "…" cannot).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ScanCarry {
+    #[default]
+    Code,
+    BlockComment,
+    Template,
+}
+
+/// Code-only view of one line, given the state left by the previous line (`carry`), which is
+/// updated for the next line. A `)` or `{` inside a template literal or block comment that
+/// started on an earlier line is therefore never mistaken for code.
+fn ts_code_line(line: &str, carry: &mut ScanCarry) -> String {
     let bytes = line.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
+
+    // Finish whatever construct the previous line left open
+    match *carry {
+        ScanCarry::Code => {}
+        ScanCarry::BlockComment => match line.find("*/") {
+            Some(p) => {
+                i = p + 2;
+                *carry = ScanCarry::Code;
+            }
+            None => return String::new(),
+        },
+        ScanCarry::Template => match find_unescaped(bytes, 0, b'`') {
+            Some(p) => {
+                out.push(b'`');
+                i = p + 1;
+                *carry = ScanCarry::Code;
+            }
+            None => return String::new(),
+        },
+    }
+
     while i < bytes.len() {
         let b = bytes[i];
         match b {
             b'/' if bytes.get(i + 1) == Some(&b'/') => break,
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // Skip to the closing `*/`, or to the end of the line
-                let close = line[i + 2..].find("*/").map(|p| i + 2 + p + 2);
-                match close {
-                    Some(next) => i = next,
-                    None => break,
+            b'/' if bytes.get(i + 1) == Some(&b'*') => match line[i + 2..].find("*/") {
+                Some(p) => {
+                    i += 2 + p + 2;
+                    continue;
                 }
-                continue;
-            }
+                None => {
+                    *carry = ScanCarry::BlockComment;
+                    break;
+                }
+            },
             b'"' | b'\'' | b'`' => {
                 out.push(b);
-                i += 1;
-                while i < bytes.len() && bytes[i] != b {
-                    if bytes[i] == b'\\' {
-                        i += 1; // skip the escaped character
+                match find_unescaped(bytes, i + 1, b) {
+                    Some(close) => {
+                        out.push(b);
+                        i = close;
                     }
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    out.push(b); // closing quote
+                    None => {
+                        if b == b'`' {
+                            *carry = ScanCarry::Template;
+                        }
+                        break;
+                    }
                 }
             }
             _ => out.push(b),
         }
         i += 1;
     }
-    // Only ASCII bytes were removed/kept around multi-byte chars inside strings or comments,
-    // and multi-byte sequences outside them are copied whole, so this is valid UTF-8.
+    // Only ASCII bytes are dropped (whole multi-byte sequences are either copied or skipped),
+    // so this is valid UTF-8.
     String::from_utf8(out).unwrap_or_default()
+}
+
+/// Position of the next `quote` at or after `from` that is not escaped with a backslash.
+fn find_unescaped(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b if b == quote => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn strip_ts_modifiers(mut s: &str) -> (String, &str) {
@@ -443,14 +500,16 @@ fn normalize_ts_import(spec: &str) -> String {
 }
 
 /// Index of the line where the call whose first `(` is on line `start` closes, scanning the
-/// code-only view (parentheses inside strings and comments are ignored). If the call never
-/// closes (malformed or truncated source), the call is treated as one line rather than
-/// swallowing the rest of the file.
+/// code-only view (parentheses inside strings and comments, including template literals and
+/// block comments spanning lines, are ignored). If the call never closes (malformed or
+/// truncated source), the call is treated as one line rather than swallowing the rest of
+/// the file.
 fn find_call_end(lines: &[&str], start: usize) -> usize {
     let mut depth = 0i32;
     let mut opened = false;
+    let mut carry = ScanCarry::Code;
     for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in ts_code_only(line).chars() {
+        for ch in ts_code_line(line, &mut carry).chars() {
             match ch {
                 '(' => {
                     depth += 1;
@@ -471,12 +530,13 @@ fn find_call_end(lines: &[&str], start: usize) -> usize {
 
 /// Index of the line that closes the first `{` opened at or after `start`. Braces inside
 /// string literals and comments are ignored (`it("parses {x", () => {` must not count the
-/// one in the name), using the same per-line code-only view as the test-block check.
+/// one in the name), using the same multi-line-aware code-only view as [`find_call_end`].
 fn find_brace_end(lines: &[&str], start: usize) -> usize {
     let mut depth = 0i32;
     let mut seen = false;
+    let mut carry = ScanCarry::Code;
     for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in ts_code_only(line).chars() {
+        for ch in ts_code_line(line, &mut carry).chars() {
             if ch == '{' {
                 depth += 1;
                 seen = true;
@@ -744,5 +804,45 @@ mod tests {
         let src = "it(\"broken\", () => {\nfunction helperAfter() {\n  return 1;\n}\n";
         let (start, end, _) = test_span(src);
         assert_eq!((start, end), (1, 1));
+    }
+
+    #[test]
+    fn multi_line_template_literal_does_not_end_the_test_early() {
+        // The unbalanced `)` and `}` on line 3 are inside a template literal opened on line 2;
+        // a line-local scanner would see that `)` as closing the it( call.
+        let src = "it(\"renders\", () => {\n  const html = `<p>\n    done :) }\n  </p>`;\n  \
+                   check(html);\n});\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        assert_eq!(test_span(src), (1, 6, true));
+    }
+
+    #[test]
+    fn multi_line_block_comment_does_not_end_the_test_early() {
+        let src = "it(\"commented body\", () => {\n  /* note:\n     ) } closes nothing\n  */\n  \
+                   run();\n});\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        assert_eq!(test_span(src), (1, 6, true));
+    }
+
+    #[test]
+    fn scanner_carries_template_and_comment_state_across_lines() {
+        let mut carry = ScanCarry::Code;
+        assert_eq!(ts_code_line("a(`x", &mut carry), "a(`");
+        assert_eq!(carry, ScanCarry::Template);
+        assert_eq!(ts_code_line(") } still text", &mut carry), "");
+        assert_eq!(ts_code_line("end` )", &mut carry), "` )");
+        assert_eq!(carry, ScanCarry::Code);
+        assert_eq!(ts_code_line("b /* open", &mut carry), "b ");
+        assert_eq!(carry, ScanCarry::BlockComment);
+        assert_eq!(ts_code_line("{ ) */ c", &mut carry), " c");
+        assert_eq!(carry, ScanCarry::Code);
+    }
+
+    #[test]
+    fn const_arrow_with_brace_in_string_does_not_swallow() {
+        let src = "const label = () => \"{\" + name;\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse(src);
+        assert!(out.symbols.iter().any(|s| s.name == "helperAfter"));
     }
 }

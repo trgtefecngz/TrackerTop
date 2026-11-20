@@ -18,15 +18,13 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    // pid + per-process counter: unique even when several threads write the same target.
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = sibling_path(path, &format!("tmp-{}-{seq}", std::process::id()));
-
+    let (tmp, mut file) = create_temp_sibling(path, "tmp", false)
+        .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
     let written = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp)?;
         file.write_all(contents)?;
         file.sync_all()
     })();
+    drop(file);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to write {}", tmp.display()));
@@ -43,9 +41,12 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// directories, and the new contents are already in place either way.
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = File::open(parent)
-    {
+    // A bare relative name ("cfg.json") has an empty parent: that is the current directory.
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
     }
 }
@@ -96,18 +97,15 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(Some(bak));
     }
 
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = sibling_path(
-        path,
-        &format!("trackertop.bak.tmp-{}-{seq}", std::process::id()),
-    );
+    let (tmp, mut out) = create_temp_sibling(path, "trackertop.bak.tmp", true)
+        .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
     let copied = (|| -> std::io::Result<()> {
         let mut src = File::open(path)?;
-        let mut out = create_private_file(&tmp)?;
         std::io::copy(&mut src, &mut out)?;
         out.sync_all()?;
         copy_unix_permissions(path, &tmp)
     })();
+    drop(out);
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&tmp);
         return Err(e)
@@ -160,17 +158,38 @@ fn publish_backup(tmp: &Path, bak: &Path, try_hard_link: bool) -> Result<bool> {
     Ok(true)
 }
 
-/// Creates a new file readable only by its owner on Unix (so a private config's contents are
-/// never exposed while being copied); a normal create elsewhere.
-fn create_private_file(path: &Path) -> std::io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+/// Creates a brand-new temp file next to `path` (`<name>.<label>-<pid>-<n>`).
+///
+/// `create_new` refuses any existing entry at that name, including a planted symlink, so the
+/// write can never be redirected elsewhere; on a collision (a leftover from a crashed run
+/// with a reused pid) the next counter value is tried. With `private`, the file is created
+/// owner-only on Unix so a private config's contents are never exposed while being copied.
+fn create_temp_sibling(
+    path: &Path,
+    label: &str,
+    private: bool,
+) -> std::io::Result<(PathBuf, File)> {
+    const ATTEMPTS: usize = 64;
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = sibling_path(path, &format!("{label}-{}-{seq}", std::process::id()));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        match opts.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
     }
-    opts.open(path)
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("no free temp file name")))
 }
 
 /// Gives the backup the same Unix permission bits as the original config, so a backup is

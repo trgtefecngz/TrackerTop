@@ -103,7 +103,32 @@ fn parse_registry(text: &str) -> Option<RegistryFile> {
     if text.trim().is_empty() {
         return Some(RegistryFile::default());
     }
-    serde_json::from_str(text).ok()
+    let mut reg: RegistryFile = serde_json::from_str(text).ok()?;
+    migrate_legacy_keys(&mut reg);
+    Some(reg)
+}
+
+/// v0.5.0 stored network-share projects as `UNC\server\share` (it only stripped `\\?\`);
+/// the key is now `\\server\share`. Rewrite old keys and, if both forms ended up in the
+/// file, keep the most recently seen entry so a project never shows up twice.
+fn migrate_legacy_keys(reg: &mut RegistryFile) {
+    for p in &mut reg.projects {
+        if let Some(rest) = p.path.strip_prefix(r"UNC\") {
+            p.path = format!(r"\\{rest}");
+        }
+    }
+    let mut kept: Vec<ProjectEntry> = Vec::with_capacity(reg.projects.len());
+    for p in reg.projects.drain(..) {
+        match kept
+            .iter_mut()
+            .find(|k| same_project_path(&k.path, &p.path))
+        {
+            Some(k) if p.last_seen > k.last_seen => *k = p,
+            Some(_) => {}
+            None => kept.push(p),
+        }
+    }
+    reg.projects = kept;
 }
 
 /// Reads the registry. Missing/empty file -> empty registry; I/O error or corruption -> `Err`.
@@ -394,5 +419,18 @@ mod tests {
             same_project_path("/home/me/Repo", "/home/me/repo"),
             cfg!(any(windows, target_os = "macos"))
         );
+    }
+
+    #[test]
+    fn legacy_unc_keys_are_migrated_and_deduplicated() {
+        let text = r#"{"projects":[
+            {"path":"UNC\\srv\\share\\app","name":"app","added_at":"a","last_seen":"2026-11-01T00:00:00+00:00"},
+            {"path":"\\\\srv\\share\\app","name":"app","added_at":"a","last_seen":"2026-11-02T00:00:00+00:00"},
+            {"path":"C:\\work\\other","name":"other","added_at":"a","last_seen":"2026-11-01T00:00:00+00:00"}
+        ]}"#;
+        let reg = parse_registry(text).unwrap();
+        let paths: Vec<&str> = reg.projects.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, vec![r"\\srv\share\app", r"C:\work\other"]);
+        assert_eq!(reg.projects[0].last_seen, "2026-11-02T00:00:00+00:00");
     }
 }
