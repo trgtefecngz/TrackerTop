@@ -17,6 +17,9 @@ All notable changes to TrackerTop are documented here.
 ### Added: note provenance
 - Notes, decisions and dismissed leads record the commit and a hash of the code they are about. When that code changes, the note is still shown but marked **POSSIBLY OUTDATED**, so an old decision is re-checked instead of trusted. A dismissed review finding is raised again once its code changes.
 
+### Changed: `run_checks` memory
+- Command output is kept up to 16 MB from the start plus the last 8–16 MB, instead of the whole log in memory. When the middle is dropped, the report says so (**PARTIAL OUTPUT**), so a failure printed there is never silently lost.
+
 ### Fixed: call edges (all tools)
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
 - A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.
