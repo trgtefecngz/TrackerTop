@@ -5,7 +5,7 @@ use crate::model::{
 use crate::tokens::estimate_usd_saved;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -142,35 +142,19 @@ impl Database {
     /// processes (MCP server, GUI) know whether an in-memory graph is still current, even
     /// when ANOTHER process performed the re-index.
     pub fn index_generation(&self) -> Result<i64> {
-        let v = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'index_generation'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        Ok(v)
-    }
-
-    fn meta_value(&self, key: &str) -> i64 {
-        self.conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap_or(0)
+        read_meta(&self.conn, "index_generation")
     }
 
     /// Bumped (inside the same transaction) whenever file/symbol/raw-ref rows change.
     pub fn files_generation(&self) -> Result<i64> {
-        Ok(self.meta_value("files_generation"))
+        read_meta(&self.conn, "files_generation")
     }
 
     /// The `files_generation` the current edge set was built from. When it lags behind
     /// `files_generation` (a crash or a lost race between upsert and edge rebuild), the next
     /// index run rebuilds the edges.
     pub fn edges_generation(&self) -> Result<i64> {
-        Ok(self.meta_value("edges_generation"))
+        read_meta(&self.conn, "edges_generation")
     }
 
     pub fn bump_index_generation(&self) -> Result<i64> {
@@ -332,15 +316,6 @@ impl Database {
         Ok(())
     }
 
-    /// Unconditionally replaces all edges (tests / tools). Indexing uses
-    /// [`Database::replace_edges_if_current`].
-    pub fn replace_edges(&mut self, edges: &[Edge]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        write_edges(&tx, edges)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Replaces the edge set ONLY if no file rows changed since `built_from`
     /// (`files_generation` read before loading the data the edges were resolved from).
     ///
@@ -353,13 +328,8 @@ impl Database {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: i64 = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'files_generation'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // A read error must abort, never be mistaken for a matching generation.
+        let current = read_meta(&tx, "files_generation")?;
         if current != built_from {
             return Ok(false); // dropping `tx` rolls back
         }
@@ -644,6 +614,17 @@ impl Database {
             .execute("DELETE FROM notes WHERE id = ?1", params![id])?;
         Ok(())
     }
+}
+
+/// Reads a `meta` counter. A missing row is 0 (fresh or pre-0.5.1 index); any real SQLite
+/// error is returned instead of being turned into a value that could match by accident.
+fn read_meta(conn: &Connection, key: &str) -> Result<i64> {
+    let v = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get::<_, i64>(0)
+        })
+        .optional()?;
+    Ok(v.unwrap_or(0))
 }
 
 /// Increments a `meta` counter. Pass a `Transaction` to make it part of that transaction.

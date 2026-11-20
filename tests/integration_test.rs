@@ -515,13 +515,25 @@ fn interrupted_edge_rebuild_is_repaired_on_next_run() {
     let full = index_repository(root, false).unwrap();
     assert!(full.total_edges > 0);
 
-    // Simulate the crash window: file rows advanced, edges wiped and never rebuilt
+    // Simulate the crash window: file rows advanced, edges wiped and never rebuilt.
+    // White-box on purpose; the row-count asserts make a schema change fail loudly here
+    // instead of silently turning this into a no-op test.
     let conn = rusqlite::Connection::open(root.join(".trackertop/index.db")).unwrap();
-    conn.execute_batch(
-        "UPDATE meta SET value = value + 1 WHERE key = 'files_generation';
-         DELETE FROM edges;",
-    )
-    .unwrap();
+    let bumped = conn
+        .execute(
+            "UPDATE meta SET value = value + 1 WHERE key = 'files_generation'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        bumped, 1,
+        "meta.files_generation row missing: schema changed?"
+    );
+    let wiped = conn.execute("DELETE FROM edges", []).unwrap();
+    assert_eq!(
+        wiped, full.total_edges,
+        "edges table out of sync with stats"
+    );
     drop(conn);
 
     let repaired = index_repository(root, false).unwrap();
@@ -529,8 +541,12 @@ fn interrupted_edge_rebuild_is_repaired_on_next_run() {
     assert_eq!(repaired.total_edges, full.total_edges);
 }
 
-/// Several indexers racing while files change must converge on the same edge set as a
-/// clean full rebuild (previously a slow indexer could overwrite newer edges forever).
+/// End-to-end convergence check: several indexers racing while files change must end on the
+/// same edge set as a clean full rebuild.
+///
+/// Scheduling decides which interleavings actually happen, so this test alone does not prove
+/// the stale-snapshot guard; `db::tests::stale_edge_snapshot_cannot_overwrite_newer_state`
+/// (deterministic) and `interrupted_edge_rebuild_is_repaired_on_next_run` do.
 #[test]
 fn concurrent_indexers_never_leave_stale_edges() {
     let tmp = TempDir::new().unwrap();
@@ -538,13 +554,16 @@ fn concurrent_indexers_never_leave_stale_edges() {
     write_call_graph_repo(&root, 1);
     index_repository(&root, false).unwrap();
 
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
     std::thread::scope(|s| {
         for _ in 0..4 {
             let root = root.clone();
+            let errors = &errors;
             s.spawn(move || {
                 for _ in 0..6 {
-                    // Lost races surface as a retryable error, never as silent corruption
-                    let _ = index_repository(&root, false);
+                    if let Err(e) = index_repository(&root, false) {
+                        errors.lock().unwrap().push(format!("{e:#}"));
+                    }
                 }
             });
         }
@@ -553,6 +572,14 @@ fn concurrent_indexers_never_leave_stale_edges() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+
+    // The only acceptable failure is the documented retryable "index kept changing" error.
+    for e in errors.into_inner().unwrap() {
+        assert!(
+            e.contains("kept changing"),
+            "unexpected indexing error: {e}"
+        );
+    }
 
     let settled = index_repository(&root, false).unwrap();
     let clean = index_repository(&root, true).unwrap();

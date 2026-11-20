@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 
 /// Writes `contents` to `path` atomically: data goes to a sibling temp file, is flushed to
 /// disk (`fsync`), and is then renamed over the target. Readers never observe a half-written
-/// file, and a power loss right after the rename cannot leave an empty file behind.
-/// A failed write never leaves the temp file lying around.
+/// file, and the target never ends up empty: after a crash it holds either the old or the new
+/// contents. On Unix the parent directory is fsynced too, so the rename itself is durable
+/// (on Windows/NTFS the rename is a journaled metadata operation). A failed write never leaves
+/// the temp file lying around.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -33,8 +35,23 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to replace {}", path.display()));
     }
+    sync_parent_dir(path);
     Ok(())
 }
+
+/// Makes a completed rename durable on Unix. Best effort: some filesystems reject fsync on
+/// directories, and the new contents are already in place either way.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -67,11 +84,27 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let bak = sibling_path(path, "trackertop.bak");
-    if bak.exists() {
-        return Ok(Some(bak));
+    // `create_new` makes "first backup wins" atomic: if two installers race, exactly one
+    // creates the file and the other sees AlreadyExists (no check-then-copy window).
+    let mut out = match OpenOptions::new().write(true).create_new(true).open(&bak) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(Some(bak)),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to create backup {}", bak.display()));
+        }
+    };
+    let copied = (|| -> std::io::Result<()> {
+        let mut src = File::open(path)?;
+        std::io::copy(&mut src, &mut out)?;
+        out.sync_all()
+    })();
+    if let Err(e) = copied {
+        // A partial backup must not later be mistaken for the pristine copy.
+        drop(out);
+        let _ = std::fs::remove_file(&bak);
+        return Err(e)
+            .with_context(|| format!("failed to back up {} to {}", path.display(), bak.display()));
     }
-    std::fs::copy(path, &bak)
-        .with_context(|| format!("failed to back up {} to {}", path.display(), bak.display()))?;
     Ok(Some(bak))
 }
 
@@ -203,6 +236,22 @@ mod tests {
         // Old-style lock file nobody holds an OS lock on
         std::fs::write(dir.path().join("reg.json.lock"), b"").unwrap();
         assert!(FileLock::acquire(&p, Duration::from_millis(10)).is_ok());
+    }
+
+    #[test]
+    fn racing_backups_never_overwrite_the_first_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "original").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| backup_file(&p).unwrap());
+            }
+            // Meanwhile the config changes; only a copy of "original" may ever be kept
+            s.spawn(|| std::fs::write(&p, "original").unwrap());
+        });
+        let bak = dir.path().join("settings.json.trackertop.bak");
+        assert_eq!(std::fs::read_to_string(bak).unwrap(), "original");
     }
 
     #[test]
