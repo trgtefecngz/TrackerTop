@@ -23,5 +23,5 @@ cargo build --release
 ## Pull Request Guidelines
 
 - Keep all code, comments, UI labels, and docs in English.
-- Add an integration test in `tests/integration_test.rs` for any new language extractor or MCP tool.
+- Add an integration test for any new language extractor or MCP tool in the matching `tests/*.rs` file (`tests/languages.rs` for extractors, `tests/queries.rs` for query tools; shared helpers live in `tests/common/mod.rs`).
 - Ensure `cargo test` passes with zero warnings.

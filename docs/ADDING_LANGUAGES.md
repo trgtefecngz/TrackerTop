@@ -62,7 +62,7 @@ In `src/parser/mod.rs`:
 
 ### Step 3: Add a Test
 
-Add a test fixture in `tests/integration_test.rs` verifying that your extractor discovers symbols, builds edges, and appears in MCP queries.
+Add a test fixture in `tests/languages.rs` verifying that your extractor discovers symbols, builds edges, and appears in MCP queries.
 
 ---
 

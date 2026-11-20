@@ -1,0 +1,283 @@
+//! Incremental indexing: caching, rehashing, interrupted and concurrent runs, extractor revisions.
+
+mod common;
+
+use common::*;
+use tempfile::TempDir;
+use trackertop::context::TrackerEngine;
+use trackertop::indexer::index_repository;
+
+/// The MCP engine caches the built graph between calls; it must still see edits made
+/// in this process AND re-indexes performed by another process (GUI / second MCP server).
+#[test]
+fn graph_cache_never_serves_stale_symbols() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn alpha_fn() -> u8 { 1 }\n").unwrap();
+
+    let engine = TrackerEngine::new(root);
+    let found = |e: &TrackerEngine, name: &str| {
+        !e.read_symbol(name, false, 0)
+            .unwrap()
+            .text
+            .contains("NOT FOUND IN INDEX")
+    };
+
+    assert!(found(&engine, "alpha_fn"));
+    assert!(!found(&engine, "beta_fn"));
+    // Served from cache: still correct
+    assert!(found(&engine, "alpha_fn"));
+
+    // Edit in place (different size, so detection does not depend on mtime resolution)
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() -> u8 { 1 }\npub fn beta_fn() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    assert!(found(&engine, "beta_fn"));
+
+    // Another engine (stands in for another process) re-indexes first
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() -> u8 { 1 }\npub fn beta_fn() -> u8 { 2 }\npub fn gamma_fn() -> u8 { 3 }\n",
+    )
+    .unwrap();
+    let other = TrackerEngine::new(root);
+    assert!(found(&other, "gamma_fn"));
+    // `engine` sees no file changes itself, but the generation moved: must reload
+    assert!(found(&engine, "gamma_fn"));
+}
+
+/// A file whose timestamp changes but whose content does not (git checkout, no-op save)
+/// must be re-hashed once and then skipped again, without bumping the graph generation.
+#[test]
+fn touched_but_unchanged_files_are_not_rehashed_every_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    std::fs::write(&file, "pub fn stable_fn() -> u8 { 1 }\n").unwrap();
+
+    let first = index_repository(root, false).unwrap();
+    assert_eq!(first.total_files, 1);
+
+    // Touch to a different, settled (past) timestamp without changing the content
+    let touched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(touched_at)
+        .unwrap();
+
+    let touched = index_repository(root, false).unwrap();
+    assert_eq!(touched.parsed_files, 0);
+    assert_eq!(
+        touched.generation, first.generation,
+        "content unchanged: no graph rebuild"
+    );
+
+    let again = index_repository(root, false).unwrap();
+    assert_eq!(
+        again.skipped_files, 1,
+        "refreshed mtime lets the fast path skip the file"
+    );
+}
+
+/// A run that wrote file rows but died before rebuilding edges must not lose those edges
+/// forever: the next (otherwise no-op) run notices and repairs them.
+#[test]
+fn interrupted_edge_rebuild_is_repaired_on_next_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_call_graph_repo(root, 3);
+    let full = index_repository(root, false).unwrap();
+    assert!(full.total_edges > 0);
+
+    // Simulate the crash window: file rows advanced, edges wiped and never rebuilt.
+    // White-box on purpose; the row-count asserts make a schema change fail loudly here
+    // instead of silently turning this into a no-op test.
+    let conn = open_existing_index(root);
+    let bumped = conn
+        .execute(
+            "UPDATE meta SET value = value + 1 WHERE key = 'files_generation'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        bumped, 1,
+        "meta.files_generation row missing: schema changed?"
+    );
+    let wiped = conn.execute("DELETE FROM edges", []).unwrap();
+    assert_eq!(
+        wiped, full.total_edges,
+        "edges table out of sync with stats"
+    );
+    drop(conn);
+
+    let repaired = index_repository(root, false).unwrap();
+    assert_eq!(repaired.parsed_files, 0);
+    assert_eq!(repaired.total_edges, full.total_edges);
+}
+
+/// End-to-end convergence check: several indexers racing while files change must end on the
+/// same edge set as a clean full rebuild.
+///
+/// Scheduling decides which interleavings actually happen, so this test alone does not prove
+/// the stale-snapshot guard; `db::tests::stale_edge_snapshot_cannot_overwrite_newer_state`
+/// (deterministic) and `interrupted_edge_rebuild_is_repaired_on_next_run` do.
+#[test]
+fn concurrent_indexers_never_leave_stale_edges() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_call_graph_repo(&root, 1);
+    index_repository(&root, false).unwrap();
+
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let root = root.clone();
+            let errors = &errors;
+            s.spawn(move || {
+                for _ in 0..6 {
+                    if let Err(e) = index_repository(&root, false) {
+                        errors.lock().unwrap().push(format!("{e:#}"));
+                    }
+                }
+            });
+        }
+        for n in 2..8 {
+            write_call_graph_repo(&root, n);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    // The only acceptable failure is the documented retryable "index kept changing" error.
+    for e in errors.into_inner().unwrap() {
+        assert!(
+            e.contains("kept changing"),
+            "unexpected indexing error: {e}"
+        );
+    }
+
+    let settled = index_repository(&root, false).unwrap();
+    let settled_edges = edge_set(&root);
+    let clean = index_repository(&root, true).unwrap();
+    assert_eq!(settled.total_symbols, clean.total_symbols);
+    // Compare the actual edges, not just their count: a wrong set with the same size must fail.
+    assert_eq!(settled_edges, edge_set(&root));
+    assert_eq!(settled_edges.len(), clean.total_edges);
+}
+
+/// "Racy" edit: two same-size versions of a file written within the same second share the
+/// same (second-resolution) mtime and size. The second version must still be indexed.
+#[test]
+fn same_second_same_size_edit_is_not_missed() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    // A stamp that is never "in the past" during this test, so both writes are racy no matter
+    // how slow the machine is (a stamp of `now` would depend on the first index finishing
+    // within a second).
+    let stamp = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let write_with_stamp = |body: &str| {
+        std::fs::write(&file, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    };
+
+    write_with_stamp("pub fn alpha_v1() -> u8 { 1 }\n");
+    index_repository(root, false).unwrap();
+    // Same length, same mtime: invisible to a naive mtime+size fast path
+    write_with_stamp("pub fn omega_v2() -> u8 { 2 }\n");
+    let second = index_repository(root, false).unwrap();
+
+    assert_eq!(second.parsed_files, 1, "racy edit was skipped");
+    let engine = TrackerEngine::new(root);
+    assert!(
+        !engine
+            .read_symbol("omega_v2", false, 0)
+            .unwrap()
+            .text
+            .contains("NOT FOUND IN INDEX")
+    );
+}
+
+/// Once a file's mtime is safely in the past, the mtime+size fast path skips it again
+/// (racy handling must not turn into re-hashing every file on every run).
+#[test]
+fn settled_files_take_the_fast_path_again() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    std::fs::write(&file, "pub fn settled_fn() -> u8 { 1 }\n").unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+
+    index_repository(root, false).unwrap();
+    let again = index_repository(root, false).unwrap();
+    assert_eq!(again.skipped_files, 1);
+}
+
+/// An index written by another extractor revision is re-parsed in full: unchanged files
+/// must not keep the references an older extractor produced (stale edges, all tools).
+#[test]
+fn index_from_another_extractor_revision_is_reparsed_in_full() {
+    use trackertop::db::Database;
+    use trackertop::indexer::{EXTRACTOR_REVISION, index_repository};
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "pub fn a() -> i32 { b() }\n").unwrap();
+    std::fs::write(root.join("src/b.rs"), "pub fn b() -> i32 { 1 }\n").unwrap();
+    let first = index_repository(root, false).unwrap();
+    assert_eq!(first.parsed_files, 2);
+    let db = Database::open_for_repo(root).unwrap();
+    assert_eq!(db.extractor_revision().unwrap(), EXTRACTOR_REVISION);
+    assert_eq!(index_repository(root, false).unwrap().parsed_files, 0);
+
+    // Simulate an index from an older TrackerTop, with a file deleted meanwhile
+    db.set_extractor_revision(EXTRACTOR_REVISION - 1).unwrap();
+    std::fs::remove_file(root.join("src/b.rs")).unwrap();
+    let upgraded = index_repository(root, false).unwrap();
+    assert_eq!(upgraded.parsed_files, 1, "the unchanged file is re-parsed");
+    assert_eq!(upgraded.deleted_files, 1, "deletions are still detected");
+    assert_eq!(db.extractor_revision().unwrap(), EXTRACTOR_REVISION);
+    assert_eq!(index_repository(root, false).unwrap().parsed_files, 0);
+}
+
+/// A full re-parse drops the rows of a file it could not re-parse (here: no longer valid
+/// UTF-8), instead of keeping the old extractor's symbols and marking the index current.
+#[test]
+fn full_reparse_drops_files_it_could_not_reparse() {
+    use trackertop::db::Database;
+    use trackertop::indexer::{EXTRACTOR_REVISION, index_repository};
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "pub fn a() -> i32 { b() }\n").unwrap();
+    std::fs::write(root.join("src/b.rs"), "pub fn b() -> i32 { 1 }\n").unwrap();
+    index_repository(root, false).unwrap();
+    let db = Database::open_for_repo(root).unwrap();
+    db.set_extractor_revision(EXTRACTOR_REVISION - 1).unwrap();
+    std::fs::write(root.join("src/b.rs"), [0xff, 0xfe, b'f', b'n']).unwrap();
+    index_repository(root, false).unwrap();
+    let files = db.load_file_map().unwrap();
+    assert!(files.contains_key("src/a.rs"));
+    assert!(
+        !files.contains_key("src/b.rs"),
+        "rows from the old extractor survived a full re-parse"
+    );
+}
