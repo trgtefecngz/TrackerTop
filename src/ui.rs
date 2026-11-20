@@ -22,7 +22,7 @@ use crate::db::{Database, note_target_matches};
 use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
 use crate::indexer::{IndexProgress, index_repository_with_progress};
 use crate::install::{AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed};
-use crate::model::{EdgeKind, ProjectNote, SymbolKind, TokenStatsSummary};
+use crate::model::{EdgeKind, ProjectNote, TokenStatsSummary};
 use crate::nested::{NestedGraph, NestedKind, NestedLevel, NestedView};
 use crate::parser::default_registry;
 use crate::registry::{
@@ -150,6 +150,9 @@ pub struct TrackerTopApp {
     last_activity_check: Instant,
     #[cfg(debug_assertions)]
     tour: Option<tour::Tour>,
+    /// Where the status bar drew the latest agent call (the tour clicks it).
+    #[cfg(debug_assertions)]
+    agent_action_rect: Option<egui::Rect>,
 
     // Nested (matryoshka) view state: the level being shown and its cached view, keyed by
     // (project path, level). An error (e.g. a group vanished after re-indexing) is shown,
@@ -212,6 +215,8 @@ impl TrackerTopApp {
             last_activity_check: Instant::now(),
             #[cfg(debug_assertions)]
             tour: tour::Tour::from_env(),
+            #[cfg(debug_assertions)]
+            agent_action_rect: None,
             nested_level: NestedLevel::Project,
             nested_cache: None,
         };
@@ -383,6 +388,11 @@ impl TrackerTopApp {
 }
 
 impl eframe::App for TrackerTopApp {
+    #[cfg(debug_assertions)]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.tour_input(raw_input);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(debug_assertions)]
         self.tour_tick(ctx);
@@ -885,7 +895,7 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| cg.symbols.get(id))
-                    .filter(|s| s.kind != SymbolKind::File && s.kind != SymbolKind::Impl)
+                    .filter(|s| s.kind.is_counted())
                     .map(|s| {
                         (
                             s.qualified_name.clone(),
@@ -935,11 +945,7 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         }
     }
 
-    let total_symbols = cg
-        .symbols
-        .values()
-        .filter(|s| s.kind != SymbolKind::File && s.kind != SymbolKind::Impl)
-        .count();
+    let total_symbols = cg.symbols.values().filter(|s| s.kind.is_counted()).count();
     let total_repo_tokens = cg.files.values().map(|f| f.token_count).sum();
 
     Ok(LoadedProject {

@@ -364,3 +364,32 @@ fn parsing_progress_counts_every_changed_file() {
     );
     assert_eq!(progress.files(), (40, 40), "every changed file was counted");
 }
+
+/// The app shows a symbol count in its header and in its status bar (from the project
+/// snapshot): both must count the same thing, code symbols without file rows and `impl`
+/// blocks, or the same screen shows two different numbers.
+#[test]
+fn project_snapshot_counts_code_symbols_only() {
+    use trackertop::registry::{ProjectEntry, project_snapshot};
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub struct S;\nimpl S {\n    pub fn m(&self) {}\n}\npub fn f() {}\n",
+    )
+    .unwrap();
+    index_repository(root, false).unwrap();
+
+    let snap = project_snapshot(ProjectEntry {
+        path: root.to_string_lossy().to_string(),
+        name: "p".to_string(),
+        added_at: String::new(),
+        last_seen: String::new(),
+    });
+    assert!(snap.indexed);
+    assert_eq!(snap.total_files, 1);
+    // S, S::m, f — not the file row, not the impl block
+    assert_eq!(snap.total_symbols, 3);
+}

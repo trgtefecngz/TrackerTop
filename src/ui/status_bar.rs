@@ -94,7 +94,12 @@ impl TrackerTopApp {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     self.render_index_state(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        open_journal = self.render_latest_call(ui);
+                        let resp = self.render_latest_call(ui);
+                        open_journal = resp.as_ref().is_some_and(egui::Response::clicked);
+                        #[cfg(debug_assertions)]
+                        {
+                            self.agent_action_rect = resp.map(|r| r.rect);
+                        }
                     });
                 });
             });
@@ -213,17 +218,13 @@ impl TrackerTopApp {
         };
     }
 
-    /// Draws the latest agent call; returns `true` when it was clicked.
-    fn render_latest_call(&self, ui: &mut egui::Ui) -> bool {
-        let Some(sel) = self.selected_path() else {
-            return false;
-        };
+    /// Draws the latest agent call; `None` when there is none to show.
+    fn render_latest_call(&self, ui: &mut egui::Ui) -> Option<egui::Response> {
+        let sel = self.selected_path()?;
         if !self.status.path.eq_ignore_ascii_case(sel) {
-            return false;
+            return None;
         }
-        let Some(call) = &self.status.last_call else {
-            return false;
-        };
+        let call = self.status.last_call.as_ref()?;
         let (agent, tool, target) = call_headline(call);
         let age = secs_since(&call.timestamp, chrono::Utc::now().timestamp()).map(fmt_age);
 
@@ -252,7 +253,7 @@ impl TrackerTopApp {
         }
         hover.push_str(&format!("\nResult: {}", call.outcome));
         hover.push_str("\n\nClick to open the work journal (AI Memory).");
-        resp.on_hover_text(hover).clicked()
+        Some(resp.on_hover_text(hover))
     }
 }
 
