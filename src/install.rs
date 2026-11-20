@@ -87,31 +87,44 @@ pub fn generic_mcp_json_snippet() -> String {
     serde_json::to_string_pretty(&val).unwrap_or_default()
 }
 
+/// True only when the agent's config actually registers a `trackertop` MCP server.
+///
+/// A plain substring search gave false positives: the Claude SessionStart hook in
+/// `~/.claude/settings.json` contains the TrackerTop path even when `claude mcp add` failed.
 pub fn is_agent_installed(agent: AiAgentKind) -> bool {
     let Some(home) = user_home() else {
         return false;
     };
-    let paths: Vec<PathBuf> = match agent {
-        AiAgentKind::ClaudeCode => vec![
-            home.join(".claude.json"),
-            home.join(".claude").join("settings.json"),
-        ],
-        AiAgentKind::Cursor => vec![home.join(".cursor").join("mcp.json")],
-        AiAgentKind::Codex => vec![home.join(".codex").join("config.toml")],
-        AiAgentKind::Windsurf => vec![
-            home.join(".codeium")
-                .join("windsurf")
-                .join("mcp_config.json"),
-        ],
+    let path = match agent {
+        // `claude mcp add --scope user` stores servers under top-level `mcpServers`
+        AiAgentKind::ClaudeCode => home.join(".claude.json"),
+        AiAgentKind::Cursor => home.join(".cursor").join("mcp.json"),
+        AiAgentKind::Codex => home.join(".codex").join("config.toml"),
+        AiAgentKind::Windsurf => home
+            .join(".codeium")
+            .join("windsurf")
+            .join("mcp_config.json"),
     };
-    for p in paths {
-        if let Ok(content) = std::fs::read_to_string(p)
-            && content.contains("trackertop")
-        {
-            return true;
-        }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match agent {
+        AiAgentKind::Codex => toml_registers_trackertop(&content),
+        _ => json_registers_trackertop(&content),
     }
-    false
+}
+
+fn json_registers_trackertop(content: &str) -> bool {
+    serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| v.get("mcpServers")?.get("trackertop").cloned())
+        .is_some_and(|s| s.is_object())
+}
+
+fn toml_registers_trackertop(content: &str) -> bool {
+    content
+        .lines()
+        .any(|l| l.trim() == "[mcp_servers.trackertop]")
 }
 
 /// Checks whether TrackerTop appears registered in user-level Claude Code configuration.
@@ -434,5 +447,40 @@ mod tests {
         assert_eq!(read_json_config(&p).unwrap(), json!({}));
         std::fs::write(&p, "  \n").unwrap();
         assert_eq!(read_json_config(&p).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn first_write_creates_missing_parent_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir
+            .path()
+            .join(".codeium")
+            .join("windsurf")
+            .join("mcp_config.json");
+        merge_json_mcp_config(&p).unwrap();
+        assert!(json_registers_trackertop(
+            &std::fs::read_to_string(&p).unwrap()
+        ));
+    }
+
+    #[test]
+    fn installed_detection_requires_a_real_mcp_registration() {
+        // Hook-only settings mention the binary path but register no MCP server
+        let hook_only = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"C:/x/trackertop.exe\" hook-hint"}]}]}}"#;
+        assert!(!json_registers_trackertop(hook_only));
+        assert!(!json_registers_trackertop(
+            r#"{"projects":{"C:/trackertop":{}}}"#
+        ));
+        assert!(!json_registers_trackertop("not json trackertop"));
+        assert!(json_registers_trackertop(
+            r#"{"mcpServers":{"trackertop":{"command":"t","args":["mcp"]}}}"#
+        ));
+
+        assert!(toml_registers_trackertop(
+            "[other]\nx = 1\n\n[mcp_servers.trackertop]\ncommand = \"t\"\n"
+        ));
+        assert!(!toml_registers_trackertop(
+            "# [mcp_servers.trackertop] removed\n"
+        ));
     }
 }

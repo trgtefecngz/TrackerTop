@@ -278,29 +278,46 @@ impl TrackerTopApp {
     }
 
     fn reset_project_stats(&mut self, repo_path: &str) {
-        if let Ok(db) = Database::open_for_repo(Path::new(repo_path))
-            && db.clear_telemetry().is_ok()
-        {
-            self.status_banner = "Reset token-savings telemetry to 0 for this project.".to_string();
-            self.reload_overview();
-            if let Some(ref mut lp) = self.loaded {
-                lp.stats = db.get_token_stats(30).unwrap_or_default();
+        let result = Database::open_for_repo(Path::new(repo_path))
+            .and_then(|db| db.clear_telemetry().map(|()| db));
+        match result {
+            Ok(db) => {
+                self.status_banner =
+                    "Reset token-savings telemetry to 0 for this project.".to_string();
+                self.reload_overview();
+                if let Some(ref mut lp) = self.loaded {
+                    lp.stats = db.get_token_stats(30).unwrap_or_default();
+                }
             }
+            Err(e) => self.status_banner = format!("Could not reset stats: {e:#}"),
         }
     }
 
     fn poll_background(&mut self) {
-        if let Some(ref rx) = self.bg_rx
-            && let Ok(msg) = rx.try_recv()
-        {
-            self.bg_busy = false;
-            self.bg_rx = None;
-            self.status_banner = msg.status;
-            if let Some(p) = msg.select_path {
-                self.selection = Selection::Project(p);
+        let Some(ref rx) = self.bg_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(msg) => {
+                self.bg_busy = false;
+                self.bg_rx = None;
+                self.status_banner = msg.status;
+                if let Some(p) = msg.select_path {
+                    self.selection = Selection::Project(p);
+                }
+                self.reload_overview();
+                self.reload_selected_project();
             }
-            self.reload_overview();
-            self.reload_selected_project();
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The worker died (panicked) without reporting: unlock the UI instead of
+                // leaving Re-Index / Add Project disabled forever.
+                self.bg_busy = false;
+                self.bg_rx = None;
+                self.status_banner =
+                    "Indexing stopped unexpectedly. Please try Re-Index again.".to_string();
+                self.reload_overview();
+            }
         }
     }
 
@@ -2227,14 +2244,19 @@ impl TrackerTopApp {
             }
         });
 
-        if let Some((rp, target, content)) = add_note_req
-            && let Ok(db) = Database::open_for_repo(Path::new(&rp))
-        {
-            let _ = db.add_note(&target, &content);
-            self.note_content_input.clear();
-            self.status_banner = format!("Saved memory note for `{target}`");
-            if let Some(ref mut lp_mut) = self.loaded {
-                lp_mut.notes = db.list_notes(None).unwrap_or_default();
+        if let Some((rp, target, content)) = add_note_req {
+            let saved = Database::open_for_repo(Path::new(&rp))
+                .and_then(|db| db.add_note(&target, &content).map(|_| db));
+            match saved {
+                Ok(db) => {
+                    // Only clear the input once the note is really stored
+                    self.note_content_input.clear();
+                    self.status_banner = format!("Saved memory note for `{target}`");
+                    if let Some(ref mut lp_mut) = self.loaded {
+                        lp_mut.notes = db.list_notes(None).unwrap_or_default();
+                    }
+                }
+                Err(e) => self.status_banner = format!("Could not save note: {e:#}"),
             }
         }
         if let Some((rp, id)) = del_note_req

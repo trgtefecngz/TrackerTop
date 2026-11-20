@@ -156,8 +156,16 @@ pub fn index_repository_with_registry(
         });
     }
 
+    enum Outcome {
+        Parsed(FileRecord, Vec<Symbol>, Vec<RawReference>),
+        /// Timestamp changed but content did not (e.g. `git checkout`, editor save without
+        /// edits): only the stored mtime/size need refreshing, otherwise the file would be
+        /// re-read and re-hashed on every later run.
+        Touched(String, i64, u64),
+    }
+
     // Read, hash, and parse changed candidates in parallel with rayon
-    let parsed_batch: Vec<(FileRecord, Vec<Symbol>, Vec<RawReference>)> = candidates
+    let outcomes: Vec<Outcome> = candidates
         .into_par_iter()
         .filter_map(|cand| {
             let source = std::fs::read_to_string(&cand.abs_path).ok()?;
@@ -166,7 +174,7 @@ pub fn index_repository_with_registry(
             if let Some(prev) = existing.get(&cand.rel_path)
                 && prev.hash == hash
             {
-                return None;
+                return Some(Outcome::Touched(cand.rel_path, cand.mtime, cand.size));
             }
 
             let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
@@ -181,9 +189,21 @@ pub fn index_repository_with_registry(
                 line_count,
                 token_count,
             };
-            Some((rec, parsed.symbols, parsed.refs))
+            Some(Outcome::Parsed(rec, parsed.symbols, parsed.refs))
         })
         .collect();
+
+    let mut parsed_batch: Vec<(FileRecord, Vec<Symbol>, Vec<RawReference>)> = Vec::new();
+    let mut touched: Vec<(String, i64, u64)> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Outcome::Parsed(rec, syms, refs) => parsed_batch.push((rec, syms, refs)),
+            Outcome::Touched(path, mtime, size) => touched.push((path, mtime, size)),
+        }
+    }
+    if !touched.is_empty() {
+        db.update_file_stats(&touched)?;
+    }
 
     let parsed_files = parsed_batch.len();
     let deleted_files = deleted.len();

@@ -455,3 +455,38 @@ fn graph_cache_never_serves_stale_symbols() {
     // `engine` sees no file changes itself, but the generation moved: must reload
     assert!(found(&engine, "gamma_fn"));
 }
+
+/// A file whose timestamp changes but whose content does not (git checkout, no-op save)
+/// must be re-hashed once and then skipped again, without bumping the graph generation.
+#[test]
+fn touched_but_unchanged_files_are_not_rehashed_every_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    std::fs::write(&file, "pub fn stable_fn() -> u8 { 1 }\n").unwrap();
+
+    let first = index_repository(root, false).unwrap();
+    assert_eq!(first.total_files, 1);
+
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    let touched = index_repository(root, false).unwrap();
+    assert_eq!(touched.parsed_files, 0);
+    assert_eq!(
+        touched.generation, first.generation,
+        "content unchanged: no graph rebuild"
+    );
+
+    let again = index_repository(root, false).unwrap();
+    assert_eq!(
+        again.skipped_files, 1,
+        "refreshed mtime lets the fast path skip the file"
+    );
+}

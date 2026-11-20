@@ -206,6 +206,23 @@ impl Database {
         Ok(map)
     }
 
+    /// Refreshes stored mtime/size for files whose content hash is unchanged.
+    pub fn update_file_stats(&mut self, entries: &[(String, i64, u64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE files SET mtime_secs = ?2, size_bytes = ?3 WHERE path = ?1")?;
+            for (path, mtime, size) in entries {
+                stmt.execute(params![path, mtime, *size as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_files(&mut self, paths: &[String]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());

@@ -79,17 +79,54 @@ const REGISTRY_LOCK_STALE: Duration = Duration::from_secs(30);
 /// per-query re-index of every MCP call does not rewrite `projects.json` each time.
 const LAST_SEEN_REFRESH_SECS: i64 = 300;
 
-/// Reads the registry. Missing/empty file -> empty registry; unparseable file -> `Err`.
-fn read_registry_at(path: &Path) -> Result<RegistryFile> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RegistryFile::default()),
-        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
-    };
-    if text.trim().is_empty() {
-        return Ok(RegistryFile::default());
+/// Project paths are case-insensitive on Windows and (by default) macOS, but two directories
+/// differing only in case are different projects on Linux.
+fn same_project_path(a: &str, b: &str) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
     }
-    serde_json::from_str(&text).with_context(|| format!("{} is corrupted", path.display()))
+}
+
+/// Raw registry text. Missing file -> `Ok(None)`. Any other I/O failure (permission or
+/// sharing violation, ...) is an `Err` and must NOT be mistaken for corruption.
+fn read_registry_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Parses registry text. Empty text -> empty registry; unparseable -> `None` (corrupted).
+fn parse_registry(text: &str) -> Option<RegistryFile> {
+    if text.trim().is_empty() {
+        return Some(RegistryFile::default());
+    }
+    serde_json::from_str(text).ok()
+}
+
+/// Reads the registry. Missing/empty file -> empty registry; I/O error or corruption -> `Err`.
+fn read_registry_at(path: &Path) -> Result<RegistryFile> {
+    match read_registry_text(path)? {
+        None => Ok(RegistryFile::default()),
+        Some(text) => {
+            parse_registry(&text).with_context(|| format!("{} is corrupted", path.display()))
+        }
+    }
+}
+
+/// Unused `projects.json.corrupt-<timestamp>[-n]` name next to `path`.
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let stamp = Utc::now().format("%Y%m%d%H%M%S%3f");
+    let mut candidate = path.with_file_name(format!("projects.json.corrupt-{stamp}"));
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = path.with_file_name(format!("projects.json.corrupt-{stamp}-{n}"));
+        n += 1;
+    }
+    candidate
 }
 
 /// Lenient read for display purposes only (never used as the base for a write).
@@ -100,17 +137,17 @@ fn load_registry_file() -> RegistryFile {
 }
 
 /// Locked read-modify-write of the registry at `path`. `mutate` returns whether anything
-/// changed. A corrupted file is moved aside to `projects.json.corrupt-<timestamp>` (kept for
-/// manual recovery) instead of being silently overwritten.
+/// changed. An unparseable file is moved aside to `projects.json.corrupt-<timestamp>` (kept
+/// for manual recovery) instead of being silently overwritten. An I/O error while reading
+/// (e.g. antivirus briefly holding the file) aborts the update and leaves the file alone.
 fn update_registry_at(path: &Path, mutate: impl FnOnce(&mut RegistryFile) -> bool) -> Result<()> {
     let _lock = FileLock::acquire(path, REGISTRY_LOCK_WAIT, REGISTRY_LOCK_STALE)?;
-    let mut reg = match read_registry_at(path) {
-        Ok(r) => r,
-        Err(_) => {
-            let aside = path.with_file_name(format!(
-                "projects.json.corrupt-{}",
-                Utc::now().format("%Y%m%d%H%M%S")
-            ));
+    let parsed = read_registry_text(path)?.map(|text| parse_registry(&text));
+    let mut reg = match parsed {
+        None => RegistryFile::default(),
+        Some(Some(r)) => r,
+        Some(None) => {
+            let aside = corrupt_backup_path(path);
             std::fs::rename(path, &aside).with_context(|| {
                 format!(
                     "{} is corrupted and could not be moved aside",
@@ -142,7 +179,7 @@ fn upsert_project(reg: &mut RegistryFile, canon: &str) -> bool {
     if let Some(existing) = reg
         .projects
         .iter_mut()
-        .find(|p| p.path.eq_ignore_ascii_case(canon))
+        .find(|p| same_project_path(&p.path, canon))
     {
         if is_recently_seen(existing) && existing.name == name {
             return false;
@@ -176,7 +213,7 @@ pub fn register_project(repo_root: &Path) -> Result<()> {
         && reg
             .projects
             .iter()
-            .any(|p| p.path.eq_ignore_ascii_case(&canon) && is_recently_seen(p))
+            .any(|p| same_project_path(&p.path, &canon) && is_recently_seen(p))
     {
         return Ok(());
     }
@@ -190,7 +227,7 @@ pub fn remove_project(repo_path: &str) -> Result<()> {
     update_registry_at(&path, |reg| {
         let before = reg.projects.len();
         reg.projects
-            .retain(|p| !p.path.eq_ignore_ascii_case(repo_path));
+            .retain(|p| !same_project_path(&p.path, repo_path));
         reg.projects.len() != before
     })
 }
@@ -317,5 +354,46 @@ mod tests {
         let mut reg = RegistryFile::default();
         assert!(upsert_project(&mut reg, "C:/work/repo"));
         assert!(!upsert_project(&mut reg, "C:/work/repo"));
+    }
+
+    #[test]
+    fn read_errors_are_not_treated_as_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: reading fails with an I/O error, not NotFound
+        let path = dir.path().join("projects.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(update_registry_at(&path, |reg| upsert_project(reg, "C:/work/repo")).is_err());
+        assert!(path.is_dir(), "registry must be left untouched");
+        let moved_aside = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(!moved_aside);
+    }
+
+    #[test]
+    fn repeated_corruption_backups_never_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        for _ in 0..3 {
+            std::fs::write(&path, "{ not json").unwrap();
+            update_registry_at(&path, |reg| upsert_project(reg, "C:/work/repo")).unwrap();
+        }
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(backups, 3);
+    }
+
+    #[test]
+    fn path_case_sensitivity_follows_the_platform() {
+        assert!(same_project_path("C:/Work/Repo", "C:/Work/Repo"));
+        assert_eq!(
+            same_project_path("/home/me/Repo", "/home/me/repo"),
+            cfg!(any(windows, target_os = "macos"))
+        );
     }
 }
