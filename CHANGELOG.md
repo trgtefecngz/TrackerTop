@@ -36,6 +36,15 @@ v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 - Every note is also written as Markdown in `.trackertop/notes/`. If the index database is deleted or rebuilt, the notes are restored from those files.
 - The existing notes table is migrated in place; old notes become kind `note`.
 
+### Fixed: pre-release review
+- A note on a type's member (`Store::load`) was shown when reading any symbol with the same bare name (`Config::load`), so a dismissed lead on one could silence the other. Member notes now match only their own symbol; module-qualified notes (`registry::load`) still match the free function.
+- `changes_since` in a project that is a subfolder of a git repository (a monorepo package) mapped no hunks, because git reported paths from the repository top level. Diffs and old file versions are now read relative to the project.
+- `run_checks`:
+  - `cargo test -- --show-output` no longer reports passing tests as failures.
+  - Jest's `● Validation Warning:` and `● Deprecation Warning:` headings are no longer counted as failing tests.
+  - A test binary that crashes (signal, stack overflow) is reported even when other failures were recognized.
+- Notes restored from `.trackertop/notes/` keep their text when it contains a `Reason:` paragraph, and files re-saved with Windows line endings are no longer skipped.
+
 ### Fixed: false call edges in Rust
 - A qualified call such as `Stroke::new(...)` was resolved by its last segment alone, so it was tied to any `new` in the project. In this repository, `TrackerTopApp::new` showed 18 callers instead of 2, and `impact_analysis` reported the wrong blast radius.
   - `Type::f` now resolves only to that exact type's function, and `Self::f` to the surrounding impl's type.

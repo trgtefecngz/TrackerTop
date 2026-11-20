@@ -711,12 +711,15 @@ impl Database {
             .notes_dir()
             .context("index DB has no parent directory")?;
         std::fs::create_dir_all(&dir)?;
+        // The front-matter `reason` (a JSON string) is what restoring reads; the trailing
+        // `Reason:` paragraph is only for people reading the file.
         let mut body = format!(
-            "---\nid: {}\nkind: {}\ntarget: {}\ncreated_at: {}\n---\n\n{}\n",
+            "---\nid: {}\nkind: {}\ntarget: {}\ncreated_at: {}\nreason: {}\n---\n\n{}\n",
             n.id,
             n.kind,
             n.target.replace('\n', " "),
             n.created_at,
+            serde_json::to_string(&n.reason)?,
             n.content
         );
         if !n.reason.is_empty() {
@@ -957,20 +960,34 @@ mod tests {
 /// Whether a note attached to `note_target` belongs to `target` (a symbol name, qualified
 /// name or repo-relative path). Exact (case-insensitive), or equal to a whole trailing
 /// `::` segment run or a whole trailing path component run.
+///
+/// A note on a type's member (`Store::load`) does not match the bare name `load`: that name
+/// is also `Config::load`, and a dismissed lead on one must not silence the other. A note
+/// qualified by a module path (`registry::load`) still matches a free function `load`,
+/// because free functions are indexed without their module.
 pub fn note_target_matches(note_target: &str, target: &str) -> bool {
-    let n = note_target.trim().to_ascii_lowercase().replace('\\', "/");
-    let t = target.trim().to_ascii_lowercase().replace('\\', "/");
+    let norm = |s: &str| s.trim().replace('\\', "/");
+    let (n_raw, t_raw) = (norm(note_target), norm(target));
+    let (n, t) = (n_raw.to_ascii_lowercase(), t_raw.to_ascii_lowercase());
     if n.is_empty() || t.is_empty() {
         return false;
     }
+    let note_qualified_by_module = || {
+        n_raw
+            .rsplit_once("::")
+            .map(|(q, _)| q.rsplit("::").next().unwrap_or(q))
+            .is_some_and(|seg| !seg.starts_with(|c: char| c.is_uppercase()))
+    };
     n == t
         || t.ends_with(&format!("::{n}"))
-        || n.ends_with(&format!("::{t}"))
+        || (n.ends_with(&format!("::{t}")) && !t.contains("::") && note_qualified_by_module())
         || t.ends_with(&format!("/{n}"))
 }
 
-/// Parses a note written by `write_note_markdown`.
+/// Parses a note written by `write_note_markdown`. The reason is a JSON string in the front
+/// matter; files written before that keep it as a trailing `Reason:` paragraph.
 fn parse_note_markdown(text: &str) -> Option<ProjectNote> {
+    let text = text.replace("\r\n", "\n");
     let rest = text.strip_prefix("---\n")?;
     let (front, body) = rest.split_once("\n---\n")?;
     let field = |k: &str| {
@@ -980,9 +997,21 @@ fn parse_note_markdown(text: &str) -> Option<ProjectNote> {
         })
     };
     let body = body.trim();
-    let (content, reason) = match body.rsplit_once("\n\nReason: ") {
-        Some((c, r)) => (c.trim().to_string(), r.trim().to_string()),
-        None => (body.to_string(), String::new()),
+    let (content, reason) = match field("reason") {
+        Some(json) => {
+            let reason = serde_json::from_str::<String>(&json).ok()?;
+            let footer = format!("\n\nReason: {}", reason.trim());
+            let content = if reason.is_empty() {
+                body
+            } else {
+                body.strip_suffix(footer.as_str()).unwrap_or(body)
+            };
+            (content.trim().to_string(), reason)
+        }
+        None => match body.rsplit_once("\n\nReason: ") {
+            Some((c, r)) => (c.trim().to_string(), r.trim().to_string()),
+            None => (body.to_string(), String::new()),
+        },
     };
     Some(ProjectNote {
         id: field("id")?.parse().ok()?,
@@ -1034,13 +1063,38 @@ mod note_tests {
     fn note_targets_match_exactly_or_by_whole_segments() {
         assert!(note_target_matches("load", "load"));
         assert!(note_target_matches("load", "Store::load"));
-        assert!(note_target_matches("Store::load", "load"));
+        assert!(note_target_matches("Store::load", "Store::load"));
+        assert!(note_target_matches("registry::load", "load"));
+        // A member note must not leak to another type's method of the same name
+        assert!(!note_target_matches("Store::load", "load"));
+        assert!(!note_target_matches("Store::load", "Config::load"));
         assert!(note_target_matches("context.rs", "src/context.rs"));
         assert!(note_target_matches(r"SRC\Context.rs", "src/context.rs"));
         assert!(!note_target_matches("run", "run_checks"));
         assert!(!note_target_matches("run", "src/runner.rs"));
         assert!(!note_target_matches("load", "Store::reload"));
         assert!(!note_target_matches("", "x"));
+    }
+
+    #[test]
+    fn markdown_notes_round_trip_reason_text_and_crlf() {
+        // A plain note whose text itself has a `Reason:` paragraph keeps it as content
+        let text = "---\nid: 7\nkind: note\ntarget: x\ncreated_at: t\nreason: \"\"\n---\n\nUse A.\n\nReason: legacy API\n";
+        let n = parse_note_markdown(text).unwrap();
+        assert_eq!(n.content, "Use A.\n\nReason: legacy API");
+        assert_eq!(n.reason, "");
+        // A decision with a multi-line reason; file re-saved with CRLF
+        let text = "---\r\nid: 8\r\nkind: decision\r\ntarget: x\r\ncreated_at: t\r\nreason: \"slow\\nand flaky\"\r\n---\r\n\r\nKeep B.\r\n\r\nReason: slow\r\nand flaky\r\n";
+        let n = parse_note_markdown(text).unwrap();
+        assert_eq!((n.id, n.content.as_str()), (8, "Keep B."));
+        assert_eq!(n.reason, "slow\nand flaky");
+        // Files written before the front-matter reason still restore
+        let legacy = "---\nid: 9\nkind: dismissed\ntarget: x\ncreated_at: t\n---\n\nLead.\n\nReason: not reproducible\n";
+        let n = parse_note_markdown(legacy).unwrap();
+        assert_eq!(
+            (n.content.as_str(), n.reason.as_str()),
+            ("Lead.", "not reproducible")
+        );
     }
 
     #[test]

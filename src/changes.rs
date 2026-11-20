@@ -219,6 +219,9 @@ pub fn diff_since(
         "--no-ext-diff",
         "--unified=0",
         "--find-renames",
+        // Paths relative to the project root, and nothing outside it, even when the project
+        // is a subdirectory of the git repository (a monorepo package)
+        "--relative",
         commit,
         "--",
     ];
@@ -237,7 +240,8 @@ pub fn diff_since(
 
 fn old_symbol_names(repo_root: &Path, commit: &str, path: &str) -> Option<BTreeSet<String>> {
     let ext = default_registry().extractor_for_path(Path::new(path))?;
-    let old = git(repo_root, &["show", &format!("{commit}:{path}")]).ok()?;
+    // `./` makes the path relative to the project root, not the repository top level
+    let old = git(repo_root, &["show", &format!("{commit}:./{path}")]).ok()?;
     let parsed = ext.parse(path, &old).ok()?;
     Some(
         parsed

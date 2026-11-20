@@ -1315,3 +1315,38 @@ pub fn variant() { let _ = Kind::New(1); }
     assert_eq!(module.len(), 1, "{calls:?}");
     assert!(module[0].contains("src/util.rs::helper#"), "{calls:?}");
 }
+
+/// A project indexed from a subdirectory of a git repository (a monorepo package) must see
+/// its own changes with project-relative paths, and nothing from sibling packages.
+#[test]
+fn changes_since_works_when_the_project_is_a_git_subdirectory() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    let app = repo.join("packages/app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("packages/other")).unwrap();
+    std::fs::write(
+        app.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn gamma() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("packages/other/x.rs"), "pub fn x() {}\n").unwrap();
+    git_in(repo, &["init", "-q"]);
+    git_in(repo, &["add", "."]);
+    git_in(repo, &["commit", "-q", "-m", "init"]);
+
+    std::fs::write(
+        app.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    10\n}\n\npub fn delta() -> i32 {\n    4\n}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("packages/other/x.rs"), "pub fn x() { }\n").unwrap();
+    let engine = TrackerEngine::new(&app);
+
+    let out = engine.changes_since("HEAD", &[], &[], 4_000).unwrap().text;
+    assert!(out.contains("## src/lib.rs (modified"), "{out}");
+    assert!(out.contains("Touched: alpha [fn] L1-3"), "{out}");
+    assert!(out.contains("Added symbols: delta"), "{out}");
+    assert!(out.contains("Removed symbols: gamma"), "{out}");
+    assert!(!out.contains("other/x.rs"), "{out}");
+}

@@ -514,6 +514,9 @@ pub fn summarize(output: &str) -> CheckSummary {
     let mut s = CheckSummary::default();
     let lines: Vec<&str> = output.lines().collect();
     let mut current: Option<String> = None; // failure whose detail block we are in
+    // Inside cargo's `successes:` section (`--show-output`): its `---- name stdout ----`
+    // blocks belong to passing tests
+    let mut in_successes = false;
 
     for (i, raw) in lines.iter().enumerate() {
         let line = raw.trim_end();
@@ -527,6 +530,25 @@ pub fn summarize(output: &str) -> CheckSummary {
                 count_before(rest, " ignored").unwrap_or(0),
             );
             current = None;
+            in_successes = false;
+            continue;
+        }
+        if t == "successes:" {
+            in_successes = true;
+            current = None;
+            continue;
+        }
+        if t == "failures:" {
+            in_successes = false;
+        }
+        // A test binary that died abnormally (signal, stack overflow) prints no `test result`
+        // line. A normal test failure exits with 101; anything else is a crash and must be
+        // reported even when other failures were recognized.
+        if t.contains("process didn't exit successfully") && !t.contains("(exit code: 101)") {
+            s.errors.push(format!(
+                "test process crashed: {}",
+                t.trim_start_matches("error: ")
+            ));
             continue;
         }
         if let Some(rest) = t.strip_prefix("test ")
@@ -540,6 +562,10 @@ pub fn summarize(output: &str) -> CheckSummary {
                 .strip_suffix(" stdout ----")
                 .or_else(|| rest.strip_suffix(" stderr ----"))
         {
+            if in_successes {
+                current = None;
+                continue;
+            }
             s.add_failure(name);
             current = Some(name.trim().to_string());
             continue;
@@ -593,7 +619,12 @@ pub fn summarize(output: &str) -> CheckSummary {
             s.errors.push("Test suite failed to run".to_string());
             continue;
         }
-        if let Some(name) = t.strip_prefix("● ") {
+        // `● Validation Warning:`, `● Deprecation Warning:` and `● Console` are Jest
+        // headings printed on passing runs too, not failing tests
+        if let Some(name) = t.strip_prefix("● ")
+            && !name.trim_end().ends_with("Warning:")
+            && name.trim() != "Console"
+        {
             s.add_failure(name);
             current = Some(name.trim().to_string());
             continue;
@@ -900,6 +931,33 @@ error: test failed, to rerun pass `--lib`
                 .iter()
                 .any(|d| d.contains("add_test.go:9"))
         );
+    }
+
+    #[test]
+    fn passing_output_blocks_and_jest_warnings_are_not_failures() {
+        // `cargo test -- --show-output` prints passing tests' output under `successes:`
+        let cargo = "running 2 tests\ntest a ... ok\ntest b ... ok\n\nsuccesses:\n\n---- a stdout ----\nhello\n\nsuccesses:\n    a\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let s = summarize(cargo);
+        assert!(!s.found_problems(), "{s:?}");
+        assert_eq!((s.passed, s.failed), (Some(2), Some(0)));
+        // ...while failures after it are still found
+        let mixed = format!(
+            "{cargo}\nfailures:\n\n---- c stdout ----\nthread 'c' panicked at src/lib.rs:3:5\n\nfailures:\n    c\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        );
+        assert_eq!(summarize(&mixed).failures[0].name, "c");
+
+        let jest = "● Validation Warning:\n\n  Unknown option \"foo\".\n\n● Deprecation Warning:\n\nTests:       3 passed, 3 total\n";
+        let s = summarize(jest);
+        assert!(!s.found_problems(), "{s:?}");
+    }
+
+    #[test]
+    fn crashed_test_binary_is_reported_next_to_other_failures() {
+        let out = "test lib_a ... FAILED\n\nfailures:\n    lib_a\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\nerror: test failed, to rerun pass `--lib`\n\nCaused by:\n  process didn't exit successfully: `target/debug/deps/it-1` (exit code: 101)\n\nCaused by:\n  process didn't exit successfully: `target/debug/deps/it-2` (exit code: 0xc00000fd, STATUS_STACK_OVERFLOW)\n";
+        let s = summarize(out);
+        assert_eq!(s.failures.len(), 1);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert!(s.errors[0].contains("STATUS_STACK_OVERFLOW"), "{s:?}");
     }
 
     #[test]
