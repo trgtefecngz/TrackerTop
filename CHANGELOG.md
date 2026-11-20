@@ -6,6 +6,16 @@ All notable changes to TrackerTop are documented here.
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
+### Added: nested graph view (desktop app)
+- The Code Graph tab has a new layout, **Nested**. It shows one level at a time: project → communities → files → symbols. Click a node to drill in; use the breadcrumbs to go back up.
+- Edges are aggregated per level. A line between two communities stands for the number of symbol-level dependencies between them.
+- A coverage line states what is not drawn:
+  - edges that leave the current scope;
+  - edges inside a single node;
+  - children cut by the 400-node cap.
+- Group ids are stable across re-indexes. A community is named by its first file path, not by a number that shifts when files are added.
+- Fixed: a community's label could differ between runs on ties, because it depended on hash-map order. It is now deterministic.
+
 ### Changed: honest metrics
 - Every telemetry row records who made the call:
   - `mcp:<client name>`, taken from the MCP `initialize` request (for example `mcp:claude-code`);
