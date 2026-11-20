@@ -419,6 +419,20 @@ mod tests {
     }
 
     #[test]
+    fn config_is_not_modified_when_backup_path_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        let original = r#"{"theme":"dark"}"#;
+        std::fs::write(&p, original).unwrap();
+        // Something that is not a usable backup already occupies the backup path
+        std::fs::create_dir(dir.path().join("settings.json.trackertop.bak")).unwrap();
+
+        let err = install_claude_session_hook(&p, "C:/tt.exe").unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
     fn session_hook_merge_preserves_existing_settings_and_backs_up() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");

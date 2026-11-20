@@ -85,8 +85,10 @@ const UNTRUSTED_MTIME: i64 = 0;
 /// change ("racy" files, same idea as git's racy-git handling):
 /// - the file changed while it was being read (size/mtime differ afterwards, or the bytes
 ///   read do not match the stat'ed size): the stored hash may describe a half-written file;
-/// - its mtime is within a second of now: a further same-size edit in the same second would
-///   keep the same (second-resolution) mtime and size and be skipped forever.
+/// - its mtime is not at least a second in the past (git's racy rule): a further same-size
+///   edit in the same second would keep the same (second-resolution) mtime and size and be
+///   skipped forever. Future mtimes (clock skew, archives) are included; they are simply
+///   re-hashed until they are in the past, which costs a hash but can never miss an edit.
 fn trustworthy_mtime(abs_path: &Path, mtime: i64, size: u64, read_len: u64) -> i64 {
     if read_len != size {
         return UNTRUSTED_MTIME;
@@ -107,7 +109,7 @@ fn trustworthy_mtime(abs_path: &Path, mtime: i64, size: u64, read_len: u64) -> i
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if (now - 1..=now + 1).contains(&mtime) {
+    if mtime >= now - 1 {
         return UNTRUSTED_MTIME;
     }
     mtime
@@ -283,14 +285,14 @@ pub fn index_repository_with_registry(
             if let Some((_, edges)) = &cochange {
                 resolved.extend(edges.iter().cloned());
             }
-            if db.replace_edges_if_current(&resolved, built_from)? {
+            if let Some(committed) = db.replace_edges_if_current(&resolved, built_from)? {
                 let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
                 break (
                     all_files.len(),
                     all_symbols.len(),
-                    resolved.len(),
+                    committed.edge_count,
                     tokens,
-                    db.index_generation()?,
+                    committed.generation,
                 );
             }
             if attempt >= MAX_ATTEMPTS {

@@ -91,7 +91,8 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let bak = sibling_path(path, "trackertop.bak");
-    if bak.exists() {
+    if std::fs::symlink_metadata(&bak).is_ok() {
+        ensure_backup_is_regular_file(&bak)?;
         return Ok(Some(bak));
     }
 
@@ -121,8 +122,25 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
     };
     let _ = std::fs::remove_file(&tmp);
     published.with_context(|| format!("failed to publish backup {}", bak.display()))?;
+    // Whoever published (us or a racing installer), it must be a real file.
+    ensure_backup_is_regular_file(&bak)?;
     sync_parent_dir(&bak);
     Ok(Some(bak))
+}
+
+/// A directory, symlink or other non-file at the backup path is NOT a recovery copy:
+/// refuse, so callers abort before modifying the config instead of proceeding unprotected.
+fn ensure_backup_is_regular_file(bak: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(bak)
+        .with_context(|| format!("failed to inspect backup {}", bak.display()))?;
+    if !meta.file_type().is_file() {
+        bail!(
+            "{} exists but is not a regular file, so it cannot serve as a backup. \
+             Move it away and run the installer again; nothing was changed",
+            bak.display()
+        );
+    }
+    Ok(())
 }
 
 /// Fallback publish for filesystems without hard links. `rename` replaces an existing

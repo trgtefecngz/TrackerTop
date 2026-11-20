@@ -162,11 +162,6 @@ impl Database {
         read_meta(&self.conn, "edges_generation")
     }
 
-    pub fn bump_index_generation(&self) -> Result<i64> {
-        bump_meta(&self.conn, "index_generation")?;
-        self.index_generation()
-    }
-
     /// Cheap aggregate counts used when nothing changed (avoids loading every row).
     pub fn index_totals(&self) -> Result<(usize, usize, usize, usize)> {
         let (files, tokens): (i64, i64) = self.conn.query_row(
@@ -326,27 +321,36 @@ impl Database {
     ///
     /// Without this check, a slower concurrent indexer could overwrite a newer, complete
     /// edge set with one resolved from a stale snapshot, and since later runs see no file
-    /// changes, the missing edges would never come back. Returns `false` when the snapshot
+    /// changes, the missing edges would never come back. Returns `None` when the snapshot
     /// is stale; the caller re-resolves and retries. On success it also records
-    /// `edges_generation` and bumps `index_generation`, all in one transaction.
-    pub fn replace_edges_if_current(&mut self, edges: &[Edge], built_from: i64) -> Result<bool> {
+    /// `edges_generation` and bumps `index_generation`, all in one transaction, and returns
+    /// what THIS transaction committed (not a later read another process could change).
+    pub fn replace_edges_if_current(
+        &mut self,
+        edges: &[Edge],
+        built_from: i64,
+    ) -> Result<Option<CommittedGraph>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // A read error must abort, never be mistaken for a matching generation.
         let current = read_meta(&tx, "files_generation")?;
         if current != built_from {
-            return Ok(false); // dropping `tx` rolls back
+            return Ok(None); // dropping `tx` rolls back
         }
-        write_edges(&tx, edges)?;
+        let edge_count = write_edges(&tx, edges)?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES('edges_generation', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [built_from],
         )?;
         bump_meta(&tx, "index_generation")?;
+        let generation = read_meta(&tx, "index_generation")?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(CommittedGraph {
+            generation,
+            edge_count,
+        }))
     }
 
     pub fn load_all_files(&self) -> Result<Vec<FileRecord>> {
@@ -642,7 +646,9 @@ fn bump_meta(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<()> {
+/// Replaces all edges and returns how many rows are actually stored. Duplicate edges in
+/// `edges` collapse into one row (`INSERT OR REPLACE`), so `edges.len()` can over-count.
+fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<usize> {
     conn.execute("DELETE FROM edges", [])?;
     let mut stmt = conn.prepare(
         "INSERT OR REPLACE INTO edges (source_id, target_id, kind, weight)
@@ -651,7 +657,17 @@ fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<()> {
     for e in edges {
         stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
     }
-    Ok(())
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+    Ok(stored as usize)
+}
+
+/// Result of a successful [`Database::replace_edges_if_current`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedGraph {
+    /// `index_generation` this commit produced.
+    pub generation: i64,
+    /// Edge rows actually stored (after de-duplication).
+    pub edge_count: usize,
 }
 
 #[cfg(test)]
@@ -681,7 +697,11 @@ mod tests {
         fast.upsert_parsed_files(&[(file_rec("src/a.rs", "h1"), vec![], vec![])])
             .unwrap();
 
-        assert!(!slow.replace_edges_if_current(&[], snapshot).unwrap());
+        assert!(
+            slow.replace_edges_if_current(&[], snapshot)
+                .unwrap()
+                .is_none()
+        );
         assert_ne!(
             slow.edges_generation().unwrap(),
             slow.files_generation().unwrap(),
@@ -689,8 +709,30 @@ mod tests {
         );
 
         let fresh = slow.files_generation().unwrap();
-        assert!(slow.replace_edges_if_current(&[], fresh).unwrap());
+        let committed = slow.replace_edges_if_current(&[], fresh).unwrap().unwrap();
         assert_eq!(slow.edges_generation().unwrap(), fresh);
+        assert_eq!(committed.generation, slow.index_generation().unwrap());
+    }
+
+    #[test]
+    fn reported_edge_count_matches_stored_rows_after_dedup() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut db = Database::open_for_repo(repo.path()).unwrap();
+        let e = |s: &str| Edge {
+            source_id: s.to_string(),
+            target_id: "t".to_string(),
+            kind: EdgeKind::Calls,
+            weight: 1.0,
+        };
+        // Duplicate (source, target, kind) collapses into a single stored row
+        let edges = [e("a"), e("a"), e("b")];
+        let built_from = db.files_generation().unwrap();
+        let committed = db
+            .replace_edges_if_current(&edges, built_from)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.edge_count, 2);
+        assert_eq!(db.index_totals().unwrap().2, 2);
     }
 
     #[test]

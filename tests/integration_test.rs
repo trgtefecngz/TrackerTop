@@ -134,7 +134,22 @@ function Start-Pipeline {
     // last second may be re-hashed once: their mtime is not trusted yet, see racy handling.)
     let stats2 = index_repository(root, false).unwrap();
     assert_eq!(stats2.parsed_files, 0);
-    assert_eq!(stats2.total_files, 6);
+
+    // Once every file's mtime is safely in the past, the mtime+size fast path must skip ALL
+    // of them again (no re-hashing of unchanged files on every run).
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for entry in walk_files(root) {
+        std::fs::File::options()
+            .write(true)
+            .open(&entry)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    index_repository(root, false).unwrap(); // records the now-trustworthy mtimes
+    let stats3 = index_repository(root, false).unwrap();
+    assert_eq!(stats3.parsed_files, 0);
+    assert_eq!(stats3.skipped_files, 6);
 
     // Query via TrackerEngine & verify MCP JSON-RPC responses
     let engine = TrackerEngine::new(root);
@@ -470,12 +485,13 @@ fn touched_but_unchanged_files_are_not_rehashed_every_run() {
     let first = index_repository(root, false).unwrap();
     assert_eq!(first.total_files, 1);
 
-    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    // Touch to a different, settled (past) timestamp without changing the content
+    let touched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
     std::fs::File::options()
         .write(true)
         .open(&file)
         .unwrap()
-        .set_modified(later)
+        .set_modified(touched_at)
         .unwrap();
 
     let touched = index_repository(root, false).unwrap();
@@ -627,7 +643,10 @@ fn same_second_same_size_edit_is_not_missed() {
     let root = tmp.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
     let file = root.join("src/lib.rs");
-    let stamp = std::time::SystemTime::now();
+    // A stamp that is never "in the past" during this test, so both writes are racy no matter
+    // how slow the machine is (a stamp of `now` would depend on the first index finishing
+    // within a second).
+    let stamp = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
     let write_with_stamp = |body: &str| {
         std::fs::write(&file, body).unwrap();
         std::fs::File::options()
@@ -675,4 +694,24 @@ fn settled_files_take_the_fast_path_again() {
     index_repository(root, false).unwrap();
     let again = index_repository(root, false).unwrap();
     assert_eq!(again.skipped_files, 1);
+}
+
+/// All regular files under `root`, excluding TrackerTop's own `.trackertop/` store.
+fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n == ".trackertop") {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }

@@ -257,7 +257,10 @@ impl LanguageExtractor for TypeScriptExtractor {
                     .map(|l| l.trim())
                     .find(|l| !l.is_empty())
                     .is_some_and(|l| l.starts_with('{'));
+                // An argument list still open at the end of the line continues on the next one.
+                let parens_balanced = code.matches('(').count() <= code.matches(')').count();
                 let statement_ends_here = !code.contains('{')
+                    && parens_balanced
                     && (code.ends_with(';') || (code.ends_with(')') && !next_line_opens_body));
                 let end_idx = if statement_ends_here {
                     i
@@ -455,11 +458,14 @@ fn normalize_ts_import(spec: &str) -> String {
         .to_string()
 }
 
+/// Index of the line that closes the first `{` opened at or after `start`. Braces inside
+/// string literals and comments are ignored (`it("parses {x", () => {` must not count the
+/// one in the name), using the same per-line code-only view as the test-block check.
 fn find_brace_end(lines: &[&str], start: usize) -> usize {
     let mut depth = 0i32;
     let mut seen = false;
     for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in line.chars() {
+        for ch in ts_code_only(line).chars() {
             if ch == '{' {
                 depth += 1;
                 seen = true;
@@ -668,5 +674,32 @@ mod tests {
                 "{header}"
             );
         }
+    }
+
+    #[test]
+    fn unmatched_brace_in_test_name_does_not_extend_the_body() {
+        let src = "it(\"parses {x\", () => {\n  run();\n});\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        let out = parse(src);
+        let test = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!((test.start_line, test.end_line), (1, 3));
+        assert!(out.symbols.iter().any(|s| s.name == "helperAfter"));
+    }
+
+    #[test]
+    fn test_call_with_arguments_continuing_on_next_line_keeps_its_body() {
+        // First line ends with `)` (from `makeConfig()`) but the call is still open
+        let src = "it(\"multi\", withSetup(makeConfig()\n  , () => {\n    run();\n  }));\n";
+        let out = parse(src);
+        let test = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!((test.start_line, test.end_line), (1, 4));
     }
 }
