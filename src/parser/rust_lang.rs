@@ -325,6 +325,9 @@ fn walk_items(
                         out,
                     );
                     collect_type_refs(node, bytes, &sym_id, &mut seen_types, out);
+                    if let Some(body) = node.child_by_field_name("body") {
+                        collect_body_type_refs(body, bytes, &sym_id, &mut seen_types, out);
+                    }
                 }
             }
             _ => {}
@@ -462,6 +465,43 @@ fn collect_type_refs(
         if child.kind() != "block" && child.kind() != "declaration_list" {
             collect_type_refs(child, bytes, source_id, seen, out);
         }
+    }
+}
+
+/// Types a function body uses: annotations and struct literals (`let r: Rec`, `Rec { .. }`,
+/// `Vec::<Rec>`) and type paths in expressions and patterns (`Level::A`, `Rec::new()`).
+/// Without these, "who uses this enum" missed every `match` on it. Only capitalised
+/// path segments count: `module::f` is not a type.
+fn collect_body_type_refs(
+    node: Node,
+    bytes: &[u8],
+    source_id: &str,
+    seen: &mut HashSet<String>,
+    out: &mut ParsedFile,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let name = match child.kind() {
+            "type_identifier" => Some(node_text(child, bytes).trim().to_string()),
+            "scoped_identifier" | "scoped_type_identifier" => child
+                .child_by_field_name("path")
+                .map(|p| clean_rust_type_name(node_text(p, bytes))),
+            _ => None,
+        };
+        if let Some(name) = name
+            && name.chars().next().is_some_and(char::is_uppercase)
+            && name != "Self"
+            && !is_builtin_rust_type(&name)
+            && seen.insert(name.clone())
+        {
+            out.refs.push(RawReference {
+                source_symbol_id: source_id.to_string(),
+                target_name: name,
+                kind: EdgeKind::UsesType,
+                line: child.start_position().row + 1,
+            });
+        }
+        collect_body_type_refs(child, bytes, source_id, seen, out);
     }
 }
 

@@ -1947,3 +1947,45 @@ fn review_changes_reports_what_changed_since_the_previous_review() {
     assert!(out.contains("1 resolved, 2 new, 0 unchanged"), "{out}");
     assert!(out.contains(&format!("- new `{a}`")), "{out}");
 }
+
+/// "Who uses this type": Rust function bodies that match on an enum, build a struct or
+/// annotate a binding with it are type users; a function sharing the type's name is not
+/// a type, and an external type gets no edge.
+#[test]
+fn rust_type_users_include_function_bodies() {
+    use trackertop::graph::CodeGraph;
+    use trackertop::indexer::index_repository;
+    use trackertop::model::EdgeKind;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub enum Level { Low, High }\n\
+         pub struct Rec { pub a: i32 }\n\
+         #[allow(non_snake_case)]\npub fn Widget() -> i32 { 1 }\n\
+         pub fn by_match(x: i32) -> i32 {\n    let l = if x > 0 { Level::High } else { Level::Low };\n    match l {\n        Level::High => 1,\n        Level::Low => 0,\n    }\n}\n\
+         pub fn builds() -> i32 {\n    let r = Rec { a: 1 };\n    r.a\n}\n\
+         pub fn annotated() -> usize {\n    let v: Vec<Rec> = Vec::new();\n    v.len()\n}\n\
+         pub fn external() -> u64 {\n    let w: Widget = Widget::default();\n    std::time::Duration::from_secs(1).as_secs()\n}\n",
+    )
+    .unwrap();
+    index_repository(root, false).unwrap();
+    let db = trackertop::db::Database::open_for_repo(root).unwrap();
+    let cg = CodeGraph::load(&db).unwrap();
+    let users = |ty: &str| -> Vec<String> {
+        let mut v: Vec<String> = cg
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::UsesType)
+            .filter(|e| cg.symbols.get(&e.target_id).is_some_and(|s| s.name == ty))
+            .filter_map(|e| cg.symbols.get(&e.source_id).map(|s| s.name.clone()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(users("Level"), vec!["by_match"]);
+    assert_eq!(users("Rec"), vec!["annotated", "builds"]);
+    // `Widget` here is an external type: no edge to the function of that name
+    assert!(users("Widget").is_empty(), "{:?}", users("Widget"));
+}

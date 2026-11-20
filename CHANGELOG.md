@@ -30,6 +30,10 @@ All notable changes to TrackerTop are documented here.
 ### Fixed: stale graph after upgrading TrackerTop
 - The index records which extractor revision parsed it. An index written by another TrackerTop version is re-parsed in full on its next run. Before, files whose content had not changed kept the references an older extractor produced, so call-edge fixes never reached them: on this repository, `TrackerEngine::finalize_inner` showed 0 callers instead of 19.
 
+### Fixed: "who uses this type" (Rust)
+- Type uses inside function bodies are now edges: `match` arms on an enum (`Level::High`), struct literals, `let` annotations, type paths such as `Rec::new()`. Before, only signatures counted, so `impact_analysis` on `Severity` listed 6 direct users instead of 18.
+- A Rust type use only resolves to a type (struct, enum, trait, alias). It never binds to a function that shares the name, and an external type gets no edge.
+
 ### Fixed: call edges (all tools)
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
 - A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.

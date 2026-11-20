@@ -14,8 +14,9 @@ use std::time::{Instant, UNIX_EPOCH};
 /// Revision of what the extractors produce (symbols, raw references). Bump it whenever an
 /// extractor change alters their output for unchanged source: an index written by another
 /// revision is re-parsed in full on its next run, instead of keeping stale edges for
-/// every file whose content did not change. (1: v0.8, Rust macro-argument and method calls.)
-pub const EXTRACTOR_REVISION: i64 = 1;
+/// every file whose content did not change. (1: v0.8, Rust macro-argument and method calls;
+/// 2: Rust type uses inside function bodies.)
+pub const EXTRACTOR_REVISION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -576,6 +577,30 @@ fn resolve_edges(
                     if let Some(best) =
                         resolve_qualified_rust_call(target, src_file, &by_qname, &by_name)
                     {
+                        resolved_targets.push(best.id.clone());
+                    }
+                }
+                // A Rust type use names a type: never a function, module or doc section
+                // that happens to share the name (an external type gets no edge)
+                else if is_rust && rref.kind == EdgeKind::UsesType {
+                    let types: Vec<&Symbol> = by_name
+                        .get(target)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|s| {
+                            matches!(
+                                s.kind,
+                                SymbolKind::Struct
+                                    | SymbolKind::Enum
+                                    | SymbolKind::Trait
+                                    | SymbolKind::TypeAlias
+                                    | SymbolKind::Class
+                            )
+                        })
+                        .collect();
+                    if let Some(best) = pick_nearest_symbol(&types, src_file) {
                         resolved_targets.push(best.id.clone());
                     }
                 }
