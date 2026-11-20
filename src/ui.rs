@@ -4,9 +4,7 @@ use crate::context::TrackerEngine;
 use crate::db::Database;
 use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
 use crate::indexer::index_repository;
-use crate::install::{
-    AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed,
-};
+use crate::install::{AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed};
 use crate::model::{EdgeKind, ProjectNote, SymbolKind, TokenStatsSummary};
 use crate::parser::default_registry;
 use crate::registry::{
@@ -135,9 +133,10 @@ pub struct TrackerTopApp {
 impl TrackerTopApp {
     pub fn new(initial_repo: Option<PathBuf>) -> Self {
         if let Some(ref p) = initial_repo
-            && p.join(".trackertop").join("index.db").exists() {
-                let _ = register_project(p);
-            }
+            && p.join(".trackertop").join("index.db").exists()
+        {
+            let _ = register_project(p);
+        }
         let overview = load_global_overview();
         let selection = if let Some(ref p) = initial_repo {
             let s = p.to_string_lossy().to_string();
@@ -233,10 +232,7 @@ impl TrackerTopApp {
                 Ok(stats) => BgMessage {
                     status: format!(
                         "Indexed {} files ({} symbols, {} edges) in {} ms",
-                        stats.total_files,
-                        stats.total_symbols,
-                        stats.total_edges,
-                        stats.elapsed_ms
+                        stats.total_files, stats.total_symbols, stats.total_edges, stats.elapsed_ms
                     ),
                     select_path: if select_after {
                         let s = std::fs::canonicalize(&repo_path)
@@ -283,27 +279,29 @@ impl TrackerTopApp {
 
     fn reset_project_stats(&mut self, repo_path: &str) {
         if let Ok(db) = Database::open_for_repo(Path::new(repo_path))
-            && db.clear_telemetry().is_ok() {
-                self.status_banner = "Reset token-savings telemetry to 0 for this project.".to_string();
-                self.reload_overview();
-                if let Some(ref mut lp) = self.loaded {
-                    lp.stats = db.get_token_stats(30).unwrap_or_default();
-                }
+            && db.clear_telemetry().is_ok()
+        {
+            self.status_banner = "Reset token-savings telemetry to 0 for this project.".to_string();
+            self.reload_overview();
+            if let Some(ref mut lp) = self.loaded {
+                lp.stats = db.get_token_stats(30).unwrap_or_default();
             }
+        }
     }
 
     fn poll_background(&mut self) {
         if let Some(ref rx) = self.bg_rx
-            && let Ok(msg) = rx.try_recv() {
-                self.bg_busy = false;
-                self.bg_rx = None;
-                self.status_banner = msg.status;
-                if let Some(p) = msg.select_path {
-                    self.selection = Selection::Project(p);
-                }
-                self.reload_overview();
-                self.reload_selected_project();
+            && let Ok(msg) = rx.try_recv()
+        {
+            self.bg_busy = false;
+            self.bg_rx = None;
+            self.status_banner = msg.status;
+            if let Some(p) = msg.select_path {
+                self.selection = Selection::Project(p);
             }
+            self.reload_overview();
+            self.reload_selected_project();
+        }
     }
 
     fn pick_and_add_project(&mut self) {
@@ -398,7 +396,12 @@ impl eframe::App for TrackerTopApp {
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(path);
-                            ui.label(RichText::new(name).strong().size(15.0).color(Color32::WHITE));
+                            ui.label(
+                                RichText::new(name)
+                                    .strong()
+                                    .size(15.0)
+                                    .color(Color32::WHITE),
+                            );
                             ui.label(
                                 RichText::new(path)
                                     .small()
@@ -415,27 +418,28 @@ impl eframe::App for TrackerTopApp {
                         } else {
                             "Connect AI Agents".to_string()
                         };
-                        let agents_btn = egui::Button::new(
-                            RichText::new(agents_label).strong().color(if connected_count > 0 {
-                                Color32::from_rgb(110, 231, 183)
+                        let agents_btn =
+                            egui::Button::new(RichText::new(agents_label).strong().color(
+                                if connected_count > 0 {
+                                    Color32::from_rgb(110, 231, 183)
+                                } else {
+                                    Color32::WHITE
+                                },
+                            ))
+                            .corner_radius(CornerRadius::same(18))
+                            .fill(if connected_count > 0 {
+                                Color32::from_rgba_unmultiplied(16, 185, 129, 34)
                             } else {
-                                Color32::WHITE
-                            }),
-                        )
-                        .corner_radius(CornerRadius::same(18))
-                        .fill(if connected_count > 0 {
-                            Color32::from_rgba_unmultiplied(16, 185, 129, 34)
-                        } else {
-                            Color32::from_rgb(37, 99, 235)
-                        })
-                        .stroke(Stroke::new(
-                            1.0_f32,
-                            if connected_count > 0 {
-                                Color32::from_rgba_unmultiplied(52, 211, 153, 110)
-                            } else {
-                                Color32::from_rgb(96, 165, 250)
-                            },
-                        ));
+                                Color32::from_rgb(37, 99, 235)
+                            })
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if connected_count > 0 {
+                                    Color32::from_rgba_unmultiplied(52, 211, 153, 110)
+                                } else {
+                                    Color32::from_rgb(96, 165, 250)
+                                },
+                            ));
                         if ui.add(agents_btn).clicked() {
                             self.show_agents_modal = true;
                         }
@@ -987,8 +991,7 @@ impl TrackerTopApp {
                             ui.label(format!("{:.1}%", p.stats.savings_percent));
                             if ui
                                 .add(
-                                    egui::Button::new("Open")
-                                        .corner_radius(CornerRadius::same(14)),
+                                    egui::Button::new("Open").corner_radius(CornerRadius::same(14)),
                                 )
                                 .clicked()
                             {
@@ -2011,7 +2014,12 @@ impl TrackerTopApp {
                     for (_, display, hex, files, toks) in &lp.lang_breakdown {
                         let col = parse_hex_color(hex);
                         egui::Frame::NONE
-                            .fill(Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 20))
+                            .fill(Color32::from_rgba_unmultiplied(
+                                col.r(),
+                                col.g(),
+                                col.b(),
+                                20,
+                            ))
                             .stroke(Stroke::new(
                                 1.0_f32,
                                 Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 100),
@@ -2021,8 +2029,11 @@ impl TrackerTopApp {
                             .show(ui, |ui| {
                                 ui.label(RichText::new(display).strong().color(col));
                                 ui.label(
-                                    RichText::new(format!("{files} files · {} tok", fmt_num(*toks)))
-                                        .small(),
+                                    RichText::new(format!(
+                                        "{files} files · {} tok",
+                                        fmt_num(*toks)
+                                    ))
+                                    .small(),
                                 );
                             });
                     }
@@ -2195,17 +2206,20 @@ impl TrackerTopApp {
                                 });
                             ui.add_space(6.0);
                             ui.label(RichText::new(&note.content).color(Color32::WHITE));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new("Delete")
-                                            .corner_radius(CornerRadius::same(12)),
-                                    )
-                                    .clicked()
-                                {
-                                    del_note_req = Some((repo_path.clone(), note.id));
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new("Delete")
+                                                .corner_radius(CornerRadius::same(12)),
+                                        )
+                                        .clicked()
+                                    {
+                                        del_note_req = Some((repo_path.clone(), note.id));
+                                    }
+                                },
+                            );
                         });
                     });
                     ui.add_space(8.0);
@@ -2214,21 +2228,23 @@ impl TrackerTopApp {
         });
 
         if let Some((rp, target, content)) = add_note_req
-            && let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
-                let _ = db.add_note(&target, &content);
-                self.note_content_input.clear();
-                self.status_banner = format!("Saved memory note for `{target}`");
-                if let Some(ref mut lp_mut) = self.loaded {
-                    lp_mut.notes = db.list_notes(None).unwrap_or_default();
-                }
+            && let Ok(db) = Database::open_for_repo(Path::new(&rp))
+        {
+            let _ = db.add_note(&target, &content);
+            self.note_content_input.clear();
+            self.status_banner = format!("Saved memory note for `{target}`");
+            if let Some(ref mut lp_mut) = self.loaded {
+                lp_mut.notes = db.list_notes(None).unwrap_or_default();
             }
+        }
         if let Some((rp, id)) = del_note_req
-            && let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
-                let _ = db.delete_note(id);
-                if let Some(ref mut lp_mut) = self.loaded {
-                    lp_mut.notes = db.list_notes(None).unwrap_or_default();
-                }
+            && let Ok(db) = Database::open_for_repo(Path::new(&rp))
+        {
+            let _ = db.delete_note(id);
+            if let Some(ref mut lp_mut) = self.loaded {
+                lp_mut.notes = db.list_notes(None).unwrap_or_default();
             }
+        }
     }
 }
 
@@ -2258,10 +2274,10 @@ fn build_app_icon() -> egui::IconData {
     // (x, y, radius, rgb)
     type GlowNode = (f32, f32, f32, (f32, f32, f32));
     let nodes: [GlowNode; 4] = [
-        (17.0, 20.0, 6.2, (56.0, 189.0, 248.0)), // top-left cyan
+        (17.0, 20.0, 6.2, (56.0, 189.0, 248.0)),  // top-left cyan
         (32.0, 20.0, 7.2, (110.0, 231.0, 183.0)), // top-center emerald hub
         (47.0, 20.0, 6.2, (129.0, 140.0, 248.0)), // top-right indigo
-        (32.0, 46.0, 6.8, (52.0, 211.0, 153.0)), // bottom-center emerald
+        (32.0, 46.0, 6.8, (52.0, 211.0, 153.0)),  // bottom-center emerald
     ];
     let segments: [((f32, f32), (f32, f32)); 2] = [
         ((17.0, 20.0), (47.0, 20.0)), // horizontal T bar
@@ -2444,12 +2460,14 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         if s.file_path == t.file_path {
             continue;
         }
-        if let (Some(&si), Some(&ti)) = (idx_by_path.get(&s.file_path), idx_by_path.get(&t.file_path))
-            && edge_seen.insert((si, ti)) {
-                nodes[si].degree += 1;
-                nodes[ti].degree += 1;
-                edges.push(GraphEdgeVis { src: si, tgt: ti });
-            }
+        if let (Some(&si), Some(&ti)) =
+            (idx_by_path.get(&s.file_path), idx_by_path.get(&t.file_path))
+            && edge_seen.insert((si, ti))
+        {
+            nodes[si].degree += 1;
+            nodes[ti].degree += 1;
+            edges.push(GraphEdgeVis { src: si, tgt: ti });
+        }
     }
 
     let total_symbols = cg
@@ -2686,9 +2704,9 @@ fn build_smooth_aurora_texture(ctx: &egui::Context) -> egui::TextureHandle {
     // (center, radius, rgb, strength)
     type SoftLight = ((f32, f32), f32, (f32, f32, f32), f32);
     let lights: [SoftLight; 3] = [
-        ((0.16, 0.14), 0.42, (56.0, 189.0, 248.0), 0.16),  // soft cyan top-left
+        ((0.16, 0.14), 0.42, (56.0, 189.0, 248.0), 0.16), // soft cyan top-left
         ((0.86, 0.84), 0.48, (129.0, 140.0, 248.0), 0.15), // soft indigo bottom-right
-        ((0.50, 0.92), 0.38, (16.0, 185.0, 129.0), 0.10),  // whisper emerald bottom
+        ((0.50, 0.92), 0.38, (16.0, 185.0, 129.0), 0.10), // whisper emerald bottom
     ];
 
     for y in 0..H {
@@ -2815,9 +2833,10 @@ fn parse_hex_color(hex: &str) -> Color32 {
             u8::from_str_radix(&h[0..2], 16),
             u8::from_str_radix(&h[2..4], 16),
             u8::from_str_radix(&h[4..6], 16),
-        ) {
-            return Color32::from_rgb(r, g, b);
-        }
+        )
+    {
+        return Color32::from_rgb(r, g, b);
+    }
     Color32::from_rgb(148, 163, 184)
 }
 

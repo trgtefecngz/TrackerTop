@@ -98,13 +98,18 @@ pub fn is_agent_installed(agent: AiAgentKind) -> bool {
         ],
         AiAgentKind::Cursor => vec![home.join(".cursor").join("mcp.json")],
         AiAgentKind::Codex => vec![home.join(".codex").join("config.toml")],
-        AiAgentKind::Windsurf => vec![home.join(".codeium").join("windsurf").join("mcp_config.json")],
+        AiAgentKind::Windsurf => vec![
+            home.join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+        ],
     };
     for p in paths {
         if let Ok(content) = std::fs::read_to_string(p)
-            && content.contains("trackertop") {
-                return true;
-            }
+            && content.contains("trackertop")
+        {
+            return true;
+        }
     }
     false
 }
@@ -125,7 +130,10 @@ pub fn install_agent(agent: AiAgentKind, repo_root: &Path) -> Result<Vec<String>
         }
         AiAgentKind::Windsurf => {
             let home = user_home().context("cannot determine home directory")?;
-            let path = home.join(".codeium").join("windsurf").join("mcp_config.json");
+            let path = home
+                .join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json");
             merge_json_mcp_config(&path)?;
             Ok(vec![format!("Connected Windsurf: {}", path.display())])
         }
@@ -251,7 +259,9 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
         let status = cmd.status();
         match status {
             Ok(s) if s.success() => {
-                actions.push(format!("Registered global Claude Code MCP: `{exe_str} mcp`"));
+                actions.push(format!(
+                    "Registered global Claude Code MCP: `{exe_str} mcp`"
+                ));
             }
             _ => {
                 actions.push(format!(
@@ -282,7 +292,10 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
             );
         }
         write_json_config(&mcp_json_path, &root_val)?;
-        actions.push(format!("Wrote project MCP config: {}", mcp_json_path.display()));
+        actions.push(format!(
+            "Wrote project MCP config: {}",
+            mcp_json_path.display()
+        ));
     }
 
     let (skill_dir, claude_md) = if global {
@@ -321,17 +334,16 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
     }
 
     // Install lightweight SessionStart hook in `~/.claude/settings.json` when global
-    if global
-        && let Some(home) = user_home() {
-            let settings_path = home.join(".claude").join("settings.json");
-            match install_claude_session_hook(&settings_path, &exe_str) {
-                Ok(()) => actions.push(format!(
-                    "Installed Claude Code SessionStart hook in {}",
-                    settings_path.display()
-                )),
-                Err(e) => actions.push(format!("Skipped SessionStart hook: {e:#}")),
-            }
+    if global && let Some(home) = user_home() {
+        let settings_path = home.join(".claude").join("settings.json");
+        match install_claude_session_hook(&settings_path, &exe_str) {
+            Ok(()) => actions.push(format!(
+                "Installed Claude Code SessionStart hook in {}",
+                settings_path.display()
+            )),
+            Err(e) => actions.push(format!("Skipped SessionStart hook: {e:#}")),
         }
+    }
 
     Ok(actions)
 }
@@ -347,9 +359,7 @@ pub(crate) fn install_claude_session_hook(settings_path: &Path, exe_str: &str) -
         .entry("hooks")
         .or_insert_with(|| json!({}));
     if let Some(hooks_obj) = hooks.as_object_mut() {
-        let session_start = hooks_obj
-            .entry("SessionStart")
-            .or_insert_with(|| json!([]));
+        let session_start = hooks_obj.entry("SessionStart").or_insert_with(|| json!([]));
         if let Some(arr) = session_start.as_array_mut() {
             let already = arr
                 .iter()
@@ -368,7 +378,10 @@ pub(crate) fn install_claude_session_hook(settings_path: &Path, exe_str: &str) -
                 return Ok(());
             }
         } else {
-            bail!("`hooks.SessionStart` in {} is not an array", settings_path.display());
+            bail!(
+                "`hooks.SessionStart` in {} is not an array",
+                settings_path.display()
+            );
         }
     } else {
         bail!("`hooks` in {} is not an object", settings_path.display());

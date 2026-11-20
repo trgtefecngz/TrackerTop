@@ -45,7 +45,9 @@ pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> (String, usize, bool
 
     let omitted = lines.len().saturating_sub(kept);
     if omitted > 0 {
-        out.push_str(&format!("\n... [+{omitted} lines omitted to fit {max_tokens} tok budget]"));
+        out.push_str(&format!(
+            "\n... [+{omitted} lines omitted to fit {max_tokens} tok budget]"
+        ));
     }
     let final_toks = count_tokens(&out);
     (out, final_toks, omitted > 0)

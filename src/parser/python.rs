@@ -67,7 +67,12 @@ impl LanguageExtractor for PythonExtractor {
                         });
                     }
                     for item in imports_part.split(',') {
-                        let name = item.split(" as ").next().unwrap_or(item).trim().trim_matches(|c| c == '(' || c == ')');
+                        let name = item
+                            .split(" as ")
+                            .next()
+                            .unwrap_or(item)
+                            .trim()
+                            .trim_matches(|c| c == '(' || c == ')');
                         if !name.is_empty() && name != "*" {
                             out.refs.push(RawReference {
                                 source_symbol_id: file_id.clone(),
@@ -83,7 +88,12 @@ impl LanguageExtractor for PythonExtractor {
             }
             if let Some(rest) = trimmed.strip_prefix("import ") {
                 for item in rest.split(',') {
-                    let mod_name = item.split(" as ").next().unwrap_or(item).trim().replace('.', "/");
+                    let mod_name = item
+                        .split(" as ")
+                        .next()
+                        .unwrap_or(item)
+                        .trim()
+                        .replace('.', "/");
                     if !mod_name.is_empty() {
                         out.refs.push(RawReference {
                             source_symbol_id: file_id.clone(),
@@ -116,26 +126,35 @@ impl LanguageExtractor for PythonExtractor {
                         start_line: line_no,
                         end_line: end_idx + 1,
                         token_count: count_tokens(&block),
-                        visibility: if name.starts_with('_') { "private" } else { "pub" }.to_string(),
+                        visibility: if name.starts_with('_') {
+                            "private"
+                        } else {
+                            "pub"
+                        }
+                        .to_string(),
                         doc_summary: doc,
                         parent_id: Some(file_id.clone()),
                     });
 
                     // Base classes
                     if let (Some(open), Some(close)) = (rest.find('('), rest.find(')'))
-                        && close > open {
-                            for base in rest[open + 1..close].split(',') {
-                                let bname = read_py_ident(base.trim().rsplit('.').next().unwrap_or(base));
-                                if !bname.is_empty() && !matches!(bname.as_str(), "object" | "ABC" | "Exception") {
-                                    out.refs.push(RawReference {
-                                        source_symbol_id: sym_id.clone(),
-                                        target_name: bname,
-                                        kind: EdgeKind::Implements,
-                                        line: line_no,
-                                    });
-                                }
+                        && close > open
+                    {
+                        for base in rest[open + 1..close].split(',') {
+                            let bname =
+                                read_py_ident(base.trim().rsplit('.').next().unwrap_or(base));
+                            if !bname.is_empty()
+                                && !matches!(bname.as_str(), "object" | "ABC" | "Exception")
+                            {
+                                out.refs.push(RawReference {
+                                    source_symbol_id: sym_id.clone(),
+                                    target_name: bname,
+                                    kind: EdgeKind::Implements,
+                                    line: line_no,
+                                });
                             }
                         }
+                    }
 
                     class_stack.push((indent, name, sym_id));
                     i += 1;
@@ -173,12 +192,21 @@ impl LanguageExtractor for PythonExtractor {
                         start_line: line_no,
                         end_line: end_idx + 1,
                         token_count: count_tokens(&block),
-                        visibility: if name.starts_with('_') { "private" } else { "pub" }.to_string(),
+                        visibility: if name.starts_with('_') {
+                            "private"
+                        } else {
+                            "pub"
+                        }
+                        .to_string(),
                         doc_summary: doc,
                         parent_id: Some(parent_id),
                     });
 
-                    let edge_kind = if is_test { EdgeKind::Tests } else { EdgeKind::Calls };
+                    let edge_kind = if is_test {
+                        EdgeKind::Tests
+                    } else {
+                        EdgeKind::Calls
+                    };
                     collect_py_calls(&block, &name, &sym_id, line_no, edge_kind, &mut out);
                     i = end_idx + 1;
                     continue;
@@ -287,7 +315,8 @@ fn collect_py_calls(
 fn is_py_builtin(name: &str) -> bool {
     matches!(
         name,
-        "def" | "class"
+        "def"
+            | "class"
             | "if"
             | "elif"
             | "for"

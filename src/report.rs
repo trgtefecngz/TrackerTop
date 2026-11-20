@@ -36,7 +36,10 @@ pub fn generate_markdown_report(repo_root: &Path) -> Result<PathBuf> {
     md.push_str(&format!("| Extracted Symbols | {total_symbols} |\n"));
     md.push_str(&format!("| Graph Edges | {} |\n", cg.edges.len()));
     md.push_str(&format!("| Total Repo Tokens | {total_repo_tokens} |\n"));
-    md.push_str(&format!("| AI Queries Logged | {} |\n", stats.total_queries));
+    md.push_str(&format!(
+        "| AI Queries Logged | {} |\n",
+        stats.total_queries
+    ));
     md.push_str(&format!(
         "| Net Tokens Saved | **{} ({:.1}%)** |\n",
         stats.total_tokens_saved, stats.savings_percent

@@ -41,7 +41,7 @@ pub struct ImpactReport {
 pub struct HealthReport {
     pub bloated_files: Vec<(String, usize, usize)>, // (path, tokens, lines)
     pub circular_groups: Vec<Vec<String>>,          // strongly connected file cycles (>= 2 files)
-    pub orphan_files: Vec<String>,                  // code files with 0 incoming non-containment edges
+    pub orphan_files: Vec<String>, // code files with 0 incoming non-containment edges
 }
 
 /// `(hop distance, edge kind, symbol)` entries returned by [`CodeGraph::neighborhood`].
@@ -175,20 +175,20 @@ impl CodeGraph {
                 if let Some(ids) = self.symbols_by_file.get(p) {
                     for id in ids {
                         if let Some(s) = self.symbols.get(id)
-                            && s.kind != SymbolKind::File && s.kind != SymbolKind::Impl {
-                                sym_count += 1;
-                                let pr = *self.pagerank.get(id).unwrap_or(&0.0);
-                                hub_candidates.push((s.qualified_name.clone(), pr));
-                            }
+                            && s.kind != SymbolKind::File
+                            && s.kind != SymbolKind::Impl
+                        {
+                            sym_count += 1;
+                            let pr = *self.pagerank.get(id).unwrap_or(&0.0);
+                            hub_candidates.push((s.qualified_name.clone(), pr));
+                        }
                     }
                 }
             }
-            hub_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top_hubs: Vec<String> = hub_candidates
-                .into_iter()
-                .take(4)
-                .map(|(n, _)| n)
-                .collect();
+            hub_candidates
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top_hubs: Vec<String> =
+                hub_candidates.into_iter().take(4).map(|(n, _)| n).collect();
 
             let label = infer_community_label(&file_paths);
             summaries.push(CommunitySummary {
@@ -291,15 +291,14 @@ impl CodeGraph {
         if let Some(s) = self.symbols.get(query) {
             return Some(s);
         }
-        self.search_symbols(query, 1).into_iter().next().map(|(s, _)| s)
+        self.search_symbols(query, 1)
+            .into_iter()
+            .next()
+            .map(|(s, _)| s)
     }
 
     /// Returns direct callers and callees (up to `depth` hops) of a symbol.
-    pub fn neighborhood(
-        &self,
-        symbol_id: &str,
-        depth: usize,
-    ) -> (HopList<'_>, HopList<'_>) {
+    pub fn neighborhood(&self, symbol_id: &str, depth: usize) -> (HopList<'_>, HopList<'_>) {
         let Some(&start_idx) = self.id_to_idx.get(symbol_id) else {
             return (Vec::new(), Vec::new());
         };
@@ -392,20 +391,23 @@ impl CodeGraph {
             if matches!(e.kind, EdgeKind::Contains | EdgeKind::CoChanges) {
                 continue;
             }
-            let (Some(src), Some(tgt)) =
-                (self.symbols.get(&e.source_id), self.symbols.get(&e.target_id))
-            else {
+            let (Some(src), Some(tgt)) = (
+                self.symbols.get(&e.source_id),
+                self.symbols.get(&e.target_id),
+            ) else {
                 continue;
             };
             if src.file_path == tgt.file_path {
                 continue;
             }
             has_incoming.insert(tgt.file_path.clone());
-            if let (Some(&si), Some(&ti)) =
-                (path_to_idx.get(&src.file_path), path_to_idx.get(&tgt.file_path))
-                && seen_file_edges.insert((si, ti)) {
-                    file_graph.add_edge(si, ti, ());
-                }
+            if let (Some(&si), Some(&ti)) = (
+                path_to_idx.get(&src.file_path),
+                path_to_idx.get(&tgt.file_path),
+            ) && seen_file_edges.insert((si, ti))
+            {
+                file_graph.add_edge(si, ti, ());
+            }
         }
 
         // Strongly connected components of size >= 2 are real circular dependency cycles
@@ -656,11 +658,11 @@ fn detect_file_communities(
                 a.1.partial_cmp(b.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.0.cmp(a.0))
-            })
-                && label_of.get(p) != Some(&best_lbl) {
-                    label_of.insert(p.clone(), best_lbl);
-                    changed = true;
-                }
+            }) && label_of.get(p) != Some(&best_lbl)
+            {
+                label_of.insert(p.clone(), best_lbl);
+                changed = true;
+            }
         }
         if !changed {
             break;

@@ -138,27 +138,30 @@ impl LanguageExtractor for TomlExtractor {
                     doc_summary: String::new(),
                     parent_id: Some(file_id.clone()),
                 });
-            } else if in_deps && !trimmed.is_empty() && !trimmed.starts_with('#')
-                && let Some((dep_name, _)) = trimmed.split_once('=') {
-                    let dep = dep_name.trim();
-                    if !dep.is_empty() {
-                        let sym_id = make_symbol_id(file_path, dep, line_no);
-                        out.symbols.push(Symbol {
-                            id: sym_id,
-                            file_path: file_path.to_string(),
-                            name: dep.to_string(),
-                            qualified_name: format!("dep::{dep}"),
-                            kind: SymbolKind::Dependency,
-                            signature: compact_signature(trimmed, 100),
-                            start_line: line_no,
-                            end_line: line_no,
-                            token_count: count_tokens(trimmed),
-                            visibility: "dep".to_string(),
-                            doc_summary: String::new(),
-                            parent_id: Some(file_id.clone()),
-                        });
-                    }
+            } else if in_deps
+                && !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && let Some((dep_name, _)) = trimmed.split_once('=')
+            {
+                let dep = dep_name.trim();
+                if !dep.is_empty() {
+                    let sym_id = make_symbol_id(file_path, dep, line_no);
+                    out.symbols.push(Symbol {
+                        id: sym_id,
+                        file_path: file_path.to_string(),
+                        name: dep.to_string(),
+                        qualified_name: format!("dep::{dep}"),
+                        kind: SymbolKind::Dependency,
+                        signature: compact_signature(trimmed, 100),
+                        start_line: line_no,
+                        end_line: line_no,
+                        token_count: count_tokens(trimmed),
+                        visibility: "dep".to_string(),
+                        doc_summary: String::new(),
+                        parent_id: Some(file_id.clone()),
+                    });
                 }
+            }
         }
         Ok(out)
     }

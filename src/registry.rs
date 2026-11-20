@@ -1,7 +1,7 @@
 use crate::db::Database;
+use crate::fsutil::{FileLock, atomic_write};
 use crate::model::TokenStatsSummary;
 use crate::tokens::estimate_usd_saved;
-use crate::fsutil::{FileLock, atomic_write};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,10 @@ fn update_registry_at(path: &Path, mutate: impl FnOnce(&mut RegistryFile) -> boo
                 Utc::now().format("%Y%m%d%H%M%S")
             ));
             std::fs::rename(path, &aside).with_context(|| {
-                format!("{} is corrupted and could not be moved aside", path.display())
+                format!(
+                    "{} is corrupted and could not be moved aside",
+                    path.display()
+                )
             })?;
             RegistryFile::default()
         }
@@ -230,23 +233,25 @@ pub fn load_global_overview() -> GlobalOverview {
             stats: TokenStatsSummary::default(),
         };
 
-        if exists && db_path.exists()
-            && let Ok(db) = Database::open_path(&db_path) {
-                snap.indexed = true;
-                if let Ok(files) = db.load_all_files() {
-                    snap.total_files = files.len();
-                    snap.total_repo_tokens = files.iter().map(|f| f.token_count).sum();
-                }
-                if let Ok(syms) = db.load_all_symbols() {
-                    snap.total_symbols = syms.len();
-                }
-                if let Ok(edges) = db.load_all_edges() {
-                    snap.total_edges = edges.len();
-                }
-                if let Ok(stats) = db.get_token_stats(15) {
-                    snap.stats = stats;
-                }
+        if exists
+            && db_path.exists()
+            && let Ok(db) = Database::open_path(&db_path)
+        {
+            snap.indexed = true;
+            if let Ok(files) = db.load_all_files() {
+                snap.total_files = files.len();
+                snap.total_repo_tokens = files.iter().map(|f| f.token_count).sum();
             }
+            if let Ok(syms) = db.load_all_symbols() {
+                snap.total_symbols = syms.len();
+            }
+            if let Ok(edges) = db.load_all_edges() {
+                snap.total_edges = edges.len();
+            }
+            if let Ok(stats) = db.get_token_stats(15) {
+                snap.stats = stats;
+            }
+        }
 
         overview.total_files += snap.total_files;
         overview.total_symbols += snap.total_symbols;

@@ -16,8 +16,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // pid + per-process counter: unique even when several threads write the same target.
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = sibling_path(path, &format!("tmp-{}-{seq}", std::process::id()));
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
     if let Err(e) = rename_with_retry(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to replace {}", path.display()));
@@ -36,7 +35,9 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     loop {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt + 1 < ATTEMPTS => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied && attempt + 1 < ATTEMPTS =>
+            {
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(15 * u64::from(attempt)));
             }

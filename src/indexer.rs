@@ -138,10 +138,12 @@ pub fn index_repository_with_registry(
             .unwrap_or(0);
 
         if let Some(prev) = existing.get(&rel_path)
-            && prev.mtime_secs == mtime && prev.size_bytes == size {
-                skipped_files += 1;
-                continue;
-            }
+            && prev.mtime_secs == mtime
+            && prev.size_bytes == size
+        {
+            skipped_files += 1;
+            continue;
+        }
         candidates.push(Candidate {
             rel_path,
             abs_path,
@@ -159,9 +161,10 @@ pub fn index_repository_with_registry(
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
 
             if let Some(prev) = existing.get(&cand.rel_path)
-                && prev.hash == hash {
-                    return None;
-                }
+                && prev.hash == hash
+            {
+                return None;
+            }
 
             let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
             let line_count = source.lines().count().max(1);
@@ -196,12 +199,21 @@ pub fn index_repository_with_registry(
         let all_refs = db.load_all_raw_refs()?;
         let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
         let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
-        resolved.extend(crate::git::extract_cochange_edges(repo_root, &indexed_paths));
+        resolved.extend(crate::git::extract_cochange_edges(
+            repo_root,
+            &indexed_paths,
+        ));
         let edge_count = resolved.len();
         db.replace_edges(&resolved)?;
         let generation = db.bump_index_generation()?;
         let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
-        (all_files.len(), all_symbols.len(), edge_count, tokens, generation)
+        (
+            all_files.len(),
+            all_symbols.len(),
+            edge_count,
+            tokens,
+            generation,
+        )
     } else {
         // Nothing changed: aggregate in SQL instead of loading every row.
         let (files, symbols, edges, tokens) = db.index_totals()?;
@@ -358,9 +370,10 @@ fn resolve_edges(
                     // Try symbol resolution on last segment
                     if let Some(&last) = segs.last()
                         && let Some(syms) = by_name.get(last)
-                            && let Some(best) = pick_best_symbol(syms, src_file, &segs) {
-                                resolved_targets.push(best.id.clone());
-                            }
+                        && let Some(best) = pick_best_symbol(syms, src_file, &segs)
+                    {
+                        resolved_targets.push(best.id.clone());
+                    }
                     // Also link to module file if found
                     if !segs.is_empty() {
                         let mod_path = format!("src/{}.rs", segs[0]);
@@ -381,7 +394,10 @@ fn resolve_edges(
                 }
                 // c) File path import (HTML script/link, PS dot-source, WGSL import)
                 else {
-                    let norm = target.replace('\\', "/").trim_start_matches("./").to_string();
+                    let norm = target
+                        .replace('\\', "/")
+                        .trim_start_matches("./")
+                        .to_string();
                     let rel_from_dir = join_rel(&parent_dir(src_file), &norm);
                     if let Some(fid) = file_by_path
                         .get(&norm)
@@ -393,13 +409,18 @@ fn resolve_edges(
                         if let Some(fids) = file_by_basename
                             .get(&key)
                             .or_else(|| file_by_stem.get(&key))
-                            && let Some(first) = fids.first() {
-                                resolved_targets.push(first.clone());
-                            }
+                            && let Some(first) = fids.first()
+                        {
+                            resolved_targets.push(first.clone());
+                        }
                     }
                 }
             }
-            EdgeKind::Calls | EdgeKind::Tests | EdgeKind::Implements | EdgeKind::UsesType | EdgeKind::References => {
+            EdgeKind::Calls
+            | EdgeKind::Tests
+            | EdgeKind::Implements
+            | EdgeKind::UsesType
+            | EdgeKind::References => {
                 // Direct file path reference (e.g., from Markdown `src/graph.rs`)
                 if let Some(fid) = file_by_path.get(target) {
                     resolved_targets.push(fid.clone());

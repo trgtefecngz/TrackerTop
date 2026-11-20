@@ -172,7 +172,12 @@ impl Database {
         let edges: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        Ok((files as usize, symbols as usize, edges as usize, tokens as usize))
+        Ok((
+            files as usize,
+            symbols as usize,
+            edges as usize,
+            tokens as usize,
+        ))
     }
 
     pub fn load_file_map(&self) -> Result<HashMap<String, FileRecord>> {
@@ -359,9 +364,9 @@ impl Database {
     }
 
     pub fn load_all_raw_refs(&self) -> Result<Vec<(String, crate::model::RawReference)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_path, source_symbol_id, target_name, kind, line FROM raw_refs",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, source_symbol_id, target_name, kind, line FROM raw_refs")?;
         let rows = stmt.query_map([], |row| {
             let kind_str: String = row.get(3)?;
             Ok((
@@ -563,13 +568,16 @@ impl Database {
             .into_iter()
             .filter(|n| {
                 let nt = n.target.to_ascii_lowercase();
-                lower_targets.iter().any(|t| nt == *t || t.contains(&nt) || nt.contains(t))
+                lower_targets
+                    .iter()
+                    .any(|t| nt == *t || t.contains(&nt) || nt.contains(t))
             })
             .collect())
     }
 
     pub fn delete_note(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM notes WHERE id = ?1", params![id])?;
         Ok(())
     }
 }

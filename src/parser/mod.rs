@@ -171,7 +171,10 @@ pub fn compact_signature(raw: &str, max_chars: usize) -> String {
     if collapsed.chars().count() <= max_chars {
         collapsed
     } else {
-        let mut s: String = collapsed.chars().take(max_chars.saturating_sub(3)).collect();
+        let mut s: String = collapsed
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect();
         s.push_str("...");
         s
     }

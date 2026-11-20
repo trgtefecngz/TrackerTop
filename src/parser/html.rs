@@ -50,13 +50,7 @@ fn text<'a>(n: Node<'a>, bytes: &'a [u8]) -> &'a str {
     n.utf8_text(bytes).unwrap_or("")
 }
 
-fn walk_html(
-    node: Node,
-    file_path: &str,
-    bytes: &[u8],
-    file_id: &str,
-    out: &mut ParsedFile,
-) {
+fn walk_html(node: Node, file_path: &str, bytes: &[u8], file_id: &str, out: &mut ParsedFile) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let start_line = child.start_position().row + 1;
@@ -118,14 +112,15 @@ fn walk_html(
                 // External links & assets
                 for attr_key in ["href", "src", "action"] {
                     if let Some(val) = attrs.get(attr_key)
-                        && is_local_ref(val) {
-                            out.refs.push(RawReference {
-                                source_symbol_id: file_id.to_string(),
-                                target_name: normalize_asset_ref(val),
-                                kind: EdgeKind::Imports,
-                                line: start_line,
-                            });
-                        }
+                        && is_local_ref(val)
+                    {
+                        out.refs.push(RawReference {
+                            source_symbol_id: file_id.to_string(),
+                            target_name: normalize_asset_ref(val),
+                            kind: EdgeKind::Imports,
+                            line: start_line,
+                        });
+                    }
                 }
 
                 // Meaningful structural elements: elements with `id`, `<template>`, `<canvas>`, custom elements (`<my-foo>`)
@@ -142,9 +137,7 @@ fn walk_html(
                         .get("class")
                         .map(|c| format!(" class=\"{c}\""))
                         .unwrap_or_default();
-                    let id_hint = id_attr
-                        .map(|i| format!(" id=\"{i}\""))
-                        .unwrap_or_default();
+                    let id_hint = id_attr.map(|i| format!(" id=\"{i}\"")).unwrap_or_default();
                     let sig = compact_signature(&format!("<{tag}{id_hint}{class_hint}>"), 120);
                     let raw = text(child, bytes);
                     out.symbols.push(Symbol {
@@ -166,19 +159,20 @@ fn walk_html(
                 // Inline event handlers (onclick="foo()")
                 for (k, v) in &attrs {
                     if k.starts_with("on")
-                        && let Some(fn_name) = v.split('(').next() {
-                            let clean = fn_name.trim();
-                            if !clean.is_empty()
-                                && clean.chars().all(|c| c.is_alphanumeric() || c == '_')
-                            {
-                                out.refs.push(RawReference {
-                                    source_symbol_id: file_id.to_string(),
-                                    target_name: clean.to_string(),
-                                    kind: EdgeKind::Calls,
-                                    line: start_line,
-                                });
-                            }
+                        && let Some(fn_name) = v.split('(').next()
+                    {
+                        let clean = fn_name.trim();
+                        if !clean.is_empty()
+                            && clean.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            out.refs.push(RawReference {
+                                source_symbol_id: file_id.to_string(),
+                                target_name: clean.to_string(),
+                                kind: EdgeKind::Calls,
+                                line: start_line,
+                            });
                         }
+                    }
                 }
 
                 walk_html(child, file_path, bytes, file_id, out);
@@ -205,10 +199,7 @@ fn extract_tag_name(elem: Node, bytes: &[u8]) -> String {
     String::new()
 }
 
-fn extract_start_tag_attrs(
-    elem: Node,
-    bytes: &[u8],
-) -> std::collections::HashMap<String, String> {
+fn extract_start_tag_attrs(elem: Node, bytes: &[u8]) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let mut cursor = elem.walk();
     for ch in elem.children(&mut cursor) {
@@ -283,26 +274,27 @@ fn extract_inline_js_symbols(
             .strip_prefix("async function ")
             .or_else(|| trimmed.strip_prefix("function "));
         if let Some(rest) = fn_rest
-            && let Some(paren) = rest.find('(') {
-                let name = rest[..paren].trim();
-                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    let sym_id = make_symbol_id(file_path, name, line_no);
-                    out.symbols.push(Symbol {
-                        id: sym_id,
-                        file_path: file_path.to_string(),
-                        name: name.to_string(),
-                        qualified_name: name.to_string(),
-                        kind: SymbolKind::Function,
-                        signature: compact_signature(trimmed.trim_end_matches('{'), 120),
-                        start_line: line_no,
-                        end_line: line_no,
-                        token_count: count_tokens(trimmed),
-                        visibility: "js".to_string(),
-                        doc_summary: String::new(),
-                        parent_id: Some(script_id.to_string()),
-                    });
-                }
+            && let Some(paren) = rest.find('(')
+        {
+            let name = rest[..paren].trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                let sym_id = make_symbol_id(file_path, name, line_no);
+                out.symbols.push(Symbol {
+                    id: sym_id,
+                    file_path: file_path.to_string(),
+                    name: name.to_string(),
+                    qualified_name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    signature: compact_signature(trimmed.trim_end_matches('{'), 120),
+                    start_line: line_no,
+                    end_line: line_no,
+                    token_count: count_tokens(trimmed),
+                    visibility: "js".to_string(),
+                    doc_summary: String::new(),
+                    parent_id: Some(script_id.to_string()),
+                });
             }
+        }
 
         // Detect references to `.wgsl` / `.js` / `.html` / `.css` files in fetch/import strings
         for quote in ['"', '\''] {
