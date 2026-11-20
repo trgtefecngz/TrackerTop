@@ -1711,3 +1711,44 @@ fn review_reports_import_cycles_the_change_creates() {
         cycles[0].evidence
     );
 }
+
+/// Symbol lookups never guess silently: `path::name` picks a symbol in a file, a name
+/// shared by several symbols is reported as ambiguous with the alternatives, and a fuzzy
+/// match is labelled as one.
+#[test]
+fn symbol_lookups_say_when_they_are_ambiguous_or_approximate() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "pub fn load() -> i32 {\n    1\n}\n").unwrap();
+    std::fs::write(root.join("src/b.rs"), "pub fn load() -> i32 {\n    2\n}\n").unwrap();
+    std::fs::write(
+        root.join("src/c.rs"),
+        "pub fn configuration_loader() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let out = engine
+        .read_symbol("src/b.rs::load", false, 2_000)
+        .unwrap()
+        .text;
+    assert!(out.contains("(src/b.rs:L1-3)"), "{out}");
+    assert!(!out.contains("AMBIGUOUS"), "{out}");
+
+    let out = engine.read_symbol("load", false, 2_000).unwrap().text;
+    assert!(
+        out.contains("AMBIGUOUS: 1 other symbol(s) are also named `load`"),
+        "{out}"
+    );
+
+    let out = engine
+        .read_symbol("configuration", false, 2_000)
+        .unwrap()
+        .text;
+    assert!(out.contains("# SYMBOL configuration_loader"), "{out}");
+    assert!(
+        out.contains("NOTE: no symbol is named exactly `configuration`"),
+        "{out}"
+    );
+}

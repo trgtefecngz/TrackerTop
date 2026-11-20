@@ -20,6 +20,9 @@ All notable changes to TrackerTop are documented here.
 ### Changed: `run_checks` memory
 - Command output is kept up to 16 MB from the start plus the last 8–16 MB, instead of the whole log in memory. When the middle is dropped, the report says so (**PARTIAL OUTPUT**), so a failure printed there is never silently lost.
 
+### Fixed: symbol lookups never guess silently
+- `read_symbol`, `read_symbols_batch`, `call_graph` and `impact_analysis` used to fall back to the best fuzzy match without saying so. For example, `src/review/rules.rs::tests` returned an unrelated test. Lookups now try an exact symbol id, `path::name`, an exact qualified name, then an exact name, in that order. When several symbols share the name, the answer says **AMBIGUOUS** and lists them; a fuzzy match is labelled as the closest match.
+
 ### Fixed: call edges (all tools)
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
 - A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.

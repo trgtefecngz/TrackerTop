@@ -404,6 +404,12 @@ impl TrackerEngine {
             sym.start_line,
             sym.end_line
         );
+        if let Some(c) = cg
+            .resolve(symbol_query)
+            .and_then(|r| r.caveat(symbol_query))
+        {
+            out.push_str(&format!("{c}\n"));
+        }
         if let Some(f) = cg.files.get(&sym.file_path) {
             let quality = default_registry().extractor_quality(&f.language);
             if quality != "tree-sitter" {
@@ -572,6 +578,12 @@ impl TrackerEngine {
             sym.start_line,
             depth.max(1)
         );
+        if let Some(c) = cg
+            .resolve(symbol_query)
+            .and_then(|r| r.caveat(symbol_query))
+        {
+            out.push_str(&format!("{c}\n"));
+        }
         out.push_str(&format!("Sig: `{}`\n", sym.signature));
 
         out.push_str(&format!("\n## Incoming / Callers ({})\n", callers.len()));
@@ -668,6 +680,12 @@ impl TrackerEngine {
             report.transitive_dependents.len(),
             report.related_tests.len(),
         );
+        if let Some(c) = cg
+            .resolve(symbol_query)
+            .and_then(|r| r.caveat(symbol_query))
+        {
+            out.push_str(&format!("{c}\n"));
+        }
 
         if !report.direct_dependents.is_empty() {
             out.push_str("\n## Direct Dependents (1-hop)\n");
@@ -1115,6 +1133,9 @@ impl TrackerEngine {
                 sym.start_line,
                 sym.end_line
             ));
+            if let Some(c) = cg.resolve(q).and_then(|r| r.caveat(q)) {
+                out.push_str(&format!("{c}\n"));
+            }
             if let Ok(notes) =
                 db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path])
             {
@@ -1415,7 +1436,8 @@ impl TrackerEngine {
         if cg.files.contains_key(&t) {
             return file_text(&t).map(|x| hash(&x));
         }
-        let s = cg.resolve_symbol(&t)?;
+        // Exact only: a fuzzy guess would hash some other symbol's code
+        let s = cg.resolve_exact(&t)?;
         symbol_text(s).map(|x| hash(&x))
     }
 

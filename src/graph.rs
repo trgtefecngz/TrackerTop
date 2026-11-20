@@ -29,6 +29,44 @@ pub struct ScoredNode {
 }
 
 #[derive(Debug, Clone)]
+/// The symbol a query names, whether the match was exact, and the other symbols with the
+/// same name (so a tool can say the choice was ambiguous instead of guessing silently).
+pub struct Resolution<'a> {
+    pub symbol: &'a Symbol,
+    pub exact: bool,
+    pub others: Vec<&'a Symbol>,
+}
+
+impl Resolution<'_> {
+    /// One line to print under a lookup's header when the answer is not unambiguous.
+    pub fn caveat(&self, query: &str) -> Option<String> {
+        if !self.exact {
+            return Some(format!(
+                "NOTE: no symbol is named exactly `{query}`; this is the closest match \
+                 ({}:{}). Check it is the one you meant.",
+                self.symbol.file_path, self.symbol.start_line
+            ));
+        }
+        if self.others.is_empty() {
+            return None;
+        }
+        let shown: Vec<String> = self
+            .others
+            .iter()
+            .take(5)
+            .map(|s| format!("{}:{}", s.file_path, s.start_line))
+            .collect();
+        Some(format!(
+            "AMBIGUOUS: {} other symbol(s) are also named `{query}`: {}{}. Pass `path::name` \
+             to pick one.",
+            self.others.len(),
+            shown.join(", "),
+            if self.others.len() > 5 { ", ..." } else { "" }
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ImpactReport {
     pub root: Symbol,
     pub direct_dependents: Vec<Symbol>,
@@ -288,13 +326,96 @@ impl CodeGraph {
 
     /// Resolves a user/AI symbol specifier (exact ID, qualified name, or best search match).
     pub fn resolve_symbol(&self, query: &str) -> Option<&Symbol> {
-        if let Some(s) = self.symbols.get(query) {
-            return Some(s);
+        self.resolve(query).map(|r| r.symbol)
+    }
+
+    /// Resolves a symbol query, most precise form first:
+    /// 1. a symbol id;
+    /// 2. `path::name` (a file of the index, then a qualified or plain name inside it);
+    /// 3. an exact qualified name, then an exact name (the highest-ranked one when several
+    ///    share it; the others are returned so the caller can say so);
+    /// 4. otherwise the best fuzzy match, marked `exact: false`.
+    pub fn resolve(&self, query: &str) -> Option<Resolution<'_>> {
+        let q = query.trim();
+        if let Some(s) = self.symbols.get(q) {
+            return Some(Resolution {
+                symbol: s,
+                exact: true,
+                others: Vec::new(),
+            });
         }
-        self.search_symbols(query, 1)
+        // `path::name`: the longest prefix that is an indexed file
+        let norm = q.replace('\\', "/");
+        let mut cuts: Vec<usize> = norm.match_indices("::").map(|(i, _)| i).collect();
+        cuts.reverse();
+        for i in cuts {
+            let (path, rest) = (&norm[..i], &norm[i + 2..]);
+            if let Some(ids) = self.symbols_by_file.get(path) {
+                let in_file: Vec<&Symbol> = ids
+                    .iter()
+                    .filter_map(|id| self.symbols.get(id))
+                    .filter(|s| s.kind != SymbolKind::File)
+                    .collect();
+                let by_qname: Vec<&Symbol> = in_file
+                    .iter()
+                    .copied()
+                    .filter(|s| s.qualified_name == rest)
+                    .collect();
+                if !by_qname.is_empty() {
+                    return self.pick_ranked(by_qname);
+                }
+                return self.pick_ranked(in_file.into_iter().filter(|s| s.name == rest).collect());
+            }
+        }
+        let code = |s: &&Symbol| s.kind != SymbolKind::File;
+        let by_qname: Vec<&Symbol> = self
+            .symbols
+            .values()
+            .filter(code)
+            .filter(|s| s.qualified_name == q)
+            .collect();
+        if !by_qname.is_empty() {
+            return self.pick_ranked(by_qname);
+        }
+        let by_name: Vec<&Symbol> = self
+            .symbols
+            .values()
+            .filter(code)
+            .filter(|s| s.name == q)
+            .collect();
+        if !by_name.is_empty() {
+            return self.pick_ranked(by_name);
+        }
+        self.search_symbols(q, 1)
             .into_iter()
             .next()
-            .map(|(s, _)| s)
+            .map(|(s, _)| Resolution {
+                symbol: s,
+                exact: false,
+                others: Vec::new(),
+            })
+    }
+
+    /// The highest-ranked of several exact matches; the rest become `others`.
+    fn pick_ranked<'a>(&'a self, mut found: Vec<&'a Symbol>) -> Option<Resolution<'a>> {
+        found.sort_by_key(|s| {
+            (
+                std::cmp::Reverse((self.pagerank.get(&s.id).copied().unwrap_or(0.0) * 1e9) as u64),
+                s.file_path.clone(),
+                s.start_line,
+            )
+        });
+        let mut it = found.into_iter();
+        it.next().map(|symbol| Resolution {
+            symbol,
+            exact: true,
+            others: it.collect(),
+        })
+    }
+
+    /// Like `resolve`, but never a fuzzy guess.
+    pub fn resolve_exact(&self, query: &str) -> Option<&Symbol> {
+        self.resolve(query).filter(|r| r.exact).map(|r| r.symbol)
     }
 
     /// Returns direct callers and callees (up to `depth` hops) of a symbol.
