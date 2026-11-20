@@ -1,6 +1,6 @@
 use crate::model::{
-    Edge, EdgeKind, FileRecord, ProjectNote, Symbol, SymbolKind, TelemetryEntry, TokenStatsSummary,
-    ToolSavingsBreakdown,
+    Edge, EdgeKind, FileRecord, ProjectNote, SourceBreakdown, Symbol, SymbolKind, TelemetryEntry,
+    TokenStatsSummary, ToolSavingsBreakdown,
 };
 use crate::tokens::estimate_usd_saved;
 use anyhow::{Context, Result};
@@ -142,6 +142,8 @@ impl Database {
         // v0.7: decision memory. Added in place so existing notes keep working (kind 'note').
         self.ensure_column("notes", "kind", "TEXT NOT NULL DEFAULT 'note'")?;
         self.ensure_column("notes", "reason", "TEXT NOT NULL DEFAULT ''")?;
+        // v0.7: honest metrics. Rows recorded before this are `legacy` (source unknown).
+        self.ensure_column("telemetry", "source", "TEXT NOT NULL DEFAULT 'legacy'")?;
         Ok(())
     }
 
@@ -479,6 +481,7 @@ impl Database {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_telemetry(
         &self,
         tool: &str,
@@ -487,12 +490,13 @@ impl Database {
         baseline_tokens: usize,
         files_avoided: usize,
         latency_ms: u64,
+        source: &str,
     ) -> Result<()> {
         let tokens_saved = baseline_tokens.saturating_sub(tokens_sent);
         let ts = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO telemetry (timestamp, tool, query, tokens_sent, baseline_tokens, tokens_saved, files_avoided, latency_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO telemetry (timestamp, tool, query, tokens_sent, baseline_tokens, tokens_saved, files_avoided, latency_ms, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 ts,
                 tool,
@@ -502,26 +506,75 @@ impl Database {
                 tokens_saved as i64,
                 files_avoided as i64,
                 latency_ms as i64,
+                source,
             ],
         )?;
         Ok(())
     }
 
+    /// Real AI-agent usage (calls that came in over MCP). Use [`Self::get_token_stats_scoped`]
+    /// for other scopes; CLI, UI, test and legacy calls are listed in `by_source`.
     pub fn get_token_stats(&self, recent_limit: usize) -> Result<TokenStatsSummary> {
-        let (total_queries, total_sent, total_base, total_saved): (i64, i64, i64, i64) =
-            self.conn.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(tokens_sent),0), COALESCE(SUM(baseline_tokens),0), COALESCE(SUM(tokens_saved),0)
-                 FROM telemetry",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
+        self.get_token_stats_scoped(recent_limit, StatsScope::Agents)
+    }
 
-        let mut stmt = self.conn.prepare(
+    pub fn get_token_stats_scoped(
+        &self,
+        recent_limit: usize,
+        scope: StatsScope,
+    ) -> Result<TokenStatsSummary> {
+        let filter = scope.where_clause();
+        let (total_queries, total_sent, total_base, total_saved, total_cons, cons_saved): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(tokens_sent),0), COALESCE(SUM(baseline_tokens),0),
+                        COALESCE(SUM(tokens_saved),0), COALESCE(SUM({CONSERVATIVE_BASELINE}),0),
+                        COALESCE(SUM(MAX(0, {CONSERVATIVE_BASELINE} - tokens_sent)),0)
+                 FROM telemetry WHERE {filter}"
+            ),
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+
+        let mut src_stmt = self.conn.prepare(&format!(
+            "SELECT source, COUNT(*), SUM(tokens_sent), SUM(tokens_saved),
+                    SUM(MAX(0, {CONSERVATIVE_BASELINE} - tokens_sent))
+             FROM telemetry GROUP BY source ORDER BY COUNT(*) DESC"
+        ))?;
+        let by_source = src_stmt
+            .query_map([], |r| {
+                Ok(SourceBreakdown {
+                    source: r.get(0)?,
+                    queries: r.get::<_, i64>(1)? as usize,
+                    tokens_sent: r.get::<_, i64>(2)? as usize,
+                    tokens_saved_upper: r.get::<_, i64>(3)? as usize,
+                    tokens_saved_conservative: r.get::<_, i64>(4)? as usize,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT tool, COUNT(*), SUM(tokens_sent), SUM(baseline_tokens), SUM(tokens_saved)
              FROM telemetry
+             WHERE {filter}
              GROUP BY tool
-             ORDER BY SUM(tokens_saved) DESC",
-        )?;
+             ORDER BY SUM(tokens_saved) DESC"
+        ))?;
         let by_tool = stmt
             .query_map([], |r| {
                 let sent = r.get::<_, i64>(2)? as usize;
@@ -543,12 +596,13 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut recent_stmt = self.conn.prepare(
-            "SELECT id, timestamp, tool, query, tokens_sent, baseline_tokens, tokens_saved, files_avoided, latency_ms
+        let mut recent_stmt = self.conn.prepare(&format!(
+            "SELECT id, timestamp, tool, query, tokens_sent, baseline_tokens, tokens_saved, files_avoided, latency_ms, source
              FROM telemetry
+             WHERE {filter}
              ORDER BY id DESC
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        ))?;
         let recent = recent_stmt
             .query_map(params![recent_limit as i64], |r| {
                 Ok(TelemetryEntry {
@@ -561,14 +615,17 @@ impl Database {
                     tokens_saved: r.get::<_, i64>(6)? as usize,
                     files_avoided: r.get::<_, i64>(7)? as usize,
                     latency_ms: r.get::<_, i64>(8)? as u64,
+                    source: r.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let savings_percent = if total_base > 0 {
-            (total_saved as f64 / total_base as f64) * 100.0
-        } else {
-            0.0
+        let pct = |saved: i64, base: i64| {
+            if base > 0 {
+                (saved as f64 / base as f64) * 100.0
+            } else {
+                0.0
+            }
         };
         let (sonnet_usd, opus_usd) = estimate_usd_saved(total_saved as usize);
 
@@ -577,11 +634,16 @@ impl Database {
             total_tokens_sent: total_sent as usize,
             total_baseline_tokens: total_base as usize,
             total_tokens_saved: total_saved as usize,
-            savings_percent,
+            savings_percent: pct(total_saved, total_base),
             est_usd_saved_sonnet: sonnet_usd,
             est_usd_saved_opus: opus_usd,
             by_tool,
             recent,
+            scope: scope.label().to_string(),
+            total_conservative_baseline: total_cons as usize,
+            conservative_tokens_saved: cons_saved as usize,
+            conservative_savings_percent: pct(cons_saved, total_cons),
+            by_source,
         })
     }
 
@@ -1052,5 +1114,108 @@ mod note_tests {
         }
         let found = db.find_notes_for_targets(&["alpha"]).unwrap();
         assert_eq!(found.len(), 1);
+    }
+}
+
+/// Lower-bound baseline per telemetry row, in SQL: a careful agent without TrackerTop would
+/// do targeted reads of at most 1,500 tokens from at most 5 of the touched files, and never
+/// spend less than what TrackerTop sent. Capped by the stored upper-bound baseline.
+/// Derived from stored columns, so it applies to rows recorded before v0.7 as well.
+pub const CONSERVATIVE_BASELINE: &str =
+    "MIN(baseline_tokens, MAX(tokens_sent, MIN(files_avoided, 5) * 1500))";
+
+/// Which telemetry rows token statistics cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsScope {
+    /// Calls made by AI agents over MCP: the real usage.
+    Agents,
+    /// Every row, including CLI, UI, tests, benchmarks and legacy rows.
+    All,
+}
+
+impl StatsScope {
+    fn where_clause(self) -> &'static str {
+        match self {
+            StatsScope::Agents => "source LIKE 'mcp:%'",
+            StatsScope::All => "1 = 1",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StatsScope::Agents => "AI agents (MCP calls)",
+            StatsScope::All => "all sources",
+        }
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[test]
+    fn agent_usage_is_the_default_scope_and_savings_are_a_range() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open_path(&tmp.path().join("m.db")).unwrap();
+        // sent 100, upper baseline 10_000, 1 file: conservative baseline min(10_000, max(100, 1_500))
+        db.record_telemetry("read_symbol", "a", 100, 10_000, 1, 1, "mcp:claude-code")
+            .unwrap();
+        // 9 files are capped at 5 for the conservative baseline: min(50_000, 7_500)
+        db.record_telemetry("repo_map", "", 500, 50_000, 9, 1, "mcp:cursor")
+            .unwrap();
+        // baseline below what was sent: nothing saved under either estimate
+        db.record_telemetry("smart_grep", "x", 300, 200, 1, 1, "mcp:cursor")
+            .unwrap();
+        db.record_telemetry("read_symbol", "b", 10, 90_000, 3, 1, "cli")
+            .unwrap();
+        db.record_telemetry("read_symbol", "c", 10, 90_000, 3, 1, "test")
+            .unwrap();
+
+        let s = db.get_token_stats(10).unwrap();
+        assert_eq!(s.scope, "AI agents (MCP calls)");
+        assert_eq!(s.total_queries, 3);
+        assert_eq!(s.total_tokens_saved, 9_900 + 49_500);
+        assert_eq!(s.conservative_tokens_saved, 1_400 + 7_000);
+        assert!(s.conservative_savings_percent <= s.savings_percent);
+        assert_eq!(s.recent.len(), 3);
+        assert!(s.recent.iter().all(|r| r.source.starts_with("mcp:")));
+        let sources: Vec<(&str, usize)> = s
+            .by_source
+            .iter()
+            .map(|b| (b.source.as_str(), b.queries))
+            .collect();
+        assert!(sources.contains(&("mcp:cursor", 2)) && sources.contains(&("cli", 1)));
+        assert!(sources.contains(&("test", 1)) && sources.contains(&("mcp:claude-code", 1)));
+
+        let all = db.get_token_stats_scoped(10, StatsScope::All).unwrap();
+        assert_eq!(all.total_queries, 5);
+        let text = s.summary_text(5);
+        assert!(text.contains("Saved: 8400 to 59400 tok"), "{text}");
+        assert!(text.contains("- cli: 1 calls"), "{text}");
+        assert!(text.contains("`read_symbol` `a`"), "{text}");
+    }
+
+    #[test]
+    fn pre_v07_telemetry_is_migrated_as_legacy_and_not_counted_as_agent_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE telemetry (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+                 tool TEXT NOT NULL, query TEXT NOT NULL, tokens_sent INTEGER NOT NULL,
+                 baseline_tokens INTEGER NOT NULL, tokens_saved INTEGER NOT NULL,
+                 files_avoided INTEGER NOT NULL, latency_ms INTEGER NOT NULL);
+                 INSERT INTO telemetry (timestamp, tool, query, tokens_sent, baseline_tokens,
+                   tokens_saved, files_avoided, latency_ms) VALUES ('t','repo_map','',10,1000,990,15,1);",
+            )
+            .unwrap();
+        }
+        let db = Database::open_path(&path).unwrap();
+        let s = db.get_token_stats(10).unwrap();
+        assert_eq!(s.total_queries, 0);
+        assert_eq!(s.by_source.len(), 1);
+        assert_eq!(s.by_source[0].source, "legacy");
+        assert_eq!(s.by_source[0].tokens_saved_upper, 990);
     }
 }

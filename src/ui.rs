@@ -252,6 +252,7 @@ impl TrackerTopApp {
 
     fn run_preview_query(&mut self, repo_path: &str) {
         let engine = TrackerEngine::new(Path::new(repo_path));
+        engine.set_source("ui");
         match engine.preview_repo_map(900) {
             Ok(out) => {
                 let pct = if out.baseline_tokens > 0 {
@@ -1099,9 +1100,16 @@ impl TrackerTopApp {
         ui.columns(4, |cols| {
             glow_kpi_card(
                 &mut cols[0],
-                "NET TOKENS SAVED",
-                &fmt_num(s.total_tokens_saved),
-                &format!("{:.1}% reduction", s.savings_percent),
+                "TOKENS SAVED (RANGE)",
+                &format!(
+                    "{}–{}",
+                    fmt_num(s.conservative_tokens_saved),
+                    fmt_num(s.total_tokens_saved)
+                ),
+                &format!(
+                    "{:.0}–{:.0}% · conservative–upper · AI agents only",
+                    s.conservative_savings_percent, s.savings_percent
+                ),
                 Color32::from_rgb(110, 231, 183),
                 Color32::from_rgb(52, 211, 153),
             );

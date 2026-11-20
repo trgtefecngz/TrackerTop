@@ -1140,3 +1140,39 @@ fn decisions_and_dismissed_leads_surface_when_code_is_read() {
     assert!(recalled.contains("# SAVED MEMORY NOTES (1)"), "{recalled}");
     assert!(root.join(".trackertop/notes/00001-decision.md").is_file());
 }
+
+#[test]
+fn mcp_calls_are_tagged_with_the_client_name() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "pub fn tagged() {}\n").unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"clientInfo":{"name":"claude-code\n<script>","version":"1"}}}),
+    )
+    .unwrap();
+    handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"read_symbol","arguments":{"symbol":"tagged"}}}),
+    )
+    .unwrap();
+    let stats = engine.token_stats().unwrap();
+    assert_eq!(stats.total_queries, 1);
+    assert_eq!(stats.recent[0].source, "mcp:claude-codescript");
+    assert_eq!(stats.recent[0].tool, "read_symbol");
+
+    // A CLI engine on the same repo is recorded separately, not as agent usage
+    let cli = TrackerEngine::new(tmp.path());
+    cli.read_symbol("tagged", false, 500).unwrap();
+    let stats = cli.token_stats().unwrap();
+    assert_eq!(stats.total_queries, 1);
+    assert!(
+        stats
+            .by_source
+            .iter()
+            .any(|s| s.source == "cli" && s.queries == 1)
+    );
+}

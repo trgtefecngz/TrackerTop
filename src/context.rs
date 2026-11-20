@@ -26,14 +26,43 @@ pub struct TrackerEngine {
     /// Last built graph, tagged with the DB `index_generation` it was built from.
     /// Long-lived engines (the MCP server) reuse it until the index changes.
     graph_cache: Mutex<Option<(i64, Arc<CodeGraph>)>>,
+    /// Telemetry source tag for calls made through this engine (see [`Self::set_source`]).
+    source: Mutex<String>,
 }
 
 impl TrackerEngine {
+    /// The source defaults to `cli`, or to `TRACKERTOP_TELEMETRY_SOURCE` when set (e.g.
+    /// `benchmark` for scripted measurement runs, so they never count as agent usage).
     pub fn new(repo_root: &Path) -> Self {
+        let source = std::env::var("TRACKERTOP_TELEMETRY_SOURCE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cli".to_string());
         Self {
             repo_root: repo_root.to_path_buf(),
             graph_cache: Mutex::new(None),
+            source: Mutex::new(source),
         }
+    }
+
+    /// Tags later telemetry rows: `mcp:<client>` for MCP sessions, `ui` for the desktop app.
+    /// An explicit `TRACKERTOP_TELEMETRY_SOURCE` always wins, so benchmarks stay separate.
+    pub fn set_source(&self, source: &str) {
+        if std::env::var("TRACKERTOP_TELEMETRY_SOURCE").is_ok_and(|s| !s.trim().is_empty()) {
+            return;
+        }
+        *self
+            .source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = source.to_string();
+    }
+
+    pub fn source(&self) -> String {
+        self.source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn load_fresh(&self) -> Result<(Database, Arc<CodeGraph>)> {
@@ -119,6 +148,7 @@ impl TrackerEngine {
                 baseline_tokens,
                 files_avoided,
                 latency_ms,
+                &self.source(),
             );
         }
 

@@ -196,9 +196,18 @@ pub struct TelemetryEntry {
     pub tokens_saved: usize,
     pub files_avoided: usize,
     pub latency_ms: u64,
+    /// Who made the call: `mcp:<client name>`, `cli`, `ui`, `test`, a custom tag from
+    /// `TRACKERTOP_TELEMETRY_SOURCE`, or `legacy` (recorded before v0.7, source unknown).
+    #[serde(default)]
+    pub source: String,
 }
 
 /// Aggregated token-savings statistics.
+///
+/// Savings are a range: `total_tokens_saved` is the upper bound (the agent would have read
+/// every touched file whole, and repo_map up to 15 files), `conservative_tokens_saved` the
+/// lower estimate (targeted reads of at most 1,500 tokens from at most 5 touched files,
+/// never less than what TrackerTop sent).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenStatsSummary {
     pub total_queries: usize,
@@ -210,6 +219,80 @@ pub struct TokenStatsSummary {
     pub est_usd_saved_opus: f64,
     pub by_tool: Vec<ToolSavingsBreakdown>,
     pub recent: Vec<TelemetryEntry>,
+    /// Which calls the totals cover, e.g. `AI agents (MCP)` or `all sources`.
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub total_conservative_baseline: usize,
+    #[serde(default)]
+    pub conservative_tokens_saved: usize,
+    #[serde(default)]
+    pub conservative_savings_percent: f64,
+    /// Every source, regardless of `scope`, so test/CLI calls are visible but separate.
+    #[serde(default)]
+    pub by_source: Vec<SourceBreakdown>,
+}
+
+impl TokenStatsSummary {
+    /// Plain-text summary: savings as a range, calls per source, and the latest requests
+    /// (tool + query) so a human can see what the agent asked for.
+    pub fn summary_text(&self, recent: usize) -> String {
+        let mut out = format!(
+            "# TRACKERTOP TOKEN SAVINGS ({})\nQueries: {}\nTokens sent: {}\n\
+             Saved: {} to {} tok ({:.0}% to {:.0}%): conservative estimate to upper bound\n\
+             Est. USD saved (upper bound): ${:.4} (Sonnet) / ${:.4} (Opus)\n\
+             Conservative: targeted reads of at most 1,500 tok from at most 5 touched files. \
+             Upper bound: every touched file read whole (repo_map: up to 15 files).\n",
+            self.scope,
+            self.total_queries,
+            self.total_tokens_sent,
+            self.conservative_tokens_saved,
+            self.total_tokens_saved,
+            self.conservative_savings_percent,
+            self.savings_percent,
+            self.est_usd_saved_sonnet,
+            self.est_usd_saved_opus
+        );
+        if !self.by_source.is_empty() {
+            out.push_str("\n## Calls by source (all rows)\n");
+            for s in &self.by_source {
+                out.push_str(&format!(
+                    "- {}: {} calls, sent {} tok, saved {} to {} tok\n",
+                    s.source,
+                    s.queries,
+                    s.tokens_sent,
+                    s.tokens_saved_conservative,
+                    s.tokens_saved_upper
+                ));
+            }
+            out.push_str(
+                "(`mcp:*` = AI agents; `cli`, `ui`, `test`, `benchmark` and `legacy` \
+                 (before v0.7, source unknown) are not counted in the totals above)\n",
+            );
+        }
+        if !self.recent.is_empty() && recent > 0 {
+            out.push_str("\n## What the agent asked for (latest first)\n");
+            for e in self.recent.iter().take(recent) {
+                out.push_str(&format!(
+                    "- {} `{}` `{}` ({} tok sent)\n",
+                    e.timestamp.get(..19).unwrap_or(&e.timestamp),
+                    e.tool,
+                    e.query.chars().take(80).collect::<String>(),
+                    e.tokens_sent
+                ));
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourceBreakdown {
+    pub source: String,
+    pub queries: usize,
+    pub tokens_sent: usize,
+    pub tokens_saved_upper: usize,
+    pub tokens_saved_conservative: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

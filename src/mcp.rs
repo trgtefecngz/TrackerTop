@@ -10,6 +10,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// All protocol frames go to stdout; diagnostics must only ever go to stderr.
 pub fn run_mcp_server(repo_root: &Path) -> Result<()> {
     let engine = TrackerEngine::new(repo_root);
+    engine.set_source("mcp:unknown"); // refined by the client name on `initialize`
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -55,6 +56,23 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
     // Notifications (no `id`) must not receive a JSON-RPC response
     let id = id?;
 
+    if method == "initialize" {
+        // Tag telemetry with the calling agent so real usage is separable from CLI/tests
+        let client: String = params
+            .pointer("/clientInfo/name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+            .take(40)
+            .collect();
+        let client = client.trim();
+        engine.set_source(&format!(
+            "mcp:{}",
+            if client.is_empty() { "unknown" } else { client }
+        ));
+    }
+
     let result = match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -65,7 +83,7 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
                 "name": "trackertop",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens."
+            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens. Call project_playbook once at the start, run_checks instead of running tests/lint in a shell, changes_since to catch up after edits, and remember(kind=decision|dismissed, reason=...) to record settled questions. Every answer states its coverage (truncation, NOT INDEXED vs NOT FOUND)."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -128,7 +146,10 @@ fn dispatch_tool_call(
             let symbols: Vec<String> = args
                 .get("symbols")
                 .and_then(Value::as_array)
-                .ok_or((-32602, "Missing required array argument `symbols`".to_string()))?
+                .ok_or((
+                    -32602,
+                    "Missing required array argument `symbols`".to_string(),
+                ))?
                 .iter()
                 .filter_map(Value::as_str)
                 .map(ToString::to_string)
@@ -198,7 +219,10 @@ fn dispatch_tool_call(
             engine.shortest_path(from, to, max_tokens).map(|q| q.text)
         }
         "remember" => {
-            let target = args.get("target").and_then(Value::as_str).unwrap_or("project");
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or("project");
             let note = args
                 .get("note")
                 .and_then(Value::as_str)
@@ -240,18 +264,7 @@ fn dispatch_tool_call(
                 .map(|q| q.text)
         }
         "project_playbook" => engine.project_playbook(max_tokens).map(|q| q.text),
-        "token_stats" => engine.token_stats().map(|s| {
-            format!(
-                "# TRACKERTOP TOKEN SAVINGS\nQueries: {}\nTokens sent: {}\nBaseline avoided: {}\nNet saved: {} tok ({:.1}%)\nEst. USD saved: ${:.4} (Sonnet) / ${:.4} (Opus)",
-                s.total_queries,
-                s.total_tokens_sent,
-                s.total_baseline_tokens,
-                s.total_tokens_saved,
-                s.savings_percent,
-                s.est_usd_saved_sonnet,
-                s.est_usd_saved_opus
-            )
-        }),
+        "token_stats" => engine.token_stats().map(|s| s.summary_text(5)),
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
     };
 

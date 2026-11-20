@@ -6,6 +6,20 @@ All notable changes to TrackerTop are documented here.
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
+### Changed: honest metrics
+- Every telemetry row records who made the call:
+  - `mcp:<client name>`, taken from the MCP `initialize` request (for example `mcp:claude-code`);
+  - `cli` or `ui`;
+  - a custom tag from `TRACKERTOP_TELEMETRY_SOURCE`, such as `benchmark`;
+  - `legacy` for rows recorded before 0.7.
+  The telemetry table is migrated in place.
+- Statistics count real AI-agent usage (MCP calls) by default, in `token_stats`, `trackertop stats`, the report, the project list and the desktop app. Calls from the CLI, UI, tests, benchmarks and legacy rows are listed per source and not mixed in.
+- Savings are shown as a range:
+  - **conservative**: targeted reads of at most 1,500 tokens from at most 5 touched files, never less than what was sent;
+  - **upper bound**: the previous figure, every touched file read whole.
+  The conservative figure is computed from stored columns, so it covers old rows too.
+- `token_stats` and `trackertop stats` end with the latest requests (tool and query), so you can see what the agent asked for.
+
 ### Added: decision memory
 - `remember` takes a `kind` (`note`, `decision` or `dismissed`, the last for a review lead that was checked and rejected) and a `reason`, which is required for decisions and dismissed leads.
 - Notes are shown, labelled with kind and reason, wherever the related code is read: `read_symbol`, `read_symbols_batch`, `file_outline` (notes on the file or any of its symbols) and `repo_map`. Settled questions are not investigated again.
