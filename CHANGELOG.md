@@ -30,6 +30,10 @@ All notable changes to TrackerTop are documented here.
 ### Added: line ranges in `read_symbol`
 - `read_symbol("src/lib.rs:L120-160")` reads a line range that no symbol covers, such as an impl tail or a test module's helpers, and names the innermost symbol around it. A range past the end of the file is clamped and says so; one that starts past the end, or a file that is not indexed, gets an explicit error.
 
+### Changed: Python and Go on tree-sitter
+- The Python and Go extractors now read a syntax tree instead of scanning lines. Text in strings and comments is no longer taken for a call, a `def` inside a docstring is no longer a symbol, and braces inside Go strings no longer end a function early.
+- Fixed along the way: multi-line Python and Go signatures (the function used to end at its first line), grouped Go `type ( ... )` declarations (previously missed), generic Go receivers (`Stack[T]` is now `Stack`), and multi-line `from x import (...)` lists.
+
 ### Fixed: stale graph after upgrading TrackerTop
 - The index records which extractor revision parsed it. An index written by another TrackerTop version is re-parsed in full on its next run. Before, files whose content had not changed kept the references an older extractor produced, so call-edge fixes never reached them: on this repository, `TrackerEngine::finalize_inner` showed 0 callers instead of 19.
 
