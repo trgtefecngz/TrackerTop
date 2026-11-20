@@ -83,7 +83,7 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
                 "name": "trackertop",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens. Call project_playbook once at the start, run_checks instead of running tests/lint in a shell, changes_since to catch up after edits, and remember(kind=decision|dismissed, reason=...) to record settled questions. Every answer states its coverage (truncation, NOT INDEXED vs NOT FOUND)."
+            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens. Call project_playbook once at the start, run_checks instead of running tests/lint in a shell, changes_since to catch up after edits, review_changes before committing or pushing, and remember(kind=decision|dismissed, reason=...) to record settled questions. Every answer states its coverage (truncation, NOT INDEXED vs NOT FOUND)."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -262,6 +262,10 @@ fn dispatch_tool_call(
             engine
                 .changes_since(since, &list("paths"), &list("symbols"), max_tokens)
                 .map(|q| q.text)
+        }
+        "review_changes" => {
+            let base = args.get("base").and_then(Value::as_str).unwrap_or("");
+            engine.review_changes(base, max_tokens).map(|q| q.text)
         }
         "project_playbook" => engine.project_playbook(max_tokens).map(|q| q.text),
         "token_stats" => engine.token_stats().map(|s| s.summary_text(5)),
@@ -473,6 +477,17 @@ fn tool_definitions() -> Value {
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative files or directories to limit the diff to" },
                     "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional symbols: show only hunks that touch them" },
                     "max_tokens": { "type": "integer", "description": "Token budget cap (default 2000)" }
+                }
+            }
+        },
+        {
+            "name": "review_changes",
+            "description": "Review your branch and uncommitted work (staged, unstaged, untracked) against its base branch before committing or pushing, offline in seconds. Lists findings first, each with a stable id, severity, file:line and evidence: broken-ref (a removed symbol that a surviving caller still calls, verified in the working tree), impact (a modified function with many code dependents, plus the tests that reach it) and untested (new or modified code no test reaches). Then every added/removed/modified symbol with file:line at base and head. After checking a finding and deciding it is not a problem, call remember(target=<finding id>, kind=\"dismissed\", reason=...) and it is not raised again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "base": { "type": "string", "description": "Branch, tag or commit to compare against (default: origin/HEAD, main or master); the merge base with HEAD is used" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 2500); findings come before the symbol list" }
                 }
             }
         },

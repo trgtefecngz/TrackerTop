@@ -129,6 +129,7 @@ flowchart LR
 | `changes_since` | What changed since a git ref (default: uncommitted work), mapped onto symbols: touched, added and removed symbols plus only the changed lines |
 | `project_playbook` | Build/test/lint/format commands, what CI runs, toolchain versions, configs and agent instruction files, each marked detected or guessed |
 | `run_checks` | Runs the project's tests, lint, build or format check and returns only counts, failing test names and error lines with file:line; never hides a failure |
+| `review_changes` | Reviews your branch and uncommitted work against its base before you push: broken references, high-impact changes, untested code, each with a stable id and file:line evidence; dismissed findings stay dismissed |
 | `token_stats` | Cumulative tokens saved and estimated cost reduction |
 
 ## Supported languages
@@ -158,6 +159,7 @@ Every command works on the current directory, or on `--repo <path>`.
 | `trackertop stats [--reset]` | Token savings for this project |
 | `trackertop projects` | All tracked projects and total savings |
 | `trackertop report` | Write a Markdown summary to `.trackertop/GRAPH_REPORT.md` |
+| `trackertop review [--base <ref>] [--format md\|json]` | Review the branch and uncommitted work against its base: changed symbols and findings |
 | `trackertop languages` | List the registered language extractors |
 | `trackertop install <agent> [--global]` | Connect an agent (see above) |
 | `trackertop mcp` | Run the MCP server over stdio (agents start this for you) |

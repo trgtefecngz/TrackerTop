@@ -10,6 +10,7 @@ All notable changes to TrackerTop are documented here.
   - `broken-ref`: a removed symbol that a surviving caller still calls, verified against the working tree;
   - `impact`: a modified function with many code dependents, with the tests that reach it;
   - `untested`: new or modified code that no test reaches.
+- New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
 
 ### Fixed: call edges (all tools)
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.

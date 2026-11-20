@@ -1505,6 +1505,72 @@ impl TrackerEngine {
         )
     }
 
+    /// Local review of the branch and uncommitted work against `base` (default branch when
+    /// empty). Findings dismissed earlier with `remember(target=<id>, kind=dismissed)` are
+    /// not shown again; they are listed by id and reason so nothing disappears silently.
+    pub fn review_changes(&self, base: &str, max_tokens: usize) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let base_ref = if base.trim().is_empty() {
+            crate::review::default_base(&self.repo_root)?
+        } else {
+            base.trim().to_string()
+        };
+        let mut cs = crate::review::review(&self.repo_root, &base_ref)?;
+        let (db, cg) = self.load_fresh()?;
+        let notes = db.list_notes(None)?;
+        let mut dismissed: Vec<(String, String)> = Vec::new();
+        cs.findings.retain(|f| {
+            match notes
+                .iter()
+                .find(|n| n.kind == "dismissed" && n.target.trim().eq_ignore_ascii_case(&f.id))
+            {
+                Some(n) => {
+                    dismissed.push((f.id.clone(), n.reason.clone()));
+                    false
+                }
+                None => true,
+            }
+        });
+        let mut text = crate::review::render_markdown(&cs);
+        let mut extra = String::new();
+        if !dismissed.is_empty() {
+            extra.push_str(&format!(
+                "Dismissed earlier, not shown again ({}):\n",
+                dismissed.len()
+            ));
+            for (id, reason) in &dismissed {
+                extra.push_str(&format!("- `{id}`: {reason}\n"));
+            }
+        }
+        if !cs.findings.is_empty() {
+            extra.push_str(
+                "After checking a finding that is not a problem: \
+                 remember(target=\"<id>\", kind=\"dismissed\", reason=\"...\").\n",
+            );
+        }
+        // Keep this next to the findings, ahead of the long symbol list a budget cuts first
+        match text.find("\n## Changed symbols") {
+            Some(at) => text.insert_str(at, &format!("\n{extra}")),
+            None => text.push_str(&extra),
+        }
+        let baseline: usize = cs
+            .files
+            .iter()
+            .filter_map(|f| cg.files.get(&f.path))
+            .map(|f| f.token_count)
+            .sum();
+        self.finalize(
+            &db,
+            "review_changes",
+            &base_ref,
+            text,
+            if max_tokens == 0 { 2500 } else { max_tokens },
+            baseline,
+            cs.files.len(),
+            start,
+        )
+    }
+
     /// 17. Build/test/lint/format commands, CI steps, toolchain versions, conventions and
     ///     agent instruction files, each marked detected (declared by the project) or guessed.
     pub fn project_playbook(&self, max_tokens: usize) -> Result<QueryOutput> {
