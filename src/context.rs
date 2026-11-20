@@ -192,7 +192,9 @@ impl TrackerEngine {
         }
 
         out.push_str("\n## Module Clusters (Communities)\n");
-        for c in cg.communities().into_iter().take(10) {
+        let communities = cg.communities();
+        out.push_str(&more_note(communities.len(), 10, "communities"));
+        for c in communities.into_iter().take(10) {
             let hubs = if c.top_hubs.is_empty() {
                 "-".to_string()
             } else {
@@ -220,6 +222,7 @@ impl TrackerEngine {
             && !notes.is_empty()
         {
             out.push_str("\n## Saved Project Memory\n");
+            out.push_str(&more_note(notes.len(), 6, "project notes"));
             for n in notes.into_iter().take(6) {
                 out.push_str(&format!("- [{}] {}\n", n.target, n.content));
             }
@@ -262,7 +265,7 @@ impl TrackerEngine {
                 &db,
                 "file_outline",
                 path,
-                format!("File not found in index: `{path}`"),
+                self.path_miss(&cg, path),
                 max_tokens,
                 0,
                 0,
@@ -333,7 +336,7 @@ impl TrackerEngine {
                 &db,
                 "read_symbol",
                 symbol_query,
-                format!("Symbol not found: `{symbol_query}`. Try `find_symbol` first."),
+                Self::symbol_miss(&cg, symbol_query),
                 max_tokens,
                 0,
                 0,
@@ -361,6 +364,7 @@ impl TrackerEngine {
         if let Ok(notes) =
             db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path])
         {
+            out.push_str(&more_note(notes.len(), 4, "memory notes"));
             for n in notes.into_iter().take(4) {
                 out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
             }
@@ -378,6 +382,7 @@ impl TrackerEngine {
             let (callers, callees) = cg.neighborhood(&sym.id, 1);
             if !callees.is_empty() {
                 out.push_str("\n## Direct Callees / Types (Signatures Only)\n");
+                out.push_str(&more_note(callees.len(), 10, "callees"));
                 for (_, kind, dep) in callees.into_iter().take(10) {
                     touched_files.insert(dep.file_path.clone());
                     out.push_str(&format!(
@@ -392,6 +397,7 @@ impl TrackerEngine {
             }
             if !callers.is_empty() {
                 out.push_str("\n## Direct Callers\n");
+                out.push_str(&more_note(callers.len(), 10, "callers"));
                 for (_, kind, caller) in callers.into_iter().take(10) {
                     touched_files.insert(caller.file_path.clone());
                     out.push_str(&format!(
@@ -495,7 +501,7 @@ impl TrackerEngine {
                 &db,
                 "call_graph",
                 symbol_query,
-                format!("Symbol not found: `{symbol_query}`"),
+                Self::symbol_miss(&cg, symbol_query),
                 max_tokens,
                 0,
                 0,
@@ -517,6 +523,7 @@ impl TrackerEngine {
         out.push_str(&format!("Sig: `{}`\n", sym.signature));
 
         out.push_str(&format!("\n## Incoming / Callers ({})\n", callers.len()));
+        out.push_str(&more_note(callers.len(), 20, "callers"));
         for (d, kind, s) in callers.iter().take(20) {
             touched_files.insert(s.file_path.clone());
             out.push_str(&format!(
@@ -532,6 +539,7 @@ impl TrackerEngine {
             "\n## Outgoing / Callees & Types ({})\n",
             callees.len()
         ));
+        out.push_str(&more_note(callees.len(), 20, "callees"));
         for (d, kind, s) in callees.iter().take(20) {
             touched_files.insert(s.file_path.clone());
             out.push_str(&format!(
@@ -577,7 +585,7 @@ impl TrackerEngine {
                 &db,
                 "impact_analysis",
                 symbol_query,
-                format!("Symbol not found: `{symbol_query}`"),
+                Self::symbol_miss(&cg, symbol_query),
                 max_tokens,
                 0,
                 0,
@@ -611,6 +619,11 @@ impl TrackerEngine {
 
         if !report.direct_dependents.is_empty() {
             out.push_str("\n## Direct Dependents (1-hop)\n");
+            out.push_str(&more_note(
+                report.direct_dependents.len(),
+                15,
+                "direct dependents",
+            ));
             for s in report.direct_dependents.iter().take(15) {
                 out.push_str(&format!(
                     "- {} [{}] ({}:L{})\n",
@@ -624,6 +637,11 @@ impl TrackerEngine {
 
         if !report.transitive_dependents.is_empty() {
             out.push_str("\n## Transitive Dependents (2+ hops)\n");
+            out.push_str(&more_note(
+                report.transitive_dependents.len(),
+                15,
+                "transitive dependents",
+            ));
             for s in report.transitive_dependents.iter().take(15) {
                 out.push_str(&format!(
                     "- {} [{}] ({}:L{})\n",
@@ -812,7 +830,15 @@ impl TrackerEngine {
                 &db,
                 "shortest_path",
                 &format!("{from}->{to}"),
-                format!("Could not resolve both endpoints: `{from}` and `{to}`"),
+                [
+                    (from, cg.resolve_symbol(from).is_none()),
+                    (to, cg.resolve_symbol(to).is_none()),
+                ]
+                .into_iter()
+                .filter(|(_, missing)| *missing)
+                .map(|(q, _)| Self::symbol_miss(&cg, q))
+                .collect::<Vec<_>>()
+                .join("\n"),
                 max_tokens,
                 0,
                 0,
@@ -875,16 +901,19 @@ impl TrackerEngine {
 
     /// 9. Graph-aware text search: finds literal/case-insensitive matches across indexed files
     ///    and tags every matching line with its enclosing symbol (`fn`, `struct`, shader, etc.).
+    ///    The output always states its coverage: files searched, matches shown vs total,
+    ///    unreadable files, and that non-indexed files are not searched.
     pub fn smart_grep(
         &self,
         pattern: &str,
         file_filter: Option<&str>,
         max_tokens: usize,
     ) -> Result<QueryOutput> {
+        const PER_FILE: usize = 12;
+        const TOTAL: usize = 50;
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
-        let pat_lower = pattern.trim().to_ascii_lowercase();
-        if pat_lower.is_empty() {
+        if pattern.trim().is_empty() {
             return self.finalize(
                 &db,
                 "smart_grep",
@@ -897,32 +926,20 @@ impl TrackerEngine {
             );
         }
 
-        let filter_l = file_filter.map(|f| f.trim().to_ascii_lowercase());
-        let mut sorted_files: Vec<&String> = cg.files.keys().collect();
-        sorted_files.sort();
+        let indexed: Vec<&String> = cg.files.keys().collect();
+        let scan = grep_scan(&self.repo_root, &indexed, pattern, file_filter);
 
         let mut out = format!("# SMART GREP `{pattern}`\n");
-        let mut total_hits = 0usize;
-        let mut matched_files = Vec::new();
-
-        for rel_path in sorted_files {
-            if let Some(ref flt) = filter_l
-                && !flt.is_empty()
-                && !rel_path.to_ascii_lowercase().contains(flt)
-            {
-                continue;
+        let mut shown = 0usize;
+        let mut files_shown = 0usize;
+        for file in &scan.files {
+            if shown >= TOTAL {
+                break;
             }
-            let abs = self.repo_root.join(rel_path);
-            let Ok(content) = std::fs::read_to_string(&abs) else {
-                continue;
-            };
-            if !content.to_ascii_lowercase().contains(&pat_lower) {
-                continue;
-            }
-
+            files_shown += 1;
             let file_syms: Vec<&Symbol> = cg
                 .symbols_by_file
-                .get(rel_path)
+                .get(&file.path)
                 .map(|ids| {
                     ids.iter()
                         .filter_map(|id| cg.symbols.get(id))
@@ -930,51 +947,67 @@ impl TrackerEngine {
                         .collect()
                 })
                 .unwrap_or_default();
-
-            let mut file_hits = Vec::new();
-            for (idx, line) in content.lines().enumerate() {
-                if line.to_ascii_lowercase().contains(&pat_lower) {
-                    let line_no = idx + 1;
-                    // Find tightest enclosing symbol
-                    let owner = file_syms
-                        .iter()
-                        .filter(|s| s.start_line <= line_no && line_no <= s.end_line)
-                        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
-                        .map(|s| format!("{} [{}]", s.qualified_name, s.kind.as_str()))
-                        .unwrap_or_else(|| "top-level".to_string());
-                    file_hits.push((line_no, owner, line.trim().to_string()));
-                    if file_hits.len() >= 12 {
-                        break;
-                    }
-                }
+            out.push_str(&format!("\n## {}\n", file.path));
+            let take = PER_FILE.min(TOTAL - shown);
+            for (line_no, txt) in file.lines.iter().take(take) {
+                // Tightest enclosing symbol
+                let owner = file_syms
+                    .iter()
+                    .filter(|s| s.start_line <= *line_no && *line_no <= s.end_line)
+                    .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
+                    .map(|s| format!("{} [{}]", s.qualified_name, s.kind.as_str()))
+                    .unwrap_or_else(|| "top-level".to_string());
+                let txt = txt.trim();
+                let snippet = if txt.chars().count() > 110 {
+                    let s: String = txt.chars().take(107).collect();
+                    format!("{s}...")
+                } else {
+                    txt.to_string()
+                };
+                out.push_str(&format!("- L{line_no} ({owner}): `{snippet}`\n"));
+                shown += 1;
             }
-
-            if !file_hits.is_empty() {
-                matched_files.push(rel_path.clone());
-                out.push_str(&format!("\n## {rel_path}\n"));
-                for (ln, owner, txt) in file_hits {
-                    total_hits += 1;
-                    let snippet = if txt.chars().count() > 110 {
-                        let s: String = txt.chars().take(107).collect();
-                        format!("{s}...")
-                    } else {
-                        txt
-                    };
-                    out.push_str(&format!("- L{ln} ({owner}): `{snippet}`\n"));
-                }
-                if total_hits >= 50 {
-                    break;
-                }
-            }
+            out.push_str(&more_note(file.lines.len(), take, "matches in this file"));
         }
 
-        if total_hits == 0 {
-            out.push_str("No matches found.\n");
+        let total = scan.total_matches();
+        if total == 0 {
+            out.push_str("No matches found in the searched files.\n");
         }
+        out.push_str(&format!(
+            "\nCOVERAGE: case-insensitive substring over {} indexed files{}; {total} matching lines \
+             in {} files, {shown} shown{}.",
+            scan.files_searched,
+            if scan.filtered_out > 0 {
+                format!(" ({} more excluded by file_filter)", scan.filtered_out)
+            } else {
+                String::new()
+            },
+            scan.files.len(),
+            if files_shown < scan.files.len() {
+                format!(
+                    "; {} matching files not shown (narrow pattern or file_filter)",
+                    scan.files.len() - files_shown
+                )
+            } else {
+                String::new()
+            }
+        ));
+        if !scan.unreadable.is_empty() {
+            out.push_str(&format!(
+                " UNREADABLE (not searched): {}.",
+                scan.unreadable.join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            " Not searched: files outside the index (types other than {}, ignored files).\n",
+            indexed_extensions()
+        ));
 
+        let matched_files: Vec<&String> = scan.files.iter().map(|f| &f.path).collect();
         let baseline: usize = matched_files
             .iter()
-            .filter_map(|p| cg.files.get(p))
+            .filter_map(|p| cg.files.get(*p))
             .map(|f| f.token_count)
             .sum();
 
@@ -1004,9 +1037,15 @@ impl TrackerEngine {
         let mut out = format!("# BATCH READ ({} requested)\n", symbol_queries.len());
         let mut touched_files = HashSet::new();
 
+        if symbol_queries.len() > 10 {
+            out.push_str(&format!(
+                "NOT READ (max 10 per call, request them again): {}\n",
+                symbol_queries[10..].join(", ")
+            ));
+        }
         for q in symbol_queries.iter().take(10) {
             let Some(sym) = cg.resolve_symbol(q) else {
-                out.push_str(&format!("\n## `{q}` — NOT FOUND\n"));
+                out.push_str(&format!("\n## `{q}`\n{}\n", Self::symbol_miss(&cg, q)));
                 continue;
             };
             touched_files.insert(sym.file_path.clone());
@@ -1027,6 +1066,7 @@ impl TrackerEngine {
             if let Ok(notes) =
                 db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path])
             {
+                out.push_str(&more_note(notes.len(), 2, "memory notes"));
                 for n in notes.into_iter().take(2) {
                     out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
                 }
@@ -1039,6 +1079,7 @@ impl TrackerEngine {
 
             if include_deps {
                 let (_, callees) = cg.neighborhood(&sym.id, 1);
+                out.push_str(&more_note(callees.len(), 5, "callees"));
                 for (_, kind, dep) in callees.into_iter().take(5) {
                     touched_files.insert(dep.file_path.clone());
                     out.push_str(&format!(
@@ -1138,6 +1179,7 @@ impl TrackerEngine {
                 "\n## Impacted Dependent Files ({})\n",
                 dep_files.len()
             ));
+            out.push_str(&more_note(dep_files.len(), 20, "dependent files"));
             for f in dep_files.iter().take(20) {
                 out.push_str(&format!("- `{f}`\n"));
             }
@@ -1147,6 +1189,7 @@ impl TrackerEngine {
             let mut co: Vec<String> = cochange_suggestions.into_iter().collect();
             co.sort();
             out.push_str("\n## Git Co-Change Alert (Often Modified Together)\n");
+            out.push_str(&more_note(co.len(), 12, "co-change files"));
             for f in co.iter().take(12) {
                 out.push_str(&format!("- `{f}` (check if it needs a matching update)\n"));
             }
@@ -1194,12 +1237,18 @@ impl TrackerEngine {
 
         if !hr.bloated_files.is_empty() {
             out.push_str("\n## Token Bloat Warnings (Consider Splitting for Better AI Accuracy)\n");
+            out.push_str(&more_note(hr.bloated_files.len(), 15, "bloated files"));
             for (p, toks, lines) in hr.bloated_files.iter().take(15) {
                 out.push_str(&format!("- `{p}` — {toks} tok ({lines} lines)\n"));
             }
         }
         if !hr.circular_groups.is_empty() {
             out.push_str("\n## Circular Dependency Cycles\n");
+            out.push_str(&more_note(
+                hr.circular_groups.len(),
+                10,
+                "dependency cycles",
+            ));
             for cyc in hr.circular_groups.iter().take(10) {
                 out.push_str(&format!(
                     "- Cycle ({} files): {}\n",
@@ -1210,6 +1259,7 @@ impl TrackerEngine {
         }
         if !hr.orphan_files.is_empty() {
             out.push_str("\n## Potential Orphan / Unreferenced Code Files\n");
+            out.push_str(&more_note(hr.orphan_files.len(), 20, "orphan files"));
             for p in hr.orphan_files.iter().take(20) {
                 out.push_str(&format!("- `{p}`\n"));
             }
@@ -1266,4 +1316,139 @@ impl TrackerEngine {
         let db = Database::open_for_repo(&self.repo_root)?;
         db.get_token_stats(20)
     }
+}
+
+/// One line telling the agent that a list was cut, so a partial list never looks complete.
+fn more_note(total: usize, shown: usize, what: &str) -> String {
+    if total > shown {
+        format!(
+            "(showing {shown} of {total} {what}; {} more not shown)\n",
+            total - shown
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Indexed extensions, e.g. `.rs .ts .tsx …`, for "not indexed" explanations.
+fn indexed_extensions() -> String {
+    let mut exts: Vec<String> = default_registry()
+        .languages()
+        .into_iter()
+        .flat_map(|l| l.extensions)
+        .map(|e| format!(".{e}"))
+        .collect();
+    exts.sort();
+    exts.dedup();
+    exts.join(" ")
+}
+
+impl TrackerEngine {
+    /// Explains a path lookup miss, separating "not indexed" (the file exists but the index
+    /// cannot see it) from "not found" (no such file), so the agent knows whether to fall
+    /// back to a plain read.
+    fn path_miss(&self, cg: &CodeGraph, path: &str) -> String {
+        let norm = path.replace('\\', "/");
+        let abs = self.repo_root.join(norm.trim_start_matches("./"));
+        if abs.is_file() {
+            if default_registry().extractor_for_path(&abs).is_none() {
+                format!(
+                    "NOT INDEXED: `{path}` exists, but its file type is not indexed (indexed: {}). \
+                     Read the file directly.",
+                    indexed_extensions()
+                )
+            } else {
+                format!(
+                    "NOT INDEXED: `{path}` exists and its type is supported, but it is not in the \
+                     index (ignored by .gitignore/.trackertopignore, too large, or unreadable). \
+                     Read the file directly."
+                )
+            }
+        } else {
+            format!(
+                "NOT FOUND: no file `{path}` exists in the repository, and no indexed path ends \
+                 with or contains it ({} files indexed).",
+                cg.files.len()
+            )
+        }
+    }
+
+    /// Explains a symbol lookup miss with the index's coverage, so "no such symbol in the
+    /// index" is never read as "no such symbol in the repository".
+    fn symbol_miss(cg: &CodeGraph, query: &str) -> String {
+        format!(
+            "NOT FOUND IN INDEX: no symbol matches `{query}` ({} symbols in {} indexed files; \
+             indexed types: {}). Code in other file types, generated or ignored files is not \
+             indexed: use `find_symbol` for fuzzy matches or `smart_grep` before concluding it \
+             does not exist.",
+            cg.symbols.len(),
+            cg.files.len(),
+            indexed_extensions()
+        )
+    }
+}
+
+/// Matches of one file: `(1-based line, line text)`, in line order.
+#[derive(Debug)]
+pub struct GrepFile {
+    pub path: String,
+    pub lines: Vec<(usize, String)>,
+}
+
+/// Complete (uncapped) result of scanning indexed files; rendering caps it visibly.
+#[derive(Debug, Default)]
+pub struct GrepScan {
+    pub files: Vec<GrepFile>,
+    pub files_searched: usize,
+    pub filtered_out: usize,
+    pub unreadable: Vec<String>,
+}
+
+impl GrepScan {
+    pub fn total_matches(&self) -> usize {
+        self.files.iter().map(|f| f.lines.len()).sum()
+    }
+}
+
+/// Case-insensitive (Unicode lowercase) substring scan of `files` (repo-relative paths),
+/// sorted by path. Every matching line is returned; nothing is capped here.
+pub fn grep_scan(
+    repo_root: &Path,
+    files: &[&String],
+    pattern: &str,
+    file_filter: Option<&str>,
+) -> GrepScan {
+    let pat = pattern.trim().to_lowercase();
+    let filter = file_filter
+        .map(|f| f.trim().to_lowercase())
+        .filter(|f| !f.is_empty());
+    let mut sorted: Vec<&String> = files.to_vec();
+    sorted.sort();
+    let mut scan = GrepScan::default();
+    for rel in sorted {
+        if let Some(flt) = &filter
+            && !rel.to_lowercase().contains(flt.as_str())
+        {
+            scan.filtered_out += 1;
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(repo_root.join(rel)) else {
+            scan.unreadable.push(rel.clone());
+            continue;
+        };
+        scan.files_searched += 1;
+        let lines: Vec<(usize, String)> = content
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.to_lowercase().contains(&pat))
+            .map(|(i, l)| (i + 1, l.to_string()))
+            .collect();
+        if !lines.is_empty() {
+            scan.files.push(GrepFile {
+                path: rel.clone(),
+                lines,
+            });
+        }
+    }
+    scan
 }

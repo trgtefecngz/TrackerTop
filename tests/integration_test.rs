@@ -450,7 +450,7 @@ fn graph_cache_never_serves_stale_symbols() {
         !e.read_symbol(name, false, 0)
             .unwrap()
             .text
-            .contains("Symbol not found")
+            .contains("NOT FOUND IN INDEX")
     };
 
     assert!(found(&engine, "alpha_fn"));
@@ -676,7 +676,7 @@ fn same_second_same_size_edit_is_not_missed() {
             .read_symbol("omega_v2", false, 0)
             .unwrap()
             .text
-            .contains("Symbol not found")
+            .contains("NOT FOUND IN INDEX")
     );
 }
 
@@ -720,4 +720,163 @@ fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// Ground truth for smart_grep: an independent scan of every file on disk whose type the
+/// registry indexes, splitting on '\n' and dropping a trailing '\r' (no `str::lines`).
+fn naive_grep(root: &std::path::Path, pattern: &str) -> Vec<(String, usize)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                if !p.file_name().unwrap().to_string_lossy().starts_with('.') {
+                    walk(&p, out);
+                }
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    let pat = pattern.to_lowercase();
+    let registry = trackertop::parser::default_registry();
+    let mut hits = Vec::new();
+    for f in files {
+        if registry.extractor_for_path(&f).is_none() {
+            continue;
+        }
+        let rel = f
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&f).unwrap();
+        for (i, raw) in text.split('\n').enumerate() {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if line.to_lowercase().contains(&pat) {
+                hits.push((rel.clone(), i + 1));
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+#[test]
+fn smart_grep_matches_a_plain_scan_and_states_its_coverage() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src/ui")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "// Needle in a comment\r\npub fn find_needle() -> &'static str {\r\n    \"NEEDLE (in a string)\"\r\n}\r\nfn other() { let needle = needle_twice(needle); }\r\n",
+    )
+    .unwrap();
+    let many: String = (0..20)
+        .map(|i| format!("export const needle{i} = () => {i};\n"))
+        .collect();
+    std::fs::write(root.join("src/b.ts"), many).unwrap();
+    std::fs::write(
+        root.join("src/ui/c.tsx"),
+        "export function Banner() {\n  return <p>ÇÖĞÜŞ a.b (needle)</p>;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("NOTES.unindexed"),
+        "needle in docs, not indexed\n",
+    )
+    .unwrap();
+
+    index_repository(root, true).unwrap();
+    let db = trackertop::db::Database::open_for_repo(root).unwrap();
+    let graph = trackertop::graph::CodeGraph::load(&db).unwrap();
+    let indexed: Vec<&String> = graph.files.keys().collect();
+
+    for pattern in [
+        "needle",
+        "NEEDLE",
+        "çöğüş",
+        "a.b",
+        "(",
+        "static str",
+        "zzz-absent",
+    ] {
+        let scan = trackertop::context::grep_scan(root, &indexed, pattern, None);
+        let mut got: Vec<(String, usize)> = scan
+            .files
+            .iter()
+            .flat_map(|f| f.lines.iter().map(move |(n, _)| (f.path.clone(), *n)))
+            .collect();
+        got.sort();
+        assert_eq!(got, naive_grep(root, pattern), "pattern {pattern:?}");
+        assert!(scan.unreadable.is_empty());
+        assert_eq!(scan.files_searched, 3, "pattern {pattern:?}");
+    }
+
+    // Rendered output: caps are announced and totals match the ground truth.
+    let engine = TrackerEngine::new(root);
+    let out = engine.smart_grep("needle", None, 20_000).unwrap().text;
+    let truth = naive_grep(root, "needle").len();
+    assert!(
+        out.contains(&format!("{truth} matching lines in 3 files")),
+        "{out}"
+    );
+    assert!(
+        out.contains("(showing 12 of 20 matches in this file; 8 more not shown)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Not searched: files outside the index"),
+        "{out}"
+    );
+    let absent = engine.smart_grep("zzz-absent", None, 2_000).unwrap().text;
+    assert!(absent.contains("No matches found in the searched files."));
+    assert!(absent.contains("0 matching lines in 0 files"), "{absent}");
+    let filtered = engine
+        .smart_grep("needle", Some("src/ui"), 2_000)
+        .unwrap()
+        .text;
+    assert!(
+        filtered.contains("(2 more excluded by file_filter)"),
+        "{filtered}"
+    );
+}
+
+#[test]
+fn lookups_distinguish_not_indexed_from_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+    std::fs::write(root.join("data.unindexed"), "# readme\n").unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let readme = engine.file_outline("data.unindexed", 800).unwrap().text;
+    assert!(
+        readme.contains("NOT INDEXED: `data.unindexed` exists"),
+        "{readme}"
+    );
+    let missing = engine.file_outline("src/nope.rs", 800).unwrap().text;
+    assert!(
+        missing.contains("NOT FOUND: no file `src/nope.rs`"),
+        "{missing}"
+    );
+    let sym = engine.read_symbol("absent_fn", true, 800).unwrap().text;
+    assert!(sym.contains("NOT FOUND IN INDEX"), "{sym}");
+    assert!(sym.contains("1 indexed files"), "{sym}");
+    let batch = engine
+        .read_symbols_batch(
+            &["present".to_string(), "absent_fn".to_string()],
+            false,
+            2_000,
+        )
+        .unwrap()
+        .text;
+    assert!(batch.contains("pub fn present"), "{batch}");
+    assert!(
+        batch.contains("NOT FOUND IN INDEX: no symbol matches `absent_fn`"),
+        "{batch}"
+    );
 }
