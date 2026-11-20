@@ -2,6 +2,13 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [Unreleased]
+
+### Changed: the desktop status bar shows live state
+- **Left: the selected project's index state.** "Indexed 2 min ago · 53 files · 1,113 symbols", with the age computed from the time the last index run finished (recorded in the index DB by every run, from the app or the MCP server; an index written before this shows the counts only). While the app indexes: a progress line ("Indexing… 120/400 files", then "linking symbols"). A failed run shows a short error in the error colour, full text on hover. Results of user actions (note saved, install, reset) replace it for 6 seconds.
+- **Right: the AI agent's latest TrackerTop call** from the work journal (agent telemetry for older indexes): agent, tool, target and age, e.g. "claude-code · read_symbol `review::rules` · 12 s ago". Failed calls show the tool in the error colour. Clicking it opens the AI Memory tab with the work-journal timeline. Empty when no agent has called TrackerTop for this project.
+- Removed the fixed "Ready — 100% offline local engine" text and the list of supported languages (the project's own languages are in the Architecture tab).
+
 ## [0.8.1] - 2026-11-21
 
 ### Added: cross-session continuity

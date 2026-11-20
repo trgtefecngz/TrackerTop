@@ -115,12 +115,12 @@ impl TrackerTopApp {
                 Ok(db) => {
                     // Only clear the input once the note is really stored
                     self.note_content_input.clear();
-                    self.status_banner = format!("Saved memory note for `{target}`");
+                    self.notify(format!("Saved memory note for `{target}`"));
                     if let Some(ref mut lp_mut) = self.loaded {
                         lp_mut.notes = db.list_notes(None).unwrap_or_default();
                     }
                 }
-                Err(e) => self.status_banner = format!("Could not save note: {e:#}"),
+                Err(e) => self.notify_error(format!("Could not save note: {e:#}")),
             }
         }
         if let Some((rp, id)) = del_note_req

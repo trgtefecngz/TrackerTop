@@ -147,9 +147,20 @@ impl TrackerTopApp {
                 "12-memory"
             }
             13 => {
+                // Opt-in: re-indexes the project, so the bar shows a run in progress.
+                let Selection::Project(p) = self.selection.clone() else {
+                    return None;
+                };
+                if std::env::var_os("TRACKERTOP_UI_TOUR_REINDEX").is_none() {
+                    return self.tour_apply(14);
+                }
+                self.start_bg_index(PathBuf::from(p), true, false);
+                "13-status-indexing"
+            }
+            14 => {
                 self.selection = Selection::AllProjects;
                 self.loaded = None;
-                "13-global"
+                "14-global"
             }
             _ => return None,
         };
@@ -192,7 +203,7 @@ impl TrackerTopApp {
                 }
             }
             tour.frames += 1;
-            let settle = if tour.name.contains("transition") {
+            let settle = if tour.name.contains("transition") || tour.name.contains("indexing") {
                 4
             } else {
                 SETTLE_FRAMES

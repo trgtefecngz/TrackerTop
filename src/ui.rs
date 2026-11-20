@@ -7,6 +7,7 @@ mod journal_view;
 mod memory_tab;
 mod projects;
 mod savings;
+mod status_bar;
 mod theme;
 #[cfg(debug_assertions)]
 mod tour;
@@ -19,7 +20,7 @@ use crate::activity::{AgentActivity, QueryResolver, build_activity};
 use crate::context::TrackerEngine;
 use crate::db::{Database, note_target_matches};
 use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
-use crate::indexer::index_repository;
+use crate::indexer::{IndexProgress, index_repository_with_progress};
 use crate::install::{AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed};
 use crate::model::{EdgeKind, ProjectNote, SymbolKind, TokenStatsSummary};
 use crate::nested::{NestedGraph, NestedKind, NestedLevel, NestedView};
@@ -104,7 +105,10 @@ struct LoadedProject {
 }
 
 struct BgMessage {
-    status: String,
+    /// The indexed project, as the registry stores it.
+    path: String,
+    /// The error text when the run failed.
+    error: Option<String>,
     select_path: Option<String>,
 }
 
@@ -115,7 +119,15 @@ pub struct TrackerTopApp {
     loaded: Option<LoadedProject>,
     connected_agents: Vec<(AiAgentKind, bool)>,
     show_agents_modal: bool,
-    status_banner: String,
+    /// A user action's result, shown in the status bar for a few seconds.
+    notice: Option<status_bar::Notice>,
+    /// Status bar data for the selected project, re-read with the regular refresh.
+    status: status_bar::StatusInfo,
+    /// The running index job: its live progress and the project it indexes.
+    index_progress: Option<std::sync::Arc<IndexProgress>>,
+    indexing_path: Option<String>,
+    /// The last index failure: (project path, error), cleared by a successful run.
+    index_error: Option<(String, String)>,
     last_refresh: Instant,
     bg_rx: Option<Receiver<BgMessage>>,
     bg_busy: bool,
@@ -180,7 +192,11 @@ impl TrackerTopApp {
             loaded: None,
             connected_agents: poll_agent_statuses(),
             show_agents_modal: false,
-            status_banner: "Ready — 100% offline local engine".to_string(),
+            notice: None,
+            status: status_bar::StatusInfo::default(),
+            index_progress: None,
+            indexing_path: None,
+            index_error: None,
             last_refresh: Instant::now(),
             bg_rx: None,
             bg_busy: false,
@@ -209,6 +225,7 @@ impl TrackerTopApp {
     }
 
     fn reload_selected_project(&mut self) {
+        self.refresh_status();
         let Selection::Project(ref path) = self.selection else {
             self.loaded = None;
             return;
@@ -249,26 +266,20 @@ impl TrackerTopApp {
         let (tx, rx) = mpsc::channel();
         self.bg_rx = Some(rx);
         self.bg_busy = true;
-        self.status_banner = format!("Indexing {}...", repo_path.display());
+        // Same key the registry stores, by construction
+        let key = crate::registry::canonical_path_string(&repo_path);
+        let progress = std::sync::Arc::new(IndexProgress::default());
+        self.index_progress = Some(progress.clone());
+        self.indexing_path = Some(key.clone());
+        self.notice = None;
 
         std::thread::spawn(move || {
-            let msg = match index_repository(&repo_path, force) {
-                Ok(stats) => BgMessage {
-                    status: format!(
-                        "Indexed {} files ({} symbols, {} edges) in {} ms",
-                        stats.total_files, stats.total_symbols, stats.total_edges, stats.elapsed_ms
-                    ),
-                    select_path: if select_after {
-                        // Same key the registry stores, by construction
-                        Some(crate::registry::canonical_path_string(&repo_path))
-                    } else {
-                        None
-                    },
-                },
-                Err(e) => BgMessage {
-                    status: format!("Index error: {e}"),
-                    select_path: None,
-                },
+            let result = index_repository_with_progress(&repo_path, force, &progress);
+            let ok = result.is_ok();
+            let msg = BgMessage {
+                error: result.err().map(|e| format!("{e:#}")),
+                select_path: (ok && select_after).then(|| key.clone()),
+                path: key,
             };
             let _ = tx.send(msg);
         });
@@ -284,18 +295,16 @@ impl TrackerTopApp {
                 } else {
                     0.0
                 };
-                self.status_banner = format!(
+                self.notify(format!(
                     "Dry-run preview (not counted in stats): {} tok vs {} baseline -> {:.1}% reduction in {} ms",
                     fmt_num(out.tokens_sent),
                     fmt_num(out.baseline_tokens),
                     pct,
                     out.latency_ms
-                );
+                ));
                 self.preview_result = Some(out);
             }
-            Err(e) => {
-                self.status_banner = format!("Preview error: {e}");
-            }
+            Err(e) => self.notify_error(format!("Preview error: {e}")),
         }
     }
 
@@ -304,14 +313,13 @@ impl TrackerTopApp {
             .and_then(|db| db.clear_telemetry().map(|()| db));
         match result {
             Ok(db) => {
-                self.status_banner =
-                    "Reset token-savings telemetry to 0 for this project.".to_string();
+                self.notify("Reset token-savings telemetry to 0 for this project.");
                 self.reload_overview();
                 if let Some(ref mut lp) = self.loaded {
                     lp.stats = db.get_token_stats(30).unwrap_or_default();
                 }
             }
-            Err(e) => self.status_banner = format!("Could not reset stats: {e:#}"),
+            Err(e) => self.notify_error(format!("Could not reset stats: {e:#}")),
         }
     }
 
@@ -323,7 +331,20 @@ impl TrackerTopApp {
             Ok(msg) => {
                 self.bg_busy = false;
                 self.bg_rx = None;
-                self.status_banner = msg.status;
+                self.index_progress = None;
+                self.indexing_path = None;
+                match msg.error {
+                    Some(e) => self.index_error = Some((msg.path, e)),
+                    None => {
+                        if self
+                            .index_error
+                            .as_ref()
+                            .is_some_and(|(p, _)| p.eq_ignore_ascii_case(&msg.path))
+                        {
+                            self.index_error = None;
+                        }
+                    }
+                }
                 if let Some(p) = msg.select_path {
                     self.selection = Selection::Project(p);
                 }
@@ -336,8 +357,13 @@ impl TrackerTopApp {
                 // leaving Re-Index / Add Project disabled forever.
                 self.bg_busy = false;
                 self.bg_rx = None;
-                self.status_banner =
-                    "Indexing stopped unexpectedly. Please try Re-Index again.".to_string();
+                self.index_progress = None;
+                if let Some(p) = self.indexing_path.take() {
+                    self.index_error = Some((
+                        p,
+                        "Indexing stopped unexpectedly. Please try Re-index again.".to_string(),
+                    ));
+                }
                 self.reload_overview();
             }
         }
@@ -365,6 +391,7 @@ impl eframe::App for TrackerTopApp {
         if self.last_refresh.elapsed() >= Duration::from_secs(2) && !self.bg_busy {
             self.last_refresh = Instant::now();
             self.reload_overview();
+            self.refresh_status();
             if let Selection::Project(ref p) = self.selection {
                 if let Some(ref mut lp) = self.loaded {
                     if let Ok(db) =
@@ -554,12 +581,13 @@ impl eframe::App for TrackerTopApp {
                 self.selection = Selection::AllProjects;
                 self.loaded = None;
             }
-            self.status_banner = if wipe {
-                "Removed project and deleted its local .trackertop index.".to_string()
+            self.notify(if wipe {
+                "Removed project and deleted its local .trackertop index."
             } else {
-                "Removed project from sidebar (local .trackertop cache kept; re-appears if Claude Code opens it).".to_string()
-            };
+                "Removed project from sidebar (local .trackertop cache kept; re-appears if Claude Code opens it)."
+            });
             self.reload_overview();
+            self.refresh_status();
         }
         if let Some(sel) = to_select {
             self.selection = Selection::Project(sel);
@@ -625,34 +653,8 @@ impl eframe::App for TrackerTopApp {
                 });
             });
 
-        // Status bar.
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(T::PANEL)
-                    .inner_margin(Margin::symmetric(16, 5))
-                    .stroke(Stroke::new(1.0_f32, T::BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if self.bg_busy {
-                        ui.spinner();
-                    }
-                    ui.label(
-                        RichText::new(&self.status_banner)
-                            .size(11.0)
-                            .color(T::TEXT_3),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let langs: Vec<String> = default_registry()
-                            .languages()
-                            .into_iter()
-                            .map(|l| l.display_name)
-                            .collect();
-                        ui.label(RichText::new(langs.join(" · ")).size(11.0).color(T::TEXT_3));
-                    });
-                });
-            });
+        // Status bar: index state and the agent's latest call (`ui/status_bar.rs`).
+        self.render_status_bar(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(T::BG).inner_margin(Margin::ZERO))

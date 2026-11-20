@@ -217,6 +217,34 @@ impl Database {
         read_meta(&self.conn, "extractor_revision")
     }
 
+    /// When the last index run finished (Unix seconds, UTC), whether or not it found
+    /// changes: the index matched the files on disk at that moment. `None` for an index
+    /// written before this was recorded.
+    pub fn indexed_at(&self) -> Result<Option<i64>> {
+        let v = read_meta(&self.conn, "indexed_at")?;
+        Ok((v > 0).then_some(v))
+    }
+
+    pub fn set_indexed_at(&self, unix_secs: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES('indexed_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [unix_secs],
+        )?;
+        Ok(())
+    }
+
+    /// The newest MCP tool call: from the work journal, or for an index older than the
+    /// journal, from the agent telemetry. `None` when no agent has called TrackerTop here.
+    pub fn latest_agent_call(&self) -> Result<Option<JournalEntry>> {
+        let (rows, _) = self.recent_journal(1)?;
+        if let Some(e) = rows.into_iter().next() {
+            return Ok(Some(e));
+        }
+        let (rows, _) = self.telemetry_as_journal("", 1)?;
+        Ok(rows.into_iter().next())
+    }
+
     pub fn set_extractor_revision(&self, revision: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('extractor_revision', ?1)
