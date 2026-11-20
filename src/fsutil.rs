@@ -13,16 +13,25 @@ use std::time::{Duration, Instant};
 /// contents. On Unix the parent directory is fsynced too, so the rename itself is durable
 /// (on Windows/NTFS the rename is a journaled metadata operation). A failed write never leaves
 /// the temp file lying around.
+///
+/// Replacing an existing file keeps its Unix permission bits (a `chmod 600` config stays
+/// private; the temp copy is owner-only until then). A new file gets the usual umask default,
+/// like `std::fs::write`.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let (tmp, mut file) = create_temp_sibling(path, "tmp", false)
+    let replacing = path.is_file();
+    let (tmp, mut file) = create_temp_sibling(path, "tmp", replacing)
         .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
     let written = (|| -> std::io::Result<()> {
         file.write_all(contents)?;
-        file.sync_all()
+        file.sync_all()?;
+        if replacing {
+            copy_unix_permissions(path, &tmp)?;
+        }
+        Ok(())
     })();
     drop(file);
     if let Err(e) = written {
@@ -393,6 +402,22 @@ mod tests {
         let bak = backup_file(&p).unwrap().unwrap();
         let mode = std::fs::metadata(bak).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_permissions_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&p, br#"{"hooks":{}}"#).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a private config must stay private after a rewrite"
+        );
     }
 
     /// Racers mixing both publish strategies (hard link and the rename fallback, e.g. a

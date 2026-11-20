@@ -123,8 +123,14 @@ fn migrate_legacy_keys(reg: &mut RegistryFile) {
             .iter_mut()
             .find(|k| same_project_path(&k.path, &p.path))
         {
-            Some(k) if p.last_seen > k.last_seen => *k = p,
-            Some(_) => {}
+            Some(k) => {
+                // Keep the most recent entry, but never lose when the project was first added
+                let first_added = std::cmp::min(k.added_at.clone(), p.added_at.clone());
+                if p.last_seen > k.last_seen {
+                    *k = p;
+                }
+                k.added_at = first_added;
+            }
             None => kept.push(p),
         }
     }
@@ -424,13 +430,15 @@ mod tests {
     #[test]
     fn legacy_unc_keys_are_migrated_and_deduplicated() {
         let text = r#"{"projects":[
-            {"path":"UNC\\srv\\share\\app","name":"app","added_at":"a","last_seen":"2026-11-01T00:00:00+00:00"},
-            {"path":"\\\\srv\\share\\app","name":"app","added_at":"a","last_seen":"2026-11-02T00:00:00+00:00"},
-            {"path":"C:\\work\\other","name":"other","added_at":"a","last_seen":"2026-11-01T00:00:00+00:00"}
+            {"path":"UNC\\srv\\share\\app","name":"app","added_at":"2026-09-01T00:00:00+00:00","last_seen":"2026-11-01T00:00:00+00:00"},
+            {"path":"\\\\srv\\share\\app","name":"app","added_at":"2026-11-02T00:00:00+00:00","last_seen":"2026-11-02T00:00:00+00:00"},
+            {"path":"C:\\work\\other","name":"other","added_at":"2026-10-01T00:00:00+00:00","last_seen":"2026-11-01T00:00:00+00:00"}
         ]}"#;
         let reg = parse_registry(text).unwrap();
         let paths: Vec<&str> = reg.projects.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(paths, vec![r"\\srv\share\app", r"C:\work\other"]);
+        // Newest activity wins, but the original "added" date survives the merge
         assert_eq!(reg.projects[0].last_seen, "2026-11-02T00:00:00+00:00");
+        assert_eq!(reg.projects[0].added_at, "2026-09-01T00:00:00+00:00");
     }
 }

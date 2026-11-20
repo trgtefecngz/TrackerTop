@@ -138,7 +138,13 @@ function Start-Pipeline {
     // Once every file's mtime is safely in the past, the mtime+size fast path must skip ALL
     // of them again (no re-hashing of unchanged files on every run).
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-    for entry in walk_files(root) {
+    let files = walk_files(root);
+    assert_eq!(
+        files.len(),
+        6,
+        "fixture must contain exactly the 6 indexed files"
+    );
+    for entry in files {
         std::fs::File::options()
             .write(true)
             .open(&entry)

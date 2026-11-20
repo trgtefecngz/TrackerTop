@@ -261,7 +261,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                     name: test_name.clone(),
                     qualified_name: test_name.clone(),
                     kind: SymbolKind::Test,
-                    signature: compact_signature(trimmed.split('{').next().unwrap_or(trimmed), 120),
+                    signature: compact_signature(before_code_brace(trimmed), 120),
                     start_line: line_no,
                     end_line: end_idx + 1,
                     token_count: count_tokens(&block),
@@ -404,21 +404,31 @@ fn ts_code_line(line: &str, carry: &mut ScanCarry) -> String {
                     break;
                 }
             },
-            b'"' | b'\'' | b'`' => {
-                out.push(b);
-                match find_unescaped(bytes, i + 1, b) {
-                    Some(close) => {
-                        out.push(b);
-                        i = close;
-                    }
-                    None => {
-                        if b == b'`' {
-                            *carry = ScanCarry::Template;
-                        }
-                        break;
-                    }
+            b'/' if regex_can_start(&out) => match find_regex_end(bytes, i + 1) {
+                // Regex literal: its contents (`/\)/`, `/[{(]/`) are not code
+                Some(close) => {
+                    out.extend_from_slice(b"//");
+                    i = close;
                 }
-            }
+                // No closing slash on this line: it was a division after all
+                None => out.push(b),
+            },
+            b'"' | b'\'' | b'`' => match find_unescaped(bytes, i + 1, b) {
+                Some(close) => {
+                    out.push(b);
+                    out.push(b);
+                    i = close;
+                }
+                None if b == b'`' => {
+                    // Template literal continues on the next line
+                    out.push(b);
+                    *carry = ScanCarry::Template;
+                    break;
+                }
+                // '…' and "…" cannot span lines in JS/TS, so an unmatched one is plain text
+                // (e.g. the apostrophe in JSX text `<p>Don't {x}</p>`): keep scanning.
+                None => {}
+            },
             _ => out.push(b),
         }
         i += 1;
@@ -426,6 +436,66 @@ fn ts_code_line(line: &str, carry: &mut ScanCarry) -> String {
     // Only ASCII bytes are dropped (whole multi-byte sequences are either copied or skipped),
     // so this is valid UTF-8.
     String::from_utf8(out).unwrap_or_default()
+}
+
+/// The part of `line` before its first `{` that is code, not inside a '…', "…" or `…`
+/// string (so `it("parses {x}", () => {` keeps the full test name in its signature).
+fn before_code_brace(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => return &line[..i],
+            q @ (b'"' | b'\'' | b'`') => match find_unescaped(bytes, i + 1, q) {
+                Some(close) => i = close,
+                None => return line,
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Whether a `/` at this point starts a regex literal rather than a division, judged by the
+/// previous significant code character (the usual lexer rule): after an operator, an opening
+/// bracket, a separator, or a keyword like `return`, an operand is expected, so `/` opens a
+/// regex; after an identifier, number or `)` / `]`, it divides.
+fn regex_can_start(code_so_far: &[u8]) -> bool {
+    let trimmed = code_so_far.trim_ascii_end();
+    let Some(&last) = trimmed.last() else {
+        return true;
+    };
+    if b"(,=:[!&|?{};+-*%<>~^".contains(&last) {
+        return true;
+    }
+    // Keywords after which an expression follows
+    let word_start = trimmed
+        .iter()
+        .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$'))
+        .map_or(0, |p| p + 1);
+    matches!(
+        &trimmed[word_start..],
+        b"return" | b"typeof" | b"case" | b"in" | b"of" | b"delete" | b"void" | b"yield" | b"await"
+    )
+}
+
+/// End (index of the closing `/`) of a regex literal whose body starts at `from`, honoring
+/// escapes and `[...]` character classes (where `/` does not close the regex).
+fn find_regex_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    let mut in_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Position of the next `quote` at or after `from` that is not escaped with a backslash.
@@ -844,5 +914,45 @@ mod tests {
                    function helperAfter() {\n  return 1;\n}\n";
         let out = parse(src);
         assert!(out.symbols.iter().any(|s| s.name == "helperAfter"));
+    }
+
+    #[test]
+    fn regex_literal_in_test_body_does_not_end_the_test_early() {
+        // `/\)+/` and `/[(]/` contain an unbalanced `)` / `(` that are regex, not code
+        let src = r#"it("matches", () => {
+  expect(/\)+/.test(s)).toBe(true);
+  check([/[(]/]);
+});
+function helperAfter() {
+  return 1;
+}
+"#;
+        assert_eq!(test_span(src), (1, 4, true));
+    }
+
+    #[test]
+    fn division_is_not_mistaken_for_a_regex() {
+        assert_eq!(
+            ts_code_only("const r = (a) / b / (c);"),
+            "const r = (a) / b / (c);"
+        );
+        assert_eq!(ts_code_only("x = /[)}]/g; y()"), "x = //g; y()");
+        assert_eq!(ts_code_only(r"return /\)/.test(s)"), "return //.test(s)");
+    }
+
+    #[test]
+    fn jsx_apostrophe_does_not_hide_the_rest_of_the_line() {
+        assert_eq!(ts_code_only("<p>Don't {name}</p>"), "<p>Dont {name}</p>");
+    }
+
+    #[test]
+    fn test_signature_keeps_braces_inside_the_name() {
+        let out = parse("it(\"parses {x}\", () => {\n  run();\n});\n");
+        let t = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        assert!(t.signature.contains("parses {x}"), "{}", t.signature);
     }
 }
