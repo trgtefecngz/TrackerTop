@@ -125,8 +125,12 @@ fn migrate_legacy_keys(reg: &mut RegistryFile) {
         {
             Some(k) => {
                 // Keep the most recent entry, but never lose when the project was first added
-                let first_added = std::cmp::min(k.added_at.clone(), p.added_at.clone());
-                if p.last_seen > k.last_seen {
+                let first_added = if is_earlier(&p.added_at, &k.added_at) {
+                    p.added_at.clone()
+                } else {
+                    k.added_at.clone()
+                };
+                if is_earlier(&k.last_seen, &p.last_seen) {
                     *k = p;
                 }
                 k.added_at = first_added;
@@ -135,6 +139,18 @@ fn migrate_legacy_keys(reg: &mut RegistryFile) {
         }
     }
     reg.projects = kept;
+}
+
+/// Compares two RFC 3339 timestamps by the instant they denote, not their text
+/// (`01:00+01:00` is earlier than `00:30+00:00`). Unparseable values fall back to text order.
+fn is_earlier(a: &str, b: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(a),
+        DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(x), Ok(y)) => x < y,
+        _ => a < b,
+    }
 }
 
 /// Reads the registry. Missing/empty file -> empty registry; I/O error or corruption -> `Err`.
@@ -440,5 +456,18 @@ mod tests {
         // Newest activity wins, but the original "added" date survives the merge
         assert_eq!(reg.projects[0].last_seen, "2026-11-02T00:00:00+00:00");
         assert_eq!(reg.projects[0].added_at, "2026-09-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn timestamps_compare_by_instant_not_text() {
+        // Textually larger, but 30 minutes EARLIER in real time
+        assert!(is_earlier(
+            "2026-11-02T01:00:00+01:00",
+            "2026-11-02T00:30:00+00:00"
+        ));
+        assert!(!is_earlier(
+            "2026-11-02T00:30:00+00:00",
+            "2026-11-02T01:00:00+01:00"
+        ));
     }
 }

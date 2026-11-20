@@ -17,7 +17,23 @@ use std::time::{Duration, Instant};
 /// Replacing an existing file keeps its Unix permission bits (a `chmod 600` config stays
 /// private; the temp copy is owner-only until then). A new file gets the usual umask default,
 /// like `std::fs::write`.
+///
+/// If `path` is a symlink (e.g. a config managed from a dotfiles repo), the file it points to
+/// is rewritten and the link is left in place; renaming over the link itself would silently
+/// turn it into a regular file and leave the real config unchanged.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let resolved;
+    let path = if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        resolved = std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "{} is a symlink whose target cannot be resolved; nothing was written",
+                path.display()
+            )
+        })?;
+        resolved.as_path()
+    } else {
+        path
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -402,6 +418,27 @@ mod tests {
         let bak = backup_file(&p).unwrap().unwrap();
         let mode = std::fs::metadata(bak).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-settings.json");
+        let link = dir.path().join("settings.json");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        atomic_write(&link, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
     }
 
     #[cfg(unix)]
