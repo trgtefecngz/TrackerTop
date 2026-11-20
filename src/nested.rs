@@ -77,6 +77,12 @@ pub struct NestedView {
     pub truncated: usize,
 }
 
+enum Scope<'p> {
+    Project,
+    Community(usize),
+    File(&'p String),
+}
+
 struct Community {
     id: String,
     label: String,
@@ -163,16 +169,28 @@ impl<'a> NestedGraph<'a> {
         self.files.get(path).map(|f| f.token_count).unwrap_or(0)
     }
 
+    /// Maps an edge endpoint (symbol) to the id of the child it belongs to in `scope`, or
+    /// `None` when the symbol is outside the scope. In a file scope every symbol of the file
+    /// is inside; file-scope entries map to an id with no node, so their internal edges are
+    /// counted as hidden instead of vanishing.
+    fn scope_key(&self, scope: &Scope<'_>, s: &Symbol) -> Option<String> {
+        match scope {
+            Scope::Project => self
+                .community_of_file
+                .get(&s.file_path)
+                .map(|&i| self.communities[i].id.clone()),
+            Scope::Community(ci) => (self.community_of_file.get(&s.file_path) == Some(ci))
+                .then(|| format!("f:{}", s.file_path)),
+            Scope::File(path) => (s.file_path == **path).then(|| format!("s:{}", s.id)),
+        }
+    }
+
     /// Returns the children of `level` with aggregated edges. Unknown ids are an error, never
     /// an empty view.
     pub fn view(&self, level: &NestedLevel) -> Result<NestedView> {
         let mut breadcrumbs = vec![("Project".to_string(), NestedLevel::Project)];
         let mut children: Vec<NestedNode> = Vec::new();
-        // Maps an edge endpoint (symbol) to the id of the child it belongs to, or None when
-        // the symbol is outside the current scope.
-        let in_scope: Box<dyn Fn(&Symbol) -> Option<String> + '_>;
-
-        match level {
+        let scope = match level {
             NestedLevel::Project => {
                 for c in &self.communities {
                     children.push(NestedNode {
@@ -186,11 +204,7 @@ impl<'a> NestedGraph<'a> {
                         drill: Some(NestedLevel::Community(c.id.clone())),
                     });
                 }
-                in_scope = Box::new(move |s: &Symbol| {
-                    self.community_of_file
-                        .get(&s.file_path)
-                        .map(|&i| self.communities[i].id.clone())
-                });
+                Scope::Project
             }
             NestedLevel::Community(cid) => {
                 let Some(ci) = self.community_index(cid) else {
@@ -220,10 +234,7 @@ impl<'a> NestedGraph<'a> {
                         drill: Some(NestedLevel::File(f.clone())),
                     });
                 }
-                in_scope = Box::new(move |s: &Symbol| {
-                    (self.community_of_file.get(&s.file_path) == Some(&ci))
-                        .then(|| format!("f:{}", s.file_path))
-                });
+                Scope::Community(ci)
             }
             NestedLevel::File(path) => {
                 if !self.files.contains_key(path) {
@@ -252,14 +263,9 @@ impl<'a> NestedGraph<'a> {
                         drill: None,
                     });
                 }
-                let path = path.clone();
-                // Every symbol of the file is in scope; file-scope entries map to an id with
-                // no node, so their internal edges are counted as hidden instead of vanishing.
-                in_scope = Box::new(move |s: &Symbol| {
-                    (s.file_path == path).then(|| format!("s:{}", s.id))
-                });
+                Scope::File(path)
             }
-        }
+        };
 
         // Cap the node count, keeping the heaviest children (tokens, then id).
         let mut truncated = 0;
@@ -299,7 +305,7 @@ impl<'a> NestedGraph<'a> {
             ) else {
                 continue;
             };
-            match (in_scope(s), in_scope(t)) {
+            match (self.scope_key(&scope, s), self.scope_key(&scope, t)) {
                 (None, None) => {}
                 (Some(_), None) | (None, Some(_)) => external_edges += 1,
                 (Some(a), Some(b)) => match (index.get(a.as_str()), index.get(b.as_str())) {
