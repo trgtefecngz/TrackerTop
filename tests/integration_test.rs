@@ -956,3 +956,101 @@ fn run_checks_says_when_no_command_is_detected() {
     let out = engine.run_checks("test", None, 60, 1_000).unwrap().text;
     assert!(out.contains("test: NOT DETECTED"), "{out}");
 }
+
+fn git_in(root: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn changes_since_maps_working_tree_diffs_to_symbols() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n\npub fn gamma() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/keep.rs"), "pub fn keep() {}\n").unwrap();
+    git_in(root, &["init", "-q"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "init"]);
+
+    // beta edited, gamma deleted, delta added; one untracked file
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    20 + 2\n}\n\npub fn delta() -> i32 {\n    4\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/fresh.rs"), "pub fn fresh() {}\n").unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let out = engine.changes_since("HEAD", &[], &[], 4_000).unwrap().text;
+    assert!(out.contains("## src/lib.rs (modified"), "{out}");
+    assert!(out.contains("Touched: beta [fn] L5-7"), "{out}");
+    assert!(out.contains("Added symbols: delta"), "{out}");
+    assert!(out.contains("Removed symbols: gamma"), "{out}");
+    assert!(out.contains("+    20 + 2"), "{out}");
+    assert!(out.contains("-    2"), "{out}");
+    assert!(
+        out.contains("## Untracked new files (1)\n- src/fresh.rs"),
+        "{out}"
+    );
+    assert!(!out.contains("keep.rs"), "{out}");
+    assert!(!out.contains(".trackertop"), "{out}");
+
+    let beta = engine
+        .changes_since("HEAD", &[], &["beta".to_string()], 4_000)
+        .unwrap()
+        .text;
+    assert!(beta.contains("+    20 + 2"), "{beta}");
+    assert!(!beta.contains("delta"), "only hunks touching beta: {beta}");
+    let alpha = engine
+        .changes_since("HEAD", &[], &["alpha".to_string()], 4_000)
+        .unwrap()
+        .text;
+    assert!(
+        alpha.contains("No changes touch the requested symbols"),
+        "{alpha}"
+    );
+    let gone = engine
+        .changes_since("HEAD", &[], &["gamma".to_string()], 4_000)
+        .unwrap()
+        .text;
+    assert!(gone.contains("SYMBOL `gamma` NOT FOUND IN INDEX"), "{gone}");
+
+    let scoped = engine
+        .changes_since("HEAD", &["src/keep.rs".to_string()], &[], 4_000)
+        .unwrap()
+        .text;
+    assert!(
+        scoped.contains("No changes since that commit in the requested scope"),
+        "{scoped}"
+    );
+
+    let bad = engine
+        .changes_since("no-such-ref", &[], &[], 1_000)
+        .unwrap_err();
+    assert!(
+        format!("{bad:#}").contains("does not name a commit"),
+        "{bad:#}"
+    );
+    let plain = TempDir::new().unwrap();
+    let err = TrackerEngine::new(plain.path())
+        .changes_since("HEAD", &[], &[], 1_000)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a git repository"),
+        "{err:#}"
+    );
+}

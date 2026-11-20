@@ -220,6 +220,23 @@ fn dispatch_tool_call(
                 .run_checks(kind, extra, timeout, max_tokens)
                 .map(|q| q.text)
         }
+        "changes_since" => {
+            let since = args.get("since").and_then(Value::as_str).unwrap_or("HEAD");
+            let list = |key: &str| -> Vec<String> {
+                args.get(key)
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            engine
+                .changes_since(since, &list("paths"), &list("symbols"), max_tokens)
+                .map(|q| q.text)
+        }
         "token_stats" => engine.token_stats().map(|s| {
             format!(
                 "# TRACKERTOP TOKEN SAVINGS\nQueries: {}\nTokens sent: {}\nBaseline avoided: {}\nNet saved: {} tok ({:.1}%)\nEst. USD saved: ${:.4} (Sonnet) / ${:.4} (Opus)",
@@ -425,6 +442,19 @@ fn tool_definitions() -> Value {
                     "extra_args": { "type": "string", "description": "Extra arguments for the single matching command, e.g. a test name filter `parser::` or `-p mycrate` (split on whitespace, no shell)" },
                     "timeout_secs": { "type": "integer", "description": "Kill the command after this many seconds (default 600, max 3600)" },
                     "max_tokens": { "type": "integer", "description": "Token budget cap (default 1500); failing names are listed before details" }
+                }
+            }
+        },
+        {
+            "name": "changes_since",
+            "description": "What changed since a git ref (default HEAD = your uncommitted work), including staged, unstaged and untracked files, mapped onto symbols. For each changed file it shows the touched symbols with current line spans, symbols added/removed since the ref, and only the changed lines. Use it to catch up after edits (yours, the user's, a merge or a checkout) instead of re-reading whole files; pass `symbols` to see only hunks touching those symbols. Invalid refs and non-git directories are errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "string", "description": "Git ref to compare against: HEAD (default), HEAD~3, a branch, tag or commit" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative files or directories to limit the diff to" },
+                    "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional symbols: show only hunks that touch them" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 2000)" }
                 }
             }
         },

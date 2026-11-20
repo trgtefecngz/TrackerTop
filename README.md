@@ -126,6 +126,7 @@ flowchart LR
 | `health_check` | Token-bloated files, circular dependencies and likely orphan files |
 | `shortest_path` | Shortest dependency path between two symbols or files |
 | `remember` / `recall` | Persistent architectural notes, surfaced automatically in later sessions |
+| `changes_since` | What changed since a git ref (default: uncommitted work), mapped onto symbols: touched, added and removed symbols plus only the changed lines |
 | `run_checks` | Runs the project's tests, lint, build or format check and returns only counts, failing test names and error lines with file:line; never hides a failure |
 | `token_stats` | Cumulative tokens saved and estimated cost reduction |
 

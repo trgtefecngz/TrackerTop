@@ -6,6 +6,12 @@ All notable changes to TrackerTop are documented here.
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
+### Added: `changes_since`
+- New MCP tool: what changed in the working tree (staged, unstaged, untracked) since a git ref, `HEAD` by default.
+  - For each file: the touched symbols with their current line spans, the symbols added or removed since the ref (the old version is parsed with the same extractor), and only the changed lines.
+  - Can be limited to paths, or to hunks that touch given symbols.
+  - Errors on an invalid ref or outside a git repository.
+
 ### Added: `run_checks`
 - New MCP tool. It runs the project's own test, lint, build or format command and returns a compact summary instead of the log: pass/fail counts, only the failing test names with their assertion lines and `file:line`, and compiler/linter errors with locations.
 - Commands come from `Cargo.toml`, `package.json` scripts (npm, pnpm, yarn or bun), `go.mod` and pytest/ruff config, each marked as detected or guessed. They run without a shell and are stopped by a timeout.

@@ -1,3 +1,4 @@
+pub mod changes;
 pub mod checks;
 pub mod context;
 pub mod db;

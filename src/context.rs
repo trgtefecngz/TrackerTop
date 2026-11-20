@@ -1410,6 +1410,30 @@ impl TrackerEngine {
         )
     }
 
+    /// 16. What changed (working tree incl. staged/unstaged/untracked) since a git ref, mapped
+    ///     onto symbols, optionally limited to paths or to hunks touching given symbols.
+    pub fn changes_since(
+        &self,
+        git_ref: &str,
+        paths: &[String],
+        symbols: &[String],
+        max_tokens: usize,
+    ) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let (db, cg) = self.load_fresh()?;
+        let report = crate::changes::changes_since(&self.repo_root, &cg, git_ref, paths, symbols)?;
+        self.finalize(
+            &db,
+            "changes_since",
+            git_ref,
+            report.text,
+            if max_tokens == 0 { 2000 } else { max_tokens },
+            report.baseline_tokens,
+            report.files,
+            start,
+        )
+    }
+
     /// 8. Token-savings telemetry summary.
     pub fn token_stats(&self) -> Result<TokenStatsSummary> {
         let db = Database::open_for_repo(&self.repo_root)?;
