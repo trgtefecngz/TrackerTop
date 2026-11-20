@@ -751,6 +751,11 @@ fn call_candidates<'a>(syms: &[&'a Symbol], method_call: bool, is_rust: bool) ->
 /// associated function such as `fn all() -> [Self; 4]` cannot, so `iter.all(..)` must not
 /// bind to it. A signature with no parameter list is kept: nothing proves it wrong.
 fn takes_self(signature: &str) -> bool {
+    // The parameter list follows the name: skip `pub(super)` and the like
+    let signature = match signature.find("fn ") {
+        Some(i) => &signature[i + 3..],
+        None => signature,
+    };
     let mut depth = 0i32;
     let mut open = None;
     for (i, c) in signature.char_indices() {
@@ -862,6 +867,9 @@ mod tests {
             "fn f<T: Into<String>>(&self, t: T)",
             "fn f(self: Box<Self>)",
             "def f(self, x):",
+            "pub(super) fn render(&mut self, ui: &mut Ui)",
+            "pub(crate) fn f(self)",
+            "pub(in crate::a) fn f(&self)",
         ] {
             assert!(takes_self(sig), "{sig}");
         }
