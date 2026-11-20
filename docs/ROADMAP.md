@@ -1,6 +1,6 @@
 # Roadmap
 
-## v0.6: graph-grounded PR review (`trackertop review`)
+## v0.7: graph-grounded PR review (`trackertop review`)
 
 ### Goal
 
@@ -54,7 +54,7 @@ Phase 1 can only find structural problems. For logic bugs, an opt-in pass sends 
 
 ### Phase 3: GitHub integration
 
-- A reusable Action: `uses: trgtefecngz/TrackerTop/review-action@v0.6`.
+- A reusable Action: `uses: trgtefecngz/TrackerTop/review-action@v0.7`.
 - It posts **one comment and edits it in place** instead of piling up new ones, plus SARIF upload for inline annotations.
 - Re-review on demand with a `@trackertop review` comment (an `issue_comment` workflow), not on every push.
 - Commands: `@trackertop wrong <id>`, `@trackertop suppress <rule>`. Dismissed findings are remembered in the repo (`.trackertop/review-suppressions.json`) and never raised again.
@@ -69,7 +69,7 @@ Fixing reviewer leads one round after another produced diminishing returns: late
 
 ### Prerequisite: tree-sitter for TypeScript/JavaScript
 
-The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, template literals and regexes are recognised by hand-written scanning. Most late review findings in v0.5.1 were edge cases of that scanner. Both the review's symbol mapping and the AI context depend on accurate spans, so this comes first:
+The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, template literals and regexes are recognised by hand-written scanning. Most late review findings in v0.6.0 were edge cases of that scanner. Both the review's symbol mapping and the AI context depend on accurate spans, so this comes first:
 - Use `tree-sitter-typescript` (TS and TSX grammars) and `tree-sitter-javascript`. Rust and HTML already use tree-sitter 0.25.
 - Keep the current extractor's tests as the acceptance suite; they describe the expected spans.
 - Python and Go are next in line for the same treatment.

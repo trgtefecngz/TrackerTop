@@ -2,7 +2,7 @@
 
 All notable changes to TrackerTop are documented here.
 
-## [0.5.1] - 2026-11-20
+## [0.6.0] - 2026-11-20
 
 A reliability and safety release. There are no new MCP tools; everything that already existed now behaves correctly with several agents at once, on unusual file systems, and with configs the installer did not create.
 
@@ -53,5 +53,5 @@ A reliability and safety release. There are no new MCP tools; everything that al
 
 Global Edition: TypeScript/JavaScript, Python and Go extractors, custom app icon, Claude Code SessionStart hook, macOS release CI, one-line installers.
 
-[0.5.1]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.5.1
+[0.6.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.6.0
 [0.5.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.5.0
