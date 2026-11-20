@@ -312,9 +312,10 @@ pub struct ProjectNote {
     pub target: String, // "project", file path, or symbol name
     pub content: String,
     pub created_at: String,
-    /// `note`, `decision` or `dismissed` (a review lead that was checked and rejected).
+    /// `note`, `decision`, `dismissed` (a review lead that was checked and rejected), or a
+    /// work-journal entry: `progress`, `tried` (an approach that failed) or `blocked`.
     pub kind: String,
-    /// Why: required for decisions and dismissed leads, empty for plain notes.
+    /// Why: required for decisions, dismissed leads, `tried` and `blocked` entries.
     pub reason: String,
     /// Provenance: the commit checked out when the note was written (empty if unknown).
     #[serde(default)]
@@ -324,6 +325,48 @@ pub struct ProjectNote {
     /// and the note may be outdated.
     #[serde(default)]
     pub code_hash: String,
+    /// The agent session that wrote it (one MCP server process); empty for CLI/UI notes and
+    /// notes written before v0.9.
+    #[serde(default)]
+    pub session: String,
+}
+
+/// Note kinds `remember` accepts. The last three are work-journal entries `resume` reports.
+pub const NOTE_KINDS: &[&str] = &[
+    "note",
+    "decision",
+    "dismissed",
+    "progress",
+    "tried",
+    "blocked",
+];
+
+/// Kinds that must say why (a bare decision or "it failed" is useless to the next session).
+pub fn note_kind_needs_reason(kind: &str) -> bool {
+    matches!(kind, "decision" | "dismissed" | "tried" | "blocked")
+}
+
+/// One MCP tool call in the work journal: what was asked and how it went.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub id: i64,
+    /// RFC 3339 UTC.
+    pub timestamp: String,
+    /// One MCP server process = one agent session.
+    pub session: String,
+    /// Telemetry source, e.g. `mcp:claude-code`.
+    pub source: String,
+    pub tool: String,
+    /// The call's arguments, compacted (`symbol=Foo path=src/a.rs`).
+    pub query: String,
+    /// `ok`, `ok: <one-line result>` or `error: <message>`.
+    pub outcome: String,
+}
+
+impl JournalEntry {
+    pub fn is_error(&self) -> bool {
+        self.outcome.starts_with("error")
+    }
 }
 
 impl ProjectNote {
@@ -332,6 +375,9 @@ impl ProjectNote {
         let label = match self.kind.as_str() {
             "decision" => "Decision",
             "dismissed" => "Dismissed lead",
+            "progress" => "Progress",
+            "tried" => "Tried (failed)",
+            "blocked" => "Blocked",
             _ => "Note",
         };
         if self.reason.is_empty() {

@@ -125,7 +125,8 @@ flowchart LR
 | `diff_impact` | Blast radius of your uncommitted changes (or the last commit): dependents, co-changing files, tests to re-run |
 | `health_check` | Oversized files (size outliers of the repo), import cycles through code (Rust module cycles allowed) and likely orphan files (entry points and scripts listed apart), with coverage |
 | `shortest_path` | Shortest dependency path between two symbols or files |
-| `remember` / `recall` | Persistent notes, decisions and dismissed review leads with reasons; shown automatically when the related symbol or file is read, and kept as Markdown in `.trackertop/notes/` |
+| `remember` / `recall` | Persistent notes, decisions and dismissed review leads with reasons, plus work-journal entries (`progress`, `tried`, `blocked`); shown automatically when the related symbol or file is read, and kept as Markdown in `.trackertop/notes/` |
+| `resume` | Where work stands at the start of a session or after `/compact`: uncommitted work with touched symbols, the progress file's Next and pending-decision sections, open blockers, approaches that failed, open review findings, decisions (possibly outdated ones first) and what recent agent sessions did; every item dated, capped lists say what they hide. The Claude Code SessionStart hook prints a short version |
 | `changes_since` | What changed since a git ref (default: uncommitted work), mapped onto symbols: touched, added and removed symbols plus only the changed lines |
 | `project_playbook` | Build/test/lint/format commands, what CI runs, toolchain versions, configs and agent instruction files, each marked detected or guessed |
 | `run_checks` | Runs the project's tests, lint, build or format check and returns only counts, failing test names and error lines with file:line; never hides a failure |

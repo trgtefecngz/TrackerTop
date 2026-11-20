@@ -13,6 +13,7 @@ use std::time::Instant;
 mod analysis;
 mod memory;
 mod reading;
+mod resume;
 mod search;
 mod workflow;
 
@@ -36,6 +37,8 @@ pub struct TrackerEngine {
     graph_cache: Mutex<Option<(i64, Arc<CodeGraph>)>>,
     /// Telemetry source tag for calls made through this engine (see [`Self::set_source`]).
     source: Mutex<String>,
+    /// Work-journal session id: one per MCP server process (see [`Self::set_session`]).
+    session: Mutex<String>,
 }
 
 impl TrackerEngine {
@@ -51,7 +54,37 @@ impl TrackerEngine {
             repo_root: repo_root.to_path_buf(),
             graph_cache: Mutex::new(None),
             source: Mutex::new(source),
+            session: Mutex::new(String::new()),
         }
+    }
+
+    /// Tags later journal rows and notes with an agent session id. The MCP server sets one
+    /// per process (one process = one agent session, which survives `/compact`).
+    pub fn set_session(&self, session: &str) {
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session.to_string();
+    }
+
+    pub fn session(&self) -> String {
+        self.session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Appends one MCP tool call to the work journal. Best effort by design: a journal
+    /// failure must never fail the call it records, so the error is returned for tests and
+    /// ignored by the server. Never creates `.trackertop/` where no index exists yet.
+    pub fn journal_call(&self, tool: &str, query: &str, outcome: &str) -> Result<()> {
+        let db_path = self.repo_root.join(".trackertop").join("index.db");
+        if !db_path.is_file() {
+            return Ok(());
+        }
+        let db = Database::open_path(&db_path)?;
+        db.record_journal(&self.session(), &self.source(), tool, query, outcome)?;
+        Ok(())
     }
 
     /// Tags later telemetry rows: `mcp:<client>` for MCP sessions, `ui` for the desktop app.

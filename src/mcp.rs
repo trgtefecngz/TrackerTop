@@ -11,6 +11,13 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 pub fn run_mcp_server(repo_root: &Path) -> Result<()> {
     let engine = TrackerEngine::new(repo_root);
     engine.set_source("mcp:unknown"); // refined by the client name on `initialize`
+    // One server process per agent session: its start time + pid name the session in the
+    // work journal (it survives `/compact`, which keeps the same process)
+    engine.set_session(&format!(
+        "{}#{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        std::process::id()
+    ));
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -45,6 +52,35 @@ pub fn run_mcp_server(repo_root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Records a `tools/call` in the work journal: tool, compacted arguments and outcome.
+/// Best effort: a journal failure never changes the response.
+fn journal_tool_call(
+    engine: &TrackerEngine,
+    params: &Value,
+    res: &std::result::Result<Value, (i32, String)>,
+) {
+    let tool = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("(missing)");
+    let query = crate::journal::compact_query(params.get("arguments").unwrap_or(&Value::Null));
+    let text = |v: &Value| {
+        v.pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let outcome = match res {
+        Ok(v) if v.get("isError").and_then(Value::as_bool) == Some(true) => {
+            let t = text(v);
+            crate::journal::outcome_of(tool, Err(t.trim_start_matches("TrackerTop error: ")))
+        }
+        Ok(v) => crate::journal::outcome_of(tool, Ok(&text(v))),
+        Err((_, msg)) => crate::journal::outcome_of(tool, Err(msg)),
+    };
+    let _ = engine.journal_call(tool, &query, &outcome);
 }
 
 /// Pure handler exposed for integration tests as well as stdio loop.
@@ -83,11 +119,15 @@ pub fn handle_jsonrpc_message(engine: &TrackerEngine, req: &Value) -> Option<Val
                 "name": "trackertop",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens. Call project_playbook once at the start, run_checks instead of running tests/lint in a shell, changes_since to catch up after edits, review_changes before committing or pushing, and remember(kind=decision|dismissed, reason=...) to record settled questions. Every answer states its coverage (truncation, NOT INDEXED vs NOT FOUND)."
+            "instructions": "TrackerTop provides a token-budgeted deterministic codebase graph with smart_grep, batch symbol reads, git diff_impact, code health, and persistent AI memory. Prefer task_context, repo_map, smart_grep, file_outline, read_symbol, read_symbols_batch, impact_analysis, and diff_impact BEFORE running broad grep or reading full files to save 80-95% tokens. Call project_playbook once at the start, run_checks instead of running tests/lint in a shell, changes_since to catch up after edits, review_changes before committing or pushing, and remember(kind=decision|dismissed, reason=...) to record settled questions. Starting or resuming work (a new session, after /compact)? Call resume first: what earlier sessions did, what failed or is blocked, open findings, decisions and uncommitted work. Record milestones and dead ends with remember(kind=progress|tried|blocked, reason=...) so the next session sees them. Every answer states its coverage (truncation, NOT INDEXED vs NOT FOUND)."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => dispatch_tool_call(engine, &params),
+        "tools/call" => {
+            let res = dispatch_tool_call(engine, &params);
+            journal_tool_call(engine, &params, &res);
+            res
+        }
         _ => Err((-32601, format!("Method not found: {method}"))),
     };
 
@@ -268,6 +308,7 @@ fn dispatch_tool_call(
             engine.review_changes(base, max_tokens).map(|q| q.text)
         }
         "project_playbook" => engine.project_playbook(max_tokens).map(|q| q.text),
+        "resume" => engine.resume(max_tokens).map(|q| q.text),
         "token_stats" => engine.token_stats().map(|s| s.summary_text(5)),
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
     };
@@ -432,16 +473,26 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "remember",
-            "description": "Saves a persistent note attached to a symbol, file path, or 'project': an architectural rule (kind=note), a decision and why it was made (kind=decision), or a review lead / suspected bug that was checked and rejected (kind=dismissed). Shown automatically whenever that symbol or file is read in later sessions (read_symbol, read_symbols_batch, file_outline), so settled questions are not re-investigated. Also kept as Markdown in .trackertop/notes/.",
+            "description": "Saves a persistent note attached to a symbol, file path, or 'project': an architectural rule (kind=note), a decision and why it was made (kind=decision), or a review lead / suspected bug that was checked and rejected (kind=dismissed). Work-journal entries for the next session: a milestone reached (kind=progress), an approach that failed and why (kind=tried), or something blocked and on what (kind=blocked; it stays open until a later progress entry on the same target, or one mentioning its #id, closes it). Notes are shown whenever that symbol or file is read in later sessions (read_symbol, read_symbols_batch, file_outline) and by `resume`, so settled questions are not re-investigated. Also kept as Markdown in .trackertop/notes/.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "Symbol name, qualified name, file path, or 'project'" },
-                    "note": { "type": "string", "description": "Concise rule, gotcha, decision, or the dismissed lead" },
-                    "kind": { "type": "string", "enum": ["note", "decision", "dismissed"], "description": "note (default), decision, or dismissed" },
-                    "reason": { "type": "string", "description": "Why (required for decision and dismissed)" }
+                    "note": { "type": "string", "description": "Concise rule, gotcha, decision, dismissed lead, milestone, failed approach or blocker" },
+                    "kind": { "type": "string", "enum": ["note", "decision", "dismissed", "progress", "tried", "blocked"], "description": "note (default), decision, dismissed, progress, tried or blocked" },
+                    "reason": { "type": "string", "description": "Why (required for decision, dismissed, tried and blocked)" }
                 },
                 "required": ["note"]
+            }
+        },
+        {
+            "name": "resume",
+            "description": "Where work stands, in one budgeted answer: call it first in a new session or after /compact instead of rediscovering. Lists uncommitted work (files and touched symbols with lines), the progress file's `## Next` and `## Kararını bekleyenler` sections (newest docs/*PROGRESS*.md), open blocked entries, approaches tried and failed, open review findings from the last review_changes, decisions (POSSIBLY OUTDATED ones first), the progress log, and what recent agent sessions did (tools, focus, check results, errors). Every item is dated; capped lists say how many items are hidden and how to see them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 3000)" }
+                }
             }
         },
         {

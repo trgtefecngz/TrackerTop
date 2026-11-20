@@ -1,4 +1,5 @@
-//! Memory tools: remember (notes, decisions, dismissed leads) and recall.
+//! Memory tools: remember (notes, decisions, dismissed leads, progress, tried, blocked)
+//! and recall.
 
 use super::*;
 
@@ -23,8 +24,15 @@ impl TrackerEngine {
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let code_hash = self.note_code_hash(&cg, target).unwrap_or_default();
-        let (id, mirror_err) =
-            db.add_note_with_provenance(target, note, kind, reason, &commit, &code_hash)?;
+        let (id, mirror_err) = db.add_note_in_session(
+            target,
+            note,
+            kind,
+            reason,
+            &commit,
+            &code_hash,
+            &self.session(),
+        )?;
         let target = if target.trim().is_empty() {
             "project"
         } else {
@@ -32,8 +40,15 @@ impl TrackerEngine {
         };
         let mut out = format!(
             "Saved {kind} #{id} for `{target}`. It is shown automatically when that symbol or \
-             file is read (read_symbol, read_symbols_batch, file_outline) and in recall."
+             file is read (read_symbol, read_symbols_batch, file_outline), in recall, and by \
+             `resume` / the session-start briefing in later sessions."
         );
+        if kind == "blocked" {
+            out.push_str(&format!(
+                " It stays open until a later progress entry on the same target, or one that \
+                 mentions #{id}, closes it."
+            ));
+        }
         if let Some(e) = mirror_err {
             out.push_str(&format!(
                 "\nWARNING: stored in the index DB, but the Markdown copy in .trackertop/notes/ \
@@ -93,8 +108,16 @@ impl TrackerEngine {
     /// than trusted.
     pub(super) fn note_line(&self, cg: &CodeGraph, n: &ProjectNote) -> String {
         let mut line = n.display_line();
+        if let Some(w) = self.note_outdated(cg, n) {
+            line.push_str(&format!(" [{w}]"));
+        }
+        line
+    }
+
+    /// The POSSIBLY OUTDATED warning for a note whose code changed or vanished, else `None`.
+    pub(super) fn note_outdated(&self, cg: &CodeGraph, n: &ProjectNote) -> Option<String> {
         if n.code_hash.is_empty() {
-            return line;
+            return None;
         }
         let at = if n.commit.is_empty() {
             String::new()
@@ -102,17 +125,16 @@ impl TrackerEngine {
             format!(" at commit {}", n.commit)
         };
         match self.note_code_hash(cg, &n.target) {
-            Some(now) if now == n.code_hash => {}
-            Some(_) => line.push_str(&format!(
-                " [POSSIBLY OUTDATED: the code changed since this note was written{at}; \
-                 re-check before relying on it]"
+            Some(now) if now == n.code_hash => None,
+            Some(_) => Some(format!(
+                "POSSIBLY OUTDATED: the code changed since this note was written{at}; \
+                 re-check before relying on it"
             )),
-            None => line.push_str(&format!(
-                " [POSSIBLY OUTDATED: `{}` is no longer found (renamed or removed?); written{at}]",
+            None => Some(format!(
+                "POSSIBLY OUTDATED: `{}` is no longer found (renamed or removed?); written{at}",
                 n.target
             )),
         }
-        line
     }
 
     /// Whether the code a note was written about is unchanged (true when the note has no

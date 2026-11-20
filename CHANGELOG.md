@@ -4,6 +4,13 @@ All notable changes to TrackerTop are documented here.
 
 ## [Unreleased]
 
+### Added: cross-session continuity
+- **Work journal.** The MCP server records every tool call per agent session (one server process = one session, which survives `/compact`): tool, compacted arguments and outcome (`ok`, the RESULT or findings line of checks and reviews, NOT FOUND misses, or the error). Kept per project in the index DB, newest 20,000 calls.
+- `remember` takes three more kinds: `progress` (a milestone), `tried` (an approach that failed, with why) and `blocked` (with what blocks it). A blocked entry stays open until a later `progress` entry on the same target, or one that mentions its `#id`, closes it. Notes now record the session that wrote them; the Markdown mirror keeps it.
+- New MCP tool `resume` (also `trackertop query resume`): uncommitted work with touched symbols and lines, the `## Next` and `## Kararını bekleyenler` sections of the newest `docs/*PROGRESS*.md` with file:line, open blockers, failed approaches, open review findings (minus later dismissals), decisions with **POSSIBLY OUTDATED** ones first, the progress log, and what recent sessions did (tools, focus, check results, errors). Agent calls recorded as telemetry before the journal existed are included, grouped by day. Every item is dated; capped lists say how many items they hide.
+- `trackertop hook-hint` (the Claude Code SessionStart hook) now prints a short `resume` (about 500 tokens) after the usual hint, for new sessions and after `/compact`. It reads the hook's stdin JSON for the working directory, never creates an index, takes about 0.3 s on this repository, and falls back to the plain hint on any error or after 0.9 s.
+- The desktop app's AI Memory tab shows the journal as a timeline: what the agent did (runs of calls collapsed, failures and check results on their own rows) and why (notes with their reasons).
+
 ### Fixed: the health check reports only real issues
 - **Cycles** now count only dependencies through code: calls, type uses, impls and imports. They use the same language-aware rule as `review`'s `new-cycle`. Doc mentions are not dependencies, and Rust module cycles inside one crate are allowed. The output says how many Rust files were left out.
 - **Orphans** no longer include entry points and scripts that are run directly: installers, `scripts/`, `bin/`, CI scripts, `build.rs`, test, bench and example targets, and `main.*`. These are listed apart with the reason.
@@ -12,7 +19,8 @@ All notable changes to TrackerTop are documented here.
 - Call edges in Rust are more accurate. A method called on a std iterator chain (`s.lines().count()`) no longer binds to a project method with the same name. Nor does a value call that reaches an associated function without `self`, a method that several types define, or a call to a local closure. Existing indexes are re-parsed once (extractor revision 7).
 
 ### Changed
-- `src/context.rs`, `src/ui.rs` and `tests/integration_test.rs` are split into modules by tool family, by tab and by feature. Behaviour is unchanged.
+- `changes_since` and `resume` run their git processes side by side.
+- `src/context.rs`, `src/ui.rs` and `tests/integration_test.rs` are split into modules by tool family, by tab and by feature (`tests/journal.rs` holds the continuity tests). Behaviour is unchanged.
 
 ## [0.8.0] - 2026-11-20
 

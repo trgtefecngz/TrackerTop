@@ -45,8 +45,9 @@ which runs them with filtered output.
 - Release: `.github/workflows/release.yml` triggers on a pushed `v*` tag; the release
   notes come from `CHANGELOG.md`, so the version's CHANGELOG section must be complete
   before tagging. Tag and release only on the user's explicit word.
-- A post-compact SessionStart hook restores the progress file's `## Next` section; keep
-  that section self-contained (paths, order, open decisions).
+- The SessionStart hook (`trackertop hook-hint`) prints a short `resume` at startup and
+  after `/compact`, including the progress file's `## Next` and `## Kararını bekleyenler`
+  sections; keep those self-contained (paths, order, open decisions).
 
 ## Use TrackerTop's own MCP tools first
 
@@ -59,7 +60,9 @@ The repo dogfoods its own server (`trackertop`). Before shell greps or full-file
 | Several symbols at once | `read_symbols_batch` |
 | Orientation / starting a task | `repo_map`, `task_context` |
 | Signatures + line ranges of a file | `file_outline` |
-| Catch up after edits or a compact | `changes_since` |
+| Where work stands (new session, after a compact) | `resume` |
+| Catch up after edits | `changes_since` |
+| Record a milestone, dead end or blocker | `remember` with `kind` `progress` / `tried` / `blocked` and a `reason` |
 | Blast radius before refactor | `impact_analysis`, `diff_impact` |
 | Build / lint / test | `run_checks` |
 | Self-review of the diff | `review_changes` (v0.8+) |

@@ -137,7 +137,7 @@ The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, 
 ## v1.0: editing and continuity
 
 - **Symbol-level editing.** `replace_symbol_body`, `insert_after_symbol` and `rename_symbol`. Rename updates every reference the graph knows about and reports the references it could not resolve. Edits stop failing on whitespace mismatches.
-- **Working memory (`resume`).** What the last sessions were doing, what was tried and failed, what is still open, and the decisions taken, in a short summary at the start of a session. The desktop app shows the same log, so a person can follow what the agent did and why.
+- **Working memory (`resume`).** *Delivered early (feat/continuity): `resume`, the work journal, the SessionStart briefing and the AI Memory timeline.* What the last sessions were doing, what was tried and failed, what is still open, and the decisions taken, in a short summary at the start of a session. The desktop app shows the same log, so a person can follow what the agent did and why.
 
 ## Later
 

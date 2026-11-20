@@ -3,6 +3,7 @@
 mod architecture;
 mod graph_tab;
 mod graph_view;
+mod journal_view;
 mod memory_tab;
 mod projects;
 mod savings;

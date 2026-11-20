@@ -114,7 +114,8 @@ enum Commands {
         #[arg(long)]
         global: bool,
     },
-    /// Lightweight SessionStart hook output reminding AI agents to prefer TrackerTop MCP tools
+    /// SessionStart hook output: the TrackerTop hint plus a short "where work stands"
+    /// briefing (reads the hook's stdin JSON; never fails, falls back to the hint)
     HookHint,
 }
 
@@ -192,6 +193,12 @@ enum QueryAction {
     /// Code health diagnostics (token bloat, circular cycles, orphans)
     Health {
         #[arg(long, default_value_t = 1000)]
+        max_tokens: usize,
+    },
+    /// Where work stands: recent agent sessions, tried/blocked entries, open findings,
+    /// decisions, the progress file's Next section and uncommitted work
+    Resume {
+        #[arg(long, default_value_t = 3000)]
         max_tokens: usize,
     },
 }
@@ -280,6 +287,7 @@ fn main() -> Result<()> {
                 } => engine.smart_grep(&pattern, filter.as_deref(), max_tokens)?,
                 QueryAction::Diff { max_tokens } => engine.diff_impact(max_tokens)?,
                 QueryAction::Health { max_tokens } => engine.health_check(max_tokens)?,
+                QueryAction::Resume { max_tokens } => engine.resume(max_tokens)?,
             };
             println!("{}", res.text);
         }
@@ -417,8 +425,14 @@ fn main() -> Result<()> {
             }
         }
         Commands::HookHint => {
+            let input = trackertop::hook::read_hook_stdin();
             println!(
-                "TrackerTop MCP is active for this workspace. Prefer `repo_map`, `task_context`, `smart_grep`, `file_outline`, `read_symbol`, `read_symbols_batch`, and `diff_impact` BEFORE raw grep or reading full files (saves 80-99% tokens)."
+                "{}",
+                trackertop::hook::hook_output(
+                    &input,
+                    cli.repo.clone(),
+                    trackertop::hook::BRIEFING_DEADLINE
+                )
             );
         }
     }
