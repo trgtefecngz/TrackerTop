@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+# Every binary is published together with `<asset>.sha256` (sha256sum format:
+# "<hex>  <file name>"). scripts/install.ps1 and scripts/install.sh verify it.
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -16,31 +19,48 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Windows release executable
         run: cargo build --release
-      - name: Rename portable executable
+      - name: Package executable + checksum
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          Copy-Item "target/release/trackertop.exe" "TrackerTop-$tag-windows-x64.exe"
+          $name = "TrackerTop-$tag-windows-x64.exe"
+          Copy-Item "target/release/trackertop.exe" $name
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "$name.sha256" -Value "$hash  $name" -Encoding ascii -NoNewline
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: TrackerTop-*-windows-x64.exe
+          files: |
+            TrackerTop-*-windows-x64.exe
+            TrackerTop-*-windows-x64.exe.sha256
 
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build macOS Apple Silicon binary (with native GUI)
-        run: cargo build --release
-      - name: Package macOS binary
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build macOS Apple Silicon + Intel binaries (with native GUI)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+      - name: Package binaries + checksums
         run: |
           TAG="${{ github.ref_name }}"
-          cp target/release/trackertop "TrackerTop-${TAG}-macos-arm64"
+          cp target/aarch64-apple-darwin/release/trackertop "TrackerTop-${TAG}-macos-arm64"
+          cp target/x86_64-apple-darwin/release/trackertop "TrackerTop-${TAG}-macos-x64"
+          for f in "TrackerTop-${TAG}-macos-arm64" "TrackerTop-${TAG}-macos-x64"; do
+            shasum -a 256 "$f" > "$f.sha256"
+          done
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: TrackerTop-*-macos-arm64
+          files: |
+            TrackerTop-*-macos-arm64
+            TrackerTop-*-macos-arm64.sha256
+            TrackerTop-*-macos-x64
+            TrackerTop-*-macos-x64.sha256
 
   build-linux-headless:
     runs-on: ubuntu-latest
@@ -49,11 +69,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Linux headless CLI/MCP binary
         run: cargo build --release --no-default-features
-      - name: Rename binary
+      - name: Package binary + checksum
         run: |
           TAG="${{ github.ref_name }}"
-          cp target/release/trackertop "trackertop-${TAG}-linux-x64-headless"
+          NAME="trackertop-${TAG}-linux-x64-headless"
+          cp target/release/trackertop "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: trackertop-*-linux-x64-headless
+          files: |
+            trackertop-*-linux-x64-headless
+            trackertop-*-linux-x64-headless.sha256

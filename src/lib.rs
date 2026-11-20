@@ -1,5 +1,6 @@
 pub mod context;
 pub mod db;
+pub mod fsutil;
 pub mod git;
 pub mod graph;
 pub mod indexer;

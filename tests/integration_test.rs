@@ -295,7 +295,9 @@ pub fn render_frame() -> &'static str {
     let engine = TrackerEngine::new(root);
 
     // 1. Rust <-> WGSL asset bridge should connect renderer.rs -> shaders/sky.wgsl
-    let path_res = engine.shortest_path("src/renderer.rs", "shaders/sky.wgsl", 600).unwrap();
+    let path_res = engine
+        .shortest_path("src/renderer.rs", "shaders/sky.wgsl", 600)
+        .unwrap();
     assert!(path_res.text.contains("sky.wgsl"));
 
     // 2. smart_grep should tag enclosing symbol `render_frame`
@@ -308,7 +310,11 @@ pub fn render_frame() -> &'static str {
         .remember("render_frame", "Must run after shadow pass")
         .unwrap();
     let batch_res = engine
-        .read_symbols_batch(&["render_frame".to_string(), "fs_sky".to_string()], false, 1200)
+        .read_symbols_batch(
+            &["render_frame".to_string(), "fs_sky".to_string()],
+            false,
+            1200,
+        )
         .unwrap();
     assert!(batch_res.text.contains("Must run after shadow pass"));
     assert!(batch_res.text.contains("fs_sky"));
@@ -406,4 +412,81 @@ func bootCluster() error {
 
     let go_call = engine.call_graph("Server::Start", 2, 800).unwrap();
     assert!(go_call.text.contains("bootCluster"));
+}
+
+/// The MCP engine caches the built graph between calls; it must still see edits made
+/// in this process AND re-indexes performed by another process (GUI / second MCP server).
+#[test]
+fn graph_cache_never_serves_stale_symbols() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn alpha_fn() -> u8 { 1 }\n").unwrap();
+
+    let engine = TrackerEngine::new(root);
+    let found = |e: &TrackerEngine, name: &str| {
+        !e.read_symbol(name, false, 0)
+            .unwrap()
+            .text
+            .contains("Symbol not found")
+    };
+
+    assert!(found(&engine, "alpha_fn"));
+    assert!(!found(&engine, "beta_fn"));
+    // Served from cache: still correct
+    assert!(found(&engine, "alpha_fn"));
+
+    // Edit in place (different size, so detection does not depend on mtime resolution)
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() -> u8 { 1 }\npub fn beta_fn() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    assert!(found(&engine, "beta_fn"));
+
+    // Another engine (stands in for another process) re-indexes first
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() -> u8 { 1 }\npub fn beta_fn() -> u8 { 2 }\npub fn gamma_fn() -> u8 { 3 }\n",
+    )
+    .unwrap();
+    let other = TrackerEngine::new(root);
+    assert!(found(&other, "gamma_fn"));
+    // `engine` sees no file changes itself, but the generation moved: must reload
+    assert!(found(&engine, "gamma_fn"));
+}
+
+/// A file whose timestamp changes but whose content does not (git checkout, no-op save)
+/// must be re-hashed once and then skipped again, without bumping the graph generation.
+#[test]
+fn touched_but_unchanged_files_are_not_rehashed_every_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/lib.rs");
+    std::fs::write(&file, "pub fn stable_fn() -> u8 { 1 }\n").unwrap();
+
+    let first = index_repository(root, false).unwrap();
+    assert_eq!(first.total_files, 1);
+
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    let touched = index_repository(root, false).unwrap();
+    assert_eq!(touched.parsed_files, 0);
+    assert_eq!(
+        touched.generation, first.generation,
+        "content unchanged: no graph rebuild"
+    );
+
+    let again = index_repository(root, false).unwrap();
+    assert_eq!(
+        again.skipped_files, 1,
+        "refreshed mtime lets the fast path skip the file"
+    );
 }

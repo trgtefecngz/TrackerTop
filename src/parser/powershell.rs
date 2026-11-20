@@ -48,12 +48,12 @@ impl LanguageExtractor for PowerShellExtractor {
                     if pending_doc.is_empty() && !before.is_empty() && !before.starts_with('.') {
                         pending_doc = compact_signature(before, 110);
                     }
-                } else if trimmed.starts_with(".SYNOPSIS") {
-                    if let Some(next_l) = lines.get(i + 1) {
-                        let s = next_l.trim();
-                        if !s.is_empty() && !s.starts_with('.') {
-                            pending_doc = compact_signature(s, 110);
-                        }
+                } else if trimmed.starts_with(".SYNOPSIS")
+                    && let Some(next_l) = lines.get(i + 1)
+                {
+                    let s = next_l.trim();
+                    if !s.is_empty() && !s.starts_with('.') {
+                        pending_doc = compact_signature(s, 110);
                     }
                 }
                 i += 1;
@@ -235,10 +235,7 @@ fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 fn read_ps_ident(s: &str) -> String {
     let trimmed = s.trim_start();
     // Skip optional scope prefix like `global:` or `script:`
-    let trimmed = trimmed
-        .split_once(':')
-        .map(|(_, r)| r)
-        .unwrap_or(trimmed);
+    let trimmed = trimmed.split_once(':').map(|(_, r)| r).unwrap_or(trimmed);
     trimmed
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
@@ -372,9 +369,12 @@ fn collect_ps_calls(
             continue;
         }
         // Look for Verb-Noun commands or script invocations
-        for tok in t.split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '(' | ')' | '{' | '}')) {
+        for tok in
+            t.split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '(' | ')' | '{' | '}'))
+        {
             if tok.contains('-') && !tok.starts_with('-') && !tok.starts_with('$') {
-                let clean = tok.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+                let clean = tok
+                    .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'));
                 if clean.len() >= 4
                     && !clean.eq_ignore_ascii_case(self_name)
                     && !is_common_ps_builtin(clean)

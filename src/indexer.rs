@@ -3,7 +3,7 @@ use crate::model::{Edge, EdgeKind, FileRecord, RawReference, Symbol, SymbolKind}
 use crate::parser::{LanguageExtractor, LanguageRegistry, default_registry, file_symbol_id};
 use crate::registry::register_project;
 use crate::tokens::count_tokens;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +20,63 @@ pub struct IndexStats {
     pub total_symbols: usize,
     pub total_edges: usize,
     pub total_repo_tokens: usize,
+    /// `Database::index_generation` after this run; changes whenever the graph data changed.
+    pub generation: i64,
     pub elapsed_ms: u128,
+}
+
+/// Refuses to index the user's home directory or a filesystem root.
+///
+/// A globally registered MCP server has no `--repo` and indexes its working directory, so
+/// an AI agent started from `~` (or `C:\`) would otherwise walk the entire disk and drop a
+/// `.trackertop/` folder there.
+pub fn ensure_indexable_root(repo_root: &Path) -> Result<()> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    check_indexable_root(repo_root, home.as_deref())
+}
+
+fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
+    let canon = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    // Show `C:\Users\me`, not the Windows-internal `\\?\C:\Users\me`.
+    let shown = display_path(&canon);
+    let hint = "Open your AI agent inside a project folder, or pass `--repo <project-path>`.";
+    let Some(parent) = canon.parent() else {
+        bail!("TrackerTop refuses to index `{shown}` because it is a filesystem root. {hint}");
+    };
+    if let Some(home) = home {
+        let home_canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        if home_canon == canon {
+            bail!(
+                "TrackerTop refuses to index `{shown}` because it is your home directory. {hint}"
+            );
+        }
+        // Catch-all user folders where terminals are often opened by accident. Only the folder
+        // itself is refused (projects *inside* Desktop etc. are fine), and only when it is not
+        // a git repository on its own. Name comparison only: no extra filesystem calls on the
+        // hot path (this runs on every DB open).
+        let under_home = parent == home_canon || parent == home_canon.join("OneDrive");
+        if under_home && let Some(dir_name) = canon.file_name().and_then(|n| n.to_str()) {
+            let user_folder = ["Desktop", "Downloads", "Documents"]
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(dir_name));
+            if let Some(name) = user_folder
+                && !canon.join(".git").exists()
+            {
+                bail!(
+                    "TrackerTop refuses to index `{shown}` because it is your {name} folder, \
+                     not a project. {hint}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
 /// Runs an incremental index of `repo_root` using the default `LanguageRegistry`.
@@ -36,6 +92,7 @@ pub fn index_repository_with_registry(
     registry: &LanguageRegistry,
 ) -> Result<IndexStats> {
     let start = Instant::now();
+    ensure_indexable_root(repo_root)?;
     let _ = register_project(repo_root);
     let mut db = Database::open_for_repo(repo_root)?;
     let existing = if force {
@@ -83,11 +140,12 @@ pub fn index_repository_with_registry(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        if let Some(prev) = existing.get(&rel_path) {
-            if prev.mtime_secs == mtime && prev.size_bytes == size {
-                skipped_files += 1;
-                continue;
-            }
+        if let Some(prev) = existing.get(&rel_path)
+            && prev.mtime_secs == mtime
+            && prev.size_bytes == size
+        {
+            skipped_files += 1;
+            continue;
         }
         candidates.push(Candidate {
             rel_path,
@@ -98,17 +156,25 @@ pub fn index_repository_with_registry(
         });
     }
 
+    enum Outcome {
+        Parsed(FileRecord, Vec<Symbol>, Vec<RawReference>),
+        /// Timestamp changed but content did not (e.g. `git checkout`, editor save without
+        /// edits): only the stored mtime/size need refreshing, otherwise the file would be
+        /// re-read and re-hashed on every later run.
+        Touched(String, i64, u64),
+    }
+
     // Read, hash, and parse changed candidates in parallel with rayon
-    let parsed_batch: Vec<(FileRecord, Vec<Symbol>, Vec<RawReference>)> = candidates
+    let outcomes: Vec<Outcome> = candidates
         .into_par_iter()
         .filter_map(|cand| {
             let source = std::fs::read_to_string(&cand.abs_path).ok()?;
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
 
-            if let Some(prev) = existing.get(&cand.rel_path) {
-                if prev.hash == hash {
-                    return None;
-                }
+            if let Some(prev) = existing.get(&cand.rel_path)
+                && prev.hash == hash
+            {
+                return Some(Outcome::Touched(cand.rel_path, cand.mtime, cand.size));
             }
 
             let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
@@ -123,9 +189,21 @@ pub fn index_repository_with_registry(
                 line_count,
                 token_count,
             };
-            Some((rec, parsed.symbols, parsed.refs))
+            Some(Outcome::Parsed(rec, parsed.symbols, parsed.refs))
         })
         .collect();
+
+    let mut parsed_batch: Vec<(FileRecord, Vec<Symbol>, Vec<RawReference>)> = Vec::new();
+    let mut touched: Vec<(String, i64, u64)> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Outcome::Parsed(rec, syms, refs) => parsed_batch.push((rec, syms, refs)),
+            Outcome::Touched(path, mtime, size) => touched.push((path, mtime, size)),
+        }
+    }
+    if !touched.is_empty() {
+        db.update_file_stats(&touched)?;
+    }
 
     let parsed_files = parsed_batch.len();
     let deleted_files = deleted.len();
@@ -138,30 +216,42 @@ pub fn index_repository_with_registry(
         db.upsert_parsed_files(&parsed_batch)?;
     }
 
-    let all_files = db.load_all_files()?;
-    let all_symbols = db.load_all_symbols()?;
-    let total_edges = if changed {
+    let (total_files, total_symbols, total_edges, total_repo_tokens, generation) = if changed {
+        let all_files = db.load_all_files()?;
+        let all_symbols = db.load_all_symbols()?;
         let all_refs = db.load_all_raw_refs()?;
         let mut resolved = resolve_edges(&all_files, &all_symbols, &all_refs);
         let indexed_paths: HashSet<String> = all_files.iter().map(|f| f.path.clone()).collect();
-        resolved.extend(crate::git::extract_cochange_edges(repo_root, &indexed_paths));
-        let count = resolved.len();
+        resolved.extend(crate::git::extract_cochange_edges(
+            repo_root,
+            &indexed_paths,
+        ));
+        let edge_count = resolved.len();
         db.replace_edges(&resolved)?;
-        count
+        let generation = db.bump_index_generation()?;
+        let tokens: usize = all_files.iter().map(|f| f.token_count).sum();
+        (
+            all_files.len(),
+            all_symbols.len(),
+            edge_count,
+            tokens,
+            generation,
+        )
     } else {
-        db.load_all_edges()?.len()
+        // Nothing changed: aggregate in SQL instead of loading every row.
+        let (files, symbols, edges, tokens) = db.index_totals()?;
+        (files, symbols, edges, tokens, db.index_generation()?)
     };
 
-    let total_repo_tokens: usize = all_files.iter().map(|f| f.token_count).sum();
-
     Ok(IndexStats {
-        total_files: all_files.len(),
+        total_files,
         parsed_files,
         skipped_files,
         deleted_files,
-        total_symbols: all_symbols.len(),
+        total_symbols,
         total_edges,
         total_repo_tokens,
+        generation,
         elapsed_ms: start.elapsed().as_millis(),
     })
 }
@@ -301,12 +391,11 @@ fn resolve_edges(
                 {
                     let segs: Vec<&str> = rest.split("::").collect();
                     // Try symbol resolution on last segment
-                    if let Some(&last) = segs.last() {
-                        if let Some(syms) = by_name.get(last) {
-                            if let Some(best) = pick_best_symbol(syms, src_file, &segs) {
-                                resolved_targets.push(best.id.clone());
-                            }
-                        }
+                    if let Some(&last) = segs.last()
+                        && let Some(syms) = by_name.get(last)
+                        && let Some(best) = pick_best_symbol(syms, src_file, &segs)
+                    {
+                        resolved_targets.push(best.id.clone());
                     }
                     // Also link to module file if found
                     if !segs.is_empty() {
@@ -328,7 +417,10 @@ fn resolve_edges(
                 }
                 // c) File path import (HTML script/link, PS dot-source, WGSL import)
                 else {
-                    let norm = target.replace('\\', "/").trim_start_matches("./").to_string();
+                    let norm = target
+                        .replace('\\', "/")
+                        .trim_start_matches("./")
+                        .to_string();
                     let rel_from_dir = join_rel(&parent_dir(src_file), &norm);
                     if let Some(fid) = file_by_path
                         .get(&norm)
@@ -340,15 +432,18 @@ fn resolve_edges(
                         if let Some(fids) = file_by_basename
                             .get(&key)
                             .or_else(|| file_by_stem.get(&key))
+                            && let Some(first) = fids.first()
                         {
-                            if let Some(first) = fids.first() {
-                                resolved_targets.push(first.clone());
-                            }
+                            resolved_targets.push(first.clone());
                         }
                     }
                 }
             }
-            EdgeKind::Calls | EdgeKind::Tests | EdgeKind::Implements | EdgeKind::UsesType | EdgeKind::References => {
+            EdgeKind::Calls
+            | EdgeKind::Tests
+            | EdgeKind::Implements
+            | EdgeKind::UsesType
+            | EdgeKind::References => {
                 // Direct file path reference (e.g., from Markdown `src/graph.rs`)
                 if let Some(fid) = file_by_path.get(target) {
                     resolved_targets.push(fid.clone());
@@ -446,4 +541,40 @@ fn pick_best_symbol<'a>(syms: &[&'a Symbol], src_file: &str, segs: &[&str]) -> O
         }
     }
     pick_nearest_symbol(syms, src_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_home_directory_and_filesystem_root() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert!(check_indexable_root(home.path(), Some(home.path())).is_err());
+        assert!(check_indexable_root(&project, Some(home.path())).is_ok());
+
+        let root = home.path().ancestors().last().unwrap();
+        assert!(check_indexable_root(root, None).is_err());
+    }
+
+    #[test]
+    fn refuses_bare_desktop_but_allows_projects_inside_it() {
+        let home = tempfile::tempdir().unwrap();
+        let desktop = home.path().join("Desktop");
+        let od_downloads = home.path().join("OneDrive").join("Downloads");
+        let project = desktop.join("MyApp");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&od_downloads).unwrap();
+
+        assert!(check_indexable_root(&desktop, Some(home.path())).is_err());
+        assert!(check_indexable_root(&od_downloads, Some(home.path())).is_err());
+        assert!(check_indexable_root(&project, Some(home.path())).is_ok());
+
+        // A Desktop that is itself a git repository is a deliberate choice
+        std::fs::create_dir_all(desktop.join(".git")).unwrap();
+        assert!(check_indexable_root(&desktop, Some(home.path())).is_ok());
+    }
 }

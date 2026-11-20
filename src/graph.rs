@@ -41,8 +41,11 @@ pub struct ImpactReport {
 pub struct HealthReport {
     pub bloated_files: Vec<(String, usize, usize)>, // (path, tokens, lines)
     pub circular_groups: Vec<Vec<String>>,          // strongly connected file cycles (>= 2 files)
-    pub orphan_files: Vec<String>,                  // code files with 0 incoming non-containment edges
+    pub orphan_files: Vec<String>, // code files with 0 incoming non-containment edges
 }
+
+/// `(hop distance, edge kind, symbol)` entries returned by [`CodeGraph::neighborhood`].
+pub type HopList<'a> = Vec<(usize, EdgeKind, &'a Symbol)>;
 
 pub struct CodeGraph {
     pub files: HashMap<String, FileRecord>,
@@ -171,22 +174,21 @@ impl CodeGraph {
             for p in &file_paths {
                 if let Some(ids) = self.symbols_by_file.get(p) {
                     for id in ids {
-                        if let Some(s) = self.symbols.get(id) {
-                            if s.kind != SymbolKind::File && s.kind != SymbolKind::Impl {
-                                sym_count += 1;
-                                let pr = *self.pagerank.get(id).unwrap_or(&0.0);
-                                hub_candidates.push((s.qualified_name.clone(), pr));
-                            }
+                        if let Some(s) = self.symbols.get(id)
+                            && s.kind != SymbolKind::File
+                            && s.kind != SymbolKind::Impl
+                        {
+                            sym_count += 1;
+                            let pr = *self.pagerank.get(id).unwrap_or(&0.0);
+                            hub_candidates.push((s.qualified_name.clone(), pr));
                         }
                     }
                 }
             }
-            hub_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top_hubs: Vec<String> = hub_candidates
-                .into_iter()
-                .take(4)
-                .map(|(n, _)| n)
-                .collect();
+            hub_candidates
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top_hubs: Vec<String> =
+                hub_candidates.into_iter().take(4).map(|(n, _)| n).collect();
 
             let label = infer_community_label(&file_paths);
             summaries.push(CommunitySummary {
@@ -199,7 +201,7 @@ impl CodeGraph {
             });
         }
 
-        summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        summaries.sort_by_key(|c| std::cmp::Reverse(c.total_tokens));
         for (idx, c) in summaries.iter_mut().enumerate() {
             c.id = idx + 1;
         }
@@ -289,15 +291,14 @@ impl CodeGraph {
         if let Some(s) = self.symbols.get(query) {
             return Some(s);
         }
-        self.search_symbols(query, 1).into_iter().next().map(|(s, _)| s)
+        self.search_symbols(query, 1)
+            .into_iter()
+            .next()
+            .map(|(s, _)| s)
     }
 
     /// Returns direct callers and callees (up to `depth` hops) of a symbol.
-    pub fn neighborhood(
-        &self,
-        symbol_id: &str,
-        depth: usize,
-    ) -> (Vec<(usize, EdgeKind, &Symbol)>, Vec<(usize, EdgeKind, &Symbol)>) {
+    pub fn neighborhood(&self, symbol_id: &str, depth: usize) -> (HopList<'_>, HopList<'_>) {
         let Some(&start_idx) = self.id_to_idx.get(symbol_id) else {
             return (Vec::new(), Vec::new());
         };
@@ -372,7 +373,7 @@ impl CodeGraph {
             .filter(|f| f.token_count >= 3500)
             .map(|f| (f.path.clone(), f.token_count, f.line_count))
             .collect();
-        bloated_files.sort_by(|a, b| b.1.cmp(&a.1));
+        bloated_files.sort_by_key(|f| std::cmp::Reverse(f.1));
 
         // 2. Build directed file-level dependency graph (excluding CoChanges & Contains)
         let mut file_graph: DiGraph<String, ()> = DiGraph::new();
@@ -390,21 +391,22 @@ impl CodeGraph {
             if matches!(e.kind, EdgeKind::Contains | EdgeKind::CoChanges) {
                 continue;
             }
-            let (Some(src), Some(tgt)) =
-                (self.symbols.get(&e.source_id), self.symbols.get(&e.target_id))
-            else {
+            let (Some(src), Some(tgt)) = (
+                self.symbols.get(&e.source_id),
+                self.symbols.get(&e.target_id),
+            ) else {
                 continue;
             };
             if src.file_path == tgt.file_path {
                 continue;
             }
             has_incoming.insert(tgt.file_path.clone());
-            if let (Some(&si), Some(&ti)) =
-                (path_to_idx.get(&src.file_path), path_to_idx.get(&tgt.file_path))
+            if let (Some(&si), Some(&ti)) = (
+                path_to_idx.get(&src.file_path),
+                path_to_idx.get(&tgt.file_path),
+            ) && seen_file_edges.insert((si, ti))
             {
-                if seen_file_edges.insert((si, ti)) {
-                    file_graph.add_edge(si, ti, ());
-                }
+                file_graph.add_edge(si, ti, ());
             }
         }
 
@@ -419,7 +421,7 @@ impl CodeGraph {
                 names
             })
             .collect();
-        circular_groups.sort_by(|a, b| b.len().cmp(&a.len()));
+        circular_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
 
         // 3. Orphan code files (excluding obvious entry points, tests, docs, configs)
         let mut orphan_files: Vec<String> = self
@@ -448,12 +450,12 @@ impl CodeGraph {
     }
 }
 
-fn bfs_neighbors<'a>(
-    cg: &'a CodeGraph,
+fn bfs_neighbors(
+    cg: &CodeGraph,
     start: NodeIndex,
     dir: Direction,
     max_depth: usize,
-) -> Vec<(usize, EdgeKind, &'a Symbol)> {
+) -> Vec<(usize, EdgeKind, &Symbol)> {
     let mut visited = HashSet::new();
     visited.insert(start);
     let mut queue = VecDeque::new();
@@ -656,11 +658,10 @@ fn detect_file_communities(
                 a.1.partial_cmp(b.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.0.cmp(a.0))
-            }) {
-                if label_of.get(p) != Some(&best_lbl) {
-                    label_of.insert(p.clone(), best_lbl);
-                    changed = true;
-                }
+            }) && label_of.get(p) != Some(&best_lbl)
+            {
+                label_of.insert(p.clone(), best_lbl);
+                changed = true;
             }
         }
         if !changed {

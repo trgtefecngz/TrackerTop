@@ -7,6 +7,7 @@ use crate::tokens::{count_tokens, truncate_to_tokens};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Result of an AI-first query, including exact token-savings metrics.
@@ -22,23 +23,39 @@ pub struct QueryOutput {
 
 pub struct TrackerEngine {
     pub repo_root: PathBuf,
+    /// Last built graph, tagged with the DB `index_generation` it was built from.
+    /// Long-lived engines (the MCP server) reuse it until the index changes.
+    graph_cache: Mutex<Option<(i64, Arc<CodeGraph>)>>,
 }
 
 impl TrackerEngine {
     pub fn new(repo_root: &Path) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
+            graph_cache: Mutex::new(None),
         }
     }
 
-    fn load_fresh(&self) -> Result<(Database, CodeGraph)> {
+    fn load_fresh(&self) -> Result<(Database, Arc<CodeGraph>)> {
         // Fast incremental refresh (mtime + size check skips unchanged files in milliseconds)
-        index_repository(&self.repo_root, false)?;
+        let stats = index_repository(&self.repo_root, false)?;
         let db = Database::open_for_repo(&self.repo_root)?;
-        let graph = CodeGraph::load(&db)?;
+
+        let mut cache = self
+            .graph_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((generation, graph)) = cache.as_ref()
+            && *generation == stats.generation
+        {
+            return Ok((db, Arc::clone(graph)));
+        }
+        let graph = Arc::new(CodeGraph::load(&db)?);
+        *cache = Some((stats.generation, Arc::clone(&graph)));
         Ok((db, graph))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize(
         &self,
         db: &Database,
@@ -150,7 +167,7 @@ impl TrackerEngine {
             .into_iter()
             .map(|(l, (c, t))| (l, c, t))
             .collect();
-        lang_vec.sort_by(|a, b| b.2.cmp(&a.2));
+        lang_vec.sort_by_key(|x| std::cmp::Reverse(x.2));
 
         let mut out = String::new();
         out.push_str(&format!(
@@ -184,25 +201,27 @@ impl TrackerEngine {
             let files_preview = if c.files.len() <= 5 {
                 c.files.join(", ")
             } else {
-                format!(
-                    "{}, +{} more",
-                    c.files[..5].join(", "),
-                    c.files.len() - 5
-                )
+                format!("{}, +{} more", c.files[..5].join(", "), c.files.len() - 5)
             };
             out.push_str(&format!(
                 "- C{} `{}` ({}f, {} syms, {} tok) hubs:[{}] -> {}\n",
-                c.id, c.label, c.files.len(), c.symbol_count, c.total_tokens, hubs, files_preview
+                c.id,
+                c.label,
+                c.files.len(),
+                c.symbol_count,
+                c.total_tokens,
+                hubs,
+                files_preview
             ));
         }
 
         // Include persistent project-level AI memory notes if any exist
-        if let Ok(notes) = db.find_notes_for_targets(&["project"]) {
-            if !notes.is_empty() {
-                out.push_str("\n## Saved Project Memory\n");
-                for n in notes.into_iter().take(6) {
-                    out.push_str(&format!("- [{}] {}\n", n.target, n.content));
-                }
+        if let Ok(notes) = db.find_notes_for_targets(&["project"])
+            && !notes.is_empty()
+        {
+            out.push_str("\n## Saved Project Memory\n");
+            for n in notes.into_iter().take(6) {
+                out.push_str(&format!("- [{}] {}\n", n.target, n.content));
             }
         }
 
@@ -339,7 +358,9 @@ impl TrackerEngine {
         if !sym.doc_summary.is_empty() {
             out.push_str(&format!("Doc: {}\n", sym.doc_summary));
         }
-        if let Ok(notes) = db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path]) {
+        if let Ok(notes) =
+            db.find_notes_for_targets(&[&sym.name, &sym.qualified_name, &sym.file_path])
+        {
             for n in notes.into_iter().take(4) {
                 out.push_str(&format!("Note [{}]: {}\n", n.target, n.content));
             }
@@ -403,12 +424,7 @@ impl TrackerEngine {
     }
 
     /// 4. Fast hybrid lexical + PageRank symbol search.
-    pub fn find_symbol(
-        &self,
-        query: &str,
-        limit: usize,
-        max_tokens: usize,
-    ) -> Result<QueryOutput> {
+    pub fn find_symbol(&self, query: &str, limit: usize, max_tokens: usize) -> Result<QueryOutput> {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
         let cap = if limit == 0 { 12 } else { limit.min(40) };
@@ -512,7 +528,10 @@ impl TrackerEngine {
             ));
         }
 
-        out.push_str(&format!("\n## Outgoing / Callees & Types ({})\n", callees.len()));
+        out.push_str(&format!(
+            "\n## Outgoing / Callees & Types ({})\n",
+            callees.len()
+        ));
         for (d, kind, s) in callees.iter().take(20) {
             touched_files.insert(s.file_path.clone());
             out.push_str(&format!(
@@ -619,7 +638,10 @@ impl TrackerEngine {
         if !report.related_tests.is_empty() {
             out.push_str("\n## Linked Tests to Re-run\n");
             for t in &report.related_tests {
-                out.push_str(&format!("- {} ({}:L{})\n", t.name, t.file_path, t.start_line));
+                out.push_str(&format!(
+                    "- {} ({}:L{})\n",
+                    t.name, t.file_path, t.start_line
+                ));
             }
         }
 
@@ -643,7 +665,7 @@ impl TrackerEngine {
     }
 
     /// 7. AI-First Flagship Tool: packs the highest-value surgical context for a task inside `max_tokens`!
-    /// Includes full code for top 1-2 primary symbols + signatures only for 1-hop neighbors + shortest links.
+    ///    Includes full code for top 1-2 primary symbols + signatures only for 1-hop neighbors + shortest links.
     pub fn task_context(&self, task: &str, max_tokens: usize) -> Result<QueryOutput> {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
@@ -726,7 +748,7 @@ impl TrackerEngine {
         let mut neighbor_seen = included_ids.clone();
         for core_id in &included_ids {
             let (callers, callees) = cg.neighborhood(core_id, 1);
-            for (_, kind, nbr) in callees.into_iter().chain(callers.into_iter()) {
+            for (_, kind, nbr) in callees.into_iter().chain(callers) {
                 if neighbor_seen.insert(nbr.id.clone()) && nbr.kind != SymbolKind::File {
                     touched_files.insert(nbr.file_path.clone());
                     out.push_str(&format!(
@@ -803,7 +825,10 @@ impl TrackerEngine {
                 &db,
                 "shortest_path",
                 &format!("{from}->{to}"),
-                format!("No graph path found between `{}` and `{}`.", a.qualified_name, b.qualified_name),
+                format!(
+                    "No graph path found between `{}` and `{}`.",
+                    a.qualified_name, b.qualified_name
+                ),
                 max_tokens,
                 0,
                 0,
@@ -849,7 +874,7 @@ impl TrackerEngine {
     }
 
     /// 9. Graph-aware text search: finds literal/case-insensitive matches across indexed files
-    /// and tags every matching line with its enclosing symbol (`fn`, `struct`, shader, etc.).
+    ///    and tags every matching line with its enclosing symbol (`fn`, `struct`, shader, etc.).
     pub fn smart_grep(
         &self,
         pattern: &str,
@@ -881,10 +906,11 @@ impl TrackerEngine {
         let mut matched_files = Vec::new();
 
         for rel_path in sorted_files {
-            if let Some(ref flt) = filter_l {
-                if !flt.is_empty() && !rel_path.to_ascii_lowercase().contains(flt) {
-                    continue;
-                }
+            if let Some(ref flt) = filter_l
+                && !flt.is_empty()
+                && !rel_path.to_ascii_lowercase().contains(flt)
+            {
+                continue;
             }
             let abs = self.repo_root.join(rel_path);
             let Ok(content) = std::fs::read_to_string(&abs) else {
@@ -1046,7 +1072,7 @@ impl TrackerEngine {
     }
 
     /// 11. Git-powered diff blast radius: maps uncommitted (or latest commit) changed files
-    /// to dependent files, git co-changing files, and linked tests to re-run.
+    ///     to dependent files, git co-changing files, and linked tests to re-run.
     pub fn diff_impact(&self, max_tokens: usize) -> Result<QueryOutput> {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
@@ -1083,7 +1109,8 @@ impl TrackerEngine {
                             affected_files.insert(af);
                         }
                         for t in imp.related_tests {
-                            tests_to_run.insert(format!("{} ({}:L{})", t.name, t.file_path, t.start_line));
+                            tests_to_run
+                                .insert(format!("{} ({}:L{})", t.name, t.file_path, t.start_line));
                         }
                     }
                     // Check CO_CHANGES neighbors
@@ -1107,7 +1134,10 @@ impl TrackerEngine {
         dep_files.sort();
 
         if !dep_files.is_empty() {
-            out.push_str(&format!("\n## Impacted Dependent Files ({})\n", dep_files.len()));
+            out.push_str(&format!(
+                "\n## Impacted Dependent Files ({})\n",
+                dep_files.len()
+            ));
             for f in dep_files.iter().take(20) {
                 out.push_str(&format!("- `{f}`\n"));
             }
@@ -1171,7 +1201,11 @@ impl TrackerEngine {
         if !hr.circular_groups.is_empty() {
             out.push_str("\n## Circular Dependency Cycles\n");
             for cyc in hr.circular_groups.iter().take(10) {
-                out.push_str(&format!("- Cycle ({} files): {}\n", cyc.len(), cyc.join(" <-> ")));
+                out.push_str(&format!(
+                    "- Cycle ({} files): {}\n",
+                    cyc.len(),
+                    cyc.join(" <-> ")
+                ));
             }
         }
         if !hr.orphan_files.is_empty() {
@@ -1181,7 +1215,12 @@ impl TrackerEngine {
             }
         }
 
-        let baseline: usize = cg.files.values().map(|f| f.token_count).sum::<usize>().min(40_000);
+        let baseline: usize = cg
+            .files
+            .values()
+            .map(|f| f.token_count)
+            .sum::<usize>()
+            .min(40_000);
         self.finalize(
             &db,
             "health_check",
@@ -1200,7 +1239,11 @@ impl TrackerEngine {
         let id = db.add_note(target, note)?;
         Ok(format!(
             "Saved memory note #{id} for `{}` — future sessions will see it automatically.",
-            if target.trim().is_empty() { "project" } else { target.trim() }
+            if target.trim().is_empty() {
+                "project"
+            } else {
+                target.trim()
+            }
         ))
     }
 

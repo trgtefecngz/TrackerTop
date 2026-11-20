@@ -117,11 +117,7 @@ impl LanguageExtractor for WgslExtractor {
                     } else {
                         format!("{} ", pending_attrs.join(" "))
                     };
-                    let sig_body = block_text
-                        .split('{')
-                        .next()
-                        .unwrap_or(cursor)
-                        .trim();
+                    let sig_body = block_text.split('{').next().unwrap_or(cursor).trim();
                     let sig = compact_signature(&format!("{attr_prefix}{sig_body}"), 140);
                     let sym_id = make_symbol_id(file_path, &name, start_line);
 
@@ -363,11 +359,7 @@ fn extract_wgsl_var_name(stmt: &str) -> Option<String> {
         after_var
     };
     let ident = read_ident(after_addr);
-    if ident.is_empty() {
-        None
-    } else {
-        Some(ident)
-    }
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 fn find_matching_brace_line(lines: &[&str], start: usize) -> usize {

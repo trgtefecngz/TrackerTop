@@ -100,10 +100,7 @@ fn dispatch_tool_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let max_tokens = args
-        .get("max_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let max_tokens = args.get("max_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
 
     let text_res = match name {
         "repo_map" => engine.repo_map(max_tokens).map(|q| q.text),

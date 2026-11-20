@@ -43,15 +43,15 @@ impl LanguageExtractor for GoExtractor {
             if in_import_block {
                 if trimmed.starts_with(')') {
                     in_import_block = false;
-                } else if let Some(pkg) = extract_go_quoted(trimmed) {
-                    if let Some(last) = pkg.rsplit('/').next() {
-                        out.refs.push(RawReference {
-                            source_symbol_id: file_id.clone(),
-                            target_name: last.to_string(),
-                            kind: EdgeKind::Imports,
-                            line: line_no,
-                        });
-                    }
+                } else if let Some(pkg) = extract_go_quoted(trimmed)
+                    && let Some(last) = pkg.rsplit('/').next()
+                {
+                    out.refs.push(RawReference {
+                        source_symbol_id: file_id.clone(),
+                        target_name: last.to_string(),
+                        kind: EdgeKind::Imports,
+                        line: line_no,
+                    });
                 }
                 i += 1;
                 continue;
@@ -77,15 +77,15 @@ impl LanguageExtractor for GoExtractor {
                 continue;
             }
             if trimmed.starts_with("import ") {
-                if let Some(pkg) = extract_go_quoted(trimmed) {
-                    if let Some(last) = pkg.rsplit('/').next() {
-                        out.refs.push(RawReference {
-                            source_symbol_id: file_id.clone(),
-                            target_name: last.to_string(),
-                            kind: EdgeKind::Imports,
-                            line: line_no,
-                        });
-                    }
+                if let Some(pkg) = extract_go_quoted(trimmed)
+                    && let Some(last) = pkg.rsplit('/').next()
+                {
+                    out.refs.push(RawReference {
+                        source_symbol_id: file_id.clone(),
+                        target_name: last.to_string(),
+                        kind: EdgeKind::Imports,
+                        line: line_no,
+                    });
                 }
                 i += 1;
                 continue;
@@ -121,7 +121,10 @@ impl LanguageExtractor for GoExtractor {
                         name: name.clone(),
                         qualified_name: name,
                         kind,
-                        signature: compact_signature(trimmed.split('{').next().unwrap_or(trimmed), 140),
+                        signature: compact_signature(
+                            trimmed.split('{').next().unwrap_or(trimmed),
+                            140,
+                        ),
                         start_line: line_no,
                         end_line: end_idx + 1,
                         token_count: count_tokens(&block),
@@ -178,7 +181,10 @@ impl LanguageExtractor for GoExtractor {
                         name: name.clone(),
                         qualified_name: qname,
                         kind,
-                        signature: compact_signature(trimmed.split('{').next().unwrap_or(trimmed), 140),
+                        signature: compact_signature(
+                            trimmed.split('{').next().unwrap_or(trimmed),
+                            140,
+                        ),
                         start_line: line_no,
                         end_line: end_idx + 1,
                         token_count: count_tokens(&block),
@@ -187,18 +193,22 @@ impl LanguageExtractor for GoExtractor {
                         parent_id: Some(file_id.clone()),
                     });
 
-                    if let Some(r) = recv {
-                        if !r.is_empty() {
-                            out.refs.push(RawReference {
-                                source_symbol_id: sym_id.clone(),
-                                target_name: r,
-                                kind: EdgeKind::UsesType,
-                                line: line_no,
-                            });
-                        }
+                    if let Some(r) = recv
+                        && !r.is_empty()
+                    {
+                        out.refs.push(RawReference {
+                            source_symbol_id: sym_id.clone(),
+                            target_name: r,
+                            kind: EdgeKind::UsesType,
+                            line: line_no,
+                        });
                     }
 
-                    let edge_kind = if is_test { EdgeKind::Tests } else { EdgeKind::Calls };
+                    let edge_kind = if is_test {
+                        EdgeKind::Tests
+                    } else {
+                        EdgeKind::Calls
+                    };
                     collect_go_calls(&block, &name, &sym_id, line_no, edge_kind, &mut out);
                     i = end_idx + 1;
                     continue;

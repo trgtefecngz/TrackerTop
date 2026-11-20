@@ -208,10 +208,10 @@ fn walk_items(
                     let mut seen_types = HashSet::new();
                     collect_type_refs(node, bytes, &sym_id, &mut seen_types, out);
 
-                    if node.kind() == "trait_item" {
-                        if let Some(body) = node.child_by_field_name("body") {
-                            walk_items(body, file_path, bytes, &sym_id, Some(&sym_id), out);
-                        }
+                    if node.kind() == "trait_item"
+                        && let Some(body) = node.child_by_field_name("body")
+                    {
+                        walk_items(body, file_path, bytes, &sym_id, Some(&sym_id), out);
                     }
                 }
             }
@@ -606,7 +606,10 @@ fn collect_asset_string_refs(
                     || unquoted.ends_with(".ps1")
                     || unquoted.ends_with(".psm1"))
             {
-                let norm = unquoted.replace('\\', "/").trim_start_matches("./").to_string();
+                let norm = unquoted
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_string();
                 if seen.insert(norm.clone()) {
                     out.refs.push(RawReference {
                         source_symbol_id: file_id.to_string(),

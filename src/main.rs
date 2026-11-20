@@ -1,4 +1,7 @@
-#![cfg_attr(all(target_os = "windows", feature = "gui"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", feature = "gui"),
+    windows_subsystem = "windows"
+)]
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -199,7 +202,9 @@ fn main() -> Result<()> {
             }
             #[cfg(not(feature = "gui"))]
             {
-                anyhow::bail!("TrackerTop was built without the `gui` feature. Rebuild with `--features gui` or pass a CLI subcommand (`trackertop --help`).");
+                anyhow::bail!(
+                    "TrackerTop was built without the `gui` feature. Rebuild with `--features gui` or pass a CLI subcommand (`trackertop --help`)."
+                );
             }
         }
         Commands::Index { force } => {
@@ -224,7 +229,9 @@ fn main() -> Result<()> {
             let engine = TrackerEngine::new(&repo_root);
             let res = match action {
                 QueryAction::Map { max_tokens } => engine.repo_map(max_tokens)?,
-                QueryAction::Outline { path, max_tokens } => engine.file_outline(&path, max_tokens)?,
+                QueryAction::Outline { path, max_tokens } => {
+                    engine.file_outline(&path, max_tokens)?
+                }
                 QueryAction::Symbol {
                     name,
                     deps,

@@ -22,16 +22,19 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
 
 /// Extracts weighted `CO_CHANGES` edges between files that frequently change together
 /// in recent git history (last 80 commits). 100% offline; silently returns empty if not a git repo.
-pub fn extract_cochange_edges(
-    repo_root: &Path,
-    indexed_files: &HashSet<String>,
-) -> Vec<Edge> {
+pub fn extract_cochange_edges(repo_root: &Path, indexed_files: &HashSet<String>) -> Vec<Edge> {
     if !repo_root.join(".git").exists() {
         return Vec::new();
     }
     let Some(log) = run_git(
         repo_root,
-        &["log", "-n", "80", "--name-only", "--pretty=format:---COMMIT---"],
+        &[
+            "log",
+            "-n",
+            "80",
+            "--name-only",
+            "--pretty=format:---COMMIT---",
+        ],
     ) else {
         return Vec::new();
     };
@@ -117,7 +120,10 @@ pub fn changed_files_for_diff(repo_root: &Path) -> (String, Vec<String>) {
     }
 
     // Fallback to latest commit so `diff_impact` is still informative on a clean repo
-    if let Some(last) = run_git(repo_root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]) {
+    if let Some(last) = run_git(
+        repo_root,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    ) {
         for line in last.lines() {
             let norm = line.trim().replace('\\', "/");
             if !norm.is_empty() {
