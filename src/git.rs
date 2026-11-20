@@ -20,6 +20,36 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// Repo-relative paths with uncommitted changes (staged, unstaged or untracked), forward
+/// slashes. Empty when `repo_root` is not a git repository or git is unavailable.
+pub fn working_tree_changes(repo_root: &Path) -> HashSet<String> {
+    let Some(out) = run_git(
+        repo_root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    ) else {
+        return HashSet::new();
+    };
+    parse_porcelain_z(&out)
+}
+
+/// Parses `git status --porcelain=v1 -z`. A rename (`R`/`C`) entry is followed by its old
+/// path as a separate field, which is skipped: only the new path is a changed file.
+fn parse_porcelain_z(out: &str) -> HashSet<String> {
+    let mut changed = HashSet::new();
+    let mut fields = out.split('\0');
+    while let Some(entry) = fields.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (status, path) = entry.split_at(3);
+        changed.insert(path.replace('\\', "/"));
+        if status.starts_with('R') || status.starts_with('C') {
+            fields.next();
+        }
+    }
+    changed
+}
+
 /// Extracts weighted `CO_CHANGES` edges between files that frequently change together
 /// in recent git history (last 80 commits). 100% offline; silently returns empty if not a git repo.
 pub fn extract_cochange_edges(repo_root: &Path, indexed_files: &HashSet<String>) -> Vec<Edge> {
@@ -134,4 +164,20 @@ pub fn changed_files_for_diff(repo_root: &Path) -> (String, Vec<String>) {
     let mut v: Vec<String> = changed.into_iter().collect();
     v.sort();
     ("HEAD (latest commit)".to_string(), v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_lists_new_paths_and_skips_rename_sources() {
+        let out = " M src/ui.rs\0R  src/new.rs\0src/old.rs\0?? assets/fonts/a.ttf\0A  docs\\x.md\0";
+        let got = parse_porcelain_z(out);
+        let want: HashSet<String> = ["src/ui.rs", "src/new.rs", "assets/fonts/a.ttf", "docs/x.md"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(got, want);
+    }
 }

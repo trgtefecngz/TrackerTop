@@ -14,7 +14,29 @@ All notable changes to TrackerTop are documented here.
 ### Changed
 - `changes_since` and `resume` run their git processes side by side.
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-11-20
+
+
+### Changed: desktop app redesign
+- New design system: one accent colour on dark neutrals, flat cards with 1px borders, a spacing and type scale. Glows, aurora gradients and saturated fills are gone.
+- Inter (UI) and JetBrains Mono (code) are embedded in the binary (SIL Open Font License; see `assets/fonts/`).
+- Code Graph:
+  - Nested is the default layout.
+  - Every layout is force-directed and clustered: Clusters by community, Folders by folder.
+  - Node colour shows the community; node size shows PageRank.
+  - Edges are curved. In Clusters and Folders, edges between groups are bundled below 110% zoom, and the coverage line says how many.
+  - More labels appear as you zoom in. A label that would cover another is skipped, except for the hovered or selected node and its neighbours.
+  - Hovering a node dims everything not connected to it.
+  - Drilling in or out is animated.
+  - A minimap shows the current view and can be clicked to move it.
+  - Edges that leave a nested level are drawn as pills that name where they go and how many there are. Their counts add up to the coverage line's "edges leave this scope". Click a pill to open that level.
+- Agent activity layer:
+  - Nodes glow by how many MCP calls named them in the last 7 days.
+  - Files with uncommitted changes get a dashed ring.
+  - The latest agent session is drawn as a numbered path you can replay.
+  - Badges mark notes (N), decisions (D) and health findings (!).
+  - A telemetry query counts toward a node only when it names a single file or symbol. Free-text queries and ambiguous names are not counted.
+- An inspector panel shows the selected node: PageRank, tokens, edges, agent activity, notes and findings.
 
 ### Added: `trackertop review` (step 1)
 - `trackertop review [--base <ref>] [--format md|json]` lists which symbols your branch and uncommitted work added, removed or modified compared with the merge base, with `file:line` on both sides. The base is checked out and indexed separately under `.trackertop/review-base/`, without touching your branch, index or working tree.
@@ -197,6 +219,7 @@ A reliability and safety release. There are no new MCP tools; everything that al
 
 Global Edition: TypeScript/JavaScript, Python and Go extractors, custom app icon, Claude Code SessionStart hook, macOS release CI, one-line installers.
 
+[0.8.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.0
 [0.7.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.7.0
 [0.6.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.6.0
 [0.5.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.5.0

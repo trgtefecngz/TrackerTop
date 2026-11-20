@@ -2,8 +2,18 @@
 
 mod journal_view;
 
+mod graph_view;
+mod theme;
+#[cfg(debug_assertions)]
+mod tour;
+
+use self::graph_view::{
+    GraphViewState, MemItem, MemKind, NodeKind, Portal, Scene, SceneEdge, SceneNode, Target,
+};
+use self::theme as T;
+use crate::activity::{AgentActivity, QueryResolver, build_activity};
 use crate::context::TrackerEngine;
-use crate::db::Database;
+use crate::db::{Database, note_target_matches};
 use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
 use crate::indexer::index_repository;
 use crate::install::{AiAgentKind, generic_mcp_json_snippet, install_agent, is_agent_installed};
@@ -15,9 +25,9 @@ use crate::registry::{
 };
 use anyhow::Result;
 use eframe::egui::{
-    self, Color32, CornerRadius, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+    self, Color32, CornerRadius, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -44,35 +54,15 @@ enum GraphLayoutMode {
     Nested,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraphColorMode {
-    Language,
-    Cluster,
-}
-
 struct GraphNodeVis {
     id: String,
     label: String,
     group_folder: String,
     language: String,
-    community: usize,
     tokens: usize,
-    lines: usize,
     rank: f64,
     degree: usize,
-    x: f32,
-    y: f32,
-    radius: f32,
     symbols: Vec<(String, String, usize, String)>,
-}
-
-struct GraphIsland {
-    title: String,
-    center_x: f32,
-    center_y: f32,
-    radius: f32,
-    count: usize,
-    color_idx: usize,
 }
 
 struct GraphEdgeVis {
@@ -94,7 +84,17 @@ struct LoadedProject {
     stats: TokenStatsSummary,
     nodes: Vec<GraphNodeVis>,
     edges: Vec<GraphEdgeVis>,
-    islands: Vec<GraphIsland>,
+    /// Agent calls and uncommitted changes; `activity_gen` bumps when they change.
+    activity: AgentActivity,
+    activity_gen: u64,
+    /// Summed symbol PageRank per file.
+    file_rank: HashMap<String, f64>,
+    /// Community id -> palette index (project-level order), label, files.
+    community_color: HashMap<String, usize>,
+    community_label: HashMap<String, String>,
+    community_files: HashMap<String, Vec<String>>,
+    /// Health findings per file (large file, dependency cycle, orphan).
+    findings: HashMap<String, Vec<String>>,
     /// Kept for the nested (matryoshka) view, which aggregates edges per level on demand.
     graph: CodeGraph,
 }
@@ -120,21 +120,20 @@ pub struct TrackerTopApp {
     note_target_input: String,
     note_content_input: String,
 
-    // Smooth GPU radial aurora texture & dry-run preview state
-    backdrop_tex: Option<egui::TextureHandle>,
+    // Dry-run preview state
     preview_result: Option<crate::context::QueryOutput>,
 
-    // Graph view state
-    cam_offset: Vec2,
-    cam_zoom: f32,
-    needs_fit_view: bool,
+    // Graph view state. Nested is the default layout.
     graph_search: String,
     graph_lang_filter: String,
     graph_code_only: bool,
     graph_layout_mode: GraphLayoutMode,
-    graph_color_mode: GraphColorMode,
-    selected_node_idx: Option<usize>,
-    dragged_node_idx: Option<usize>,
+    graph_view: GraphViewState,
+    /// The scene being drawn, keyed by project, layout, level, filters and activity.
+    scene: Option<(String, Scene)>,
+    last_activity_check: Instant,
+    #[cfg(debug_assertions)]
+    tour: Option<tour::Tour>,
 
     // Nested (matryoshka) view state: the level being shown and its cached view, keyed by
     // (project path, level). An error (e.g. a group vanished after re-indexing) is shown,
@@ -183,18 +182,16 @@ impl TrackerTopApp {
             bg_busy: false,
             note_target_input: "project".to_string(),
             note_content_input: String::new(),
-            backdrop_tex: None,
             preview_result: None,
-            cam_offset: Vec2::ZERO,
-            cam_zoom: 1.0,
-            needs_fit_view: true,
             graph_search: String::new(),
             graph_lang_filter: "all".to_string(),
             graph_code_only: false,
-            graph_layout_mode: GraphLayoutMode::Folders,
-            graph_color_mode: GraphColorMode::Language,
-            selected_node_idx: None,
-            dragged_node_idx: None,
+            graph_layout_mode: GraphLayoutMode::Nested,
+            graph_view: GraphViewState::default(),
+            scene: None,
+            last_activity_check: Instant::now(),
+            #[cfg(debug_assertions)]
+            tour: tour::Tour::from_env(),
             nested_level: NestedLevel::Project,
             nested_cache: None,
         };
@@ -212,31 +209,33 @@ impl TrackerTopApp {
             self.loaded = None;
             return;
         };
-        self.selected_node_idx = None;
-        self.dragged_node_idx = None;
+        self.graph_view.selected = None;
         self.preview_result = None;
         self.nested_cache = None;
+        self.scene = None;
         // A nested level belongs to one project: switching projects starts at its root.
         // A re-index of the same project keeps the level (a stale one shows an error).
         if self.loaded.as_ref().map(|lp| lp.path.as_str()) != Some(path.as_str()) {
             self.nested_level = NestedLevel::Project;
+            self.graph_view = GraphViewState::default();
         }
         self.loaded = load_project_details(Path::new(path)).ok();
-        self.recompute_graph_layout();
     }
 
-    fn recompute_graph_layout(&mut self) {
-        let Some(ref mut lp) = self.loaded else {
+    /// Reloads agent activity; a change bumps `activity_gen`, which rebuilds the scene.
+    fn refresh_activity(&mut self) {
+        let Some(lp) = self.loaded.as_mut() else {
             return;
         };
-        let visible = compute_visible_mask(
-            &lp.nodes,
-            &self.graph_search,
-            &self.graph_lang_filter,
-            self.graph_code_only,
-        );
-        lp.islands = arrange_structured_islands(&mut lp.nodes, &visible, self.graph_layout_mode);
-        self.needs_fit_view = true;
+        let Ok(db) = Database::open_path(&Path::new(&lp.path).join(".trackertop").join("index.db"))
+        else {
+            return;
+        };
+        let act = load_activity(&db, &lp.graph, Path::new(&lp.path));
+        if activity_fingerprint(&act) != activity_fingerprint(&lp.activity) {
+            lp.activity = act;
+            lp.activity_gen += 1;
+        }
     }
 
     fn start_bg_index(&mut self, repo_path: PathBuf, force: bool, select_after: bool) {
@@ -355,6 +354,8 @@ impl TrackerTopApp {
 
 impl eframe::App for TrackerTopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(debug_assertions)]
+        self.tour_tick(ctx);
         self.poll_background();
 
         if self.last_refresh.elapsed() >= Duration::from_secs(2) && !self.bg_busy {
@@ -377,54 +378,208 @@ impl eframe::App for TrackerTopApp {
                 }
             }
         }
+        if self.last_activity_check.elapsed() >= Duration::from_secs(15) && !self.bg_busy {
+            self.last_activity_check = Instant::now();
+            self.refresh_activity();
+        }
         ctx.request_repaint_after(Duration::from_millis(if self.bg_busy { 100 } else { 750 }));
 
-        apply_soft_modern_theme(ctx);
-        let bg_tex_id = self
-            .backdrop_tex
-            .get_or_insert_with(|| build_smooth_aurora_texture(ctx))
-            .id();
-
-        // Top Header Bar
-        egui::TopBottomPanel::top("top_bar")
+        // Left sidebar: brand, workspace, projects, agent status.
+        let mut to_select: Option<String> = None;
+        let mut to_remove: Option<(String, bool)> = None;
+        egui::SidePanel::left("projects_sidebar")
+            .resizable(true)
+            .default_width(232.0)
+            .min_width(200.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(10, 15, 27))
-                    .inner_margin(Margin::symmetric(18, 12))
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgba_unmultiplied(148, 163, 184, 24),
-                    )),
+                    .fill(T::PANEL)
+                    .inner_margin(Margin::symmetric(10, 14))
+                    .stroke(Stroke::new(1.0_f32, T::BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                    let p = ui.painter();
+                    p.circle_stroke(r.center(), 10.0, Stroke::new(1.0_f32, T::CONTROL_STRONG));
+                    p.circle_stroke(r.center(), 5.5, Stroke::new(1.5_f32, T::ACCENT));
+                    p.circle_filled(r.center(), 2.0, T::ACCENT);
+                    ui.label(T::strong("TrackerTop", 14.0).color(T::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            T::mono(concat!("v", env!("CARGO_PKG_VERSION")), 11.0)
+                                .color(T::TEXT_3),
+                        );
+                    });
+                });
+                ui.add_space(T::S4);
+
+                let all_selected = self.selection == Selection::AllProjects;
+                if sidebar_row(
+                    ui,
+                    all_selected,
+                    None,
+                    "Global workspace",
+                    &self.overview.projects.len().to_string(),
+                )
+                .clicked()
+                {
+                    self.selection = Selection::AllProjects;
+                    self.loaded = None;
+                }
+                ui.add_space(T::S4);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    T::section_label(ui, "Projects");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.bg_busy, T::button("+ Add"))
+                            .on_hover_text("Pin a folder and index it")
+                            .clicked()
+                        {
+                            self.pick_and_add_project();
+                        }
+                    });
+                });
+                ui.add_space(T::S1);
+
+                let footer_h = 74.0;
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - footer_h).max(80.0))
+                    .show(ui, |ui| {
+                        if self.overview.projects.is_empty() {
+                            T::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(T::strong("No projects yet", 12.0).color(T::TEXT));
+                                ui.add_space(T::S1);
+                                ui.label(
+                                    RichText::new(
+                                        "Add a folder above, or open any repo in Claude Code: it appears here automatically.",
+                                    )
+                                    .size(12.0)
+                                    .color(T::TEXT_3),
+                                );
+                            });
+                        }
+                        for snap in &self.overview.projects {
+                            let is_sel = matches!(&self.selection, Selection::Project(p) if p.eq_ignore_ascii_case(&snap.entry.path));
+                            let resp = sidebar_row(
+                                ui,
+                                is_sel,
+                                Some(if is_sel { T::ACCENT } else { T::CONTROL_STRONG }),
+                                &snap.entry.name,
+                                &fmt_num(snap.total_files),
+                            );
+                            let resp = resp.on_hover_text(format!(
+                                "{}\n{} files · {} tok{}\nRight-click to remove",
+                                snap.entry.path,
+                                fmt_num(snap.total_files),
+                                fmt_num(snap.total_repo_tokens),
+                                if snap.stats.total_queries > 0 {
+                                    format!(
+                                        " · saved {} tok ({:.0}%)",
+                                        fmt_num(snap.stats.total_tokens_saved),
+                                        snap.stats.savings_percent
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            ));
+                            if resp.clicked() {
+                                to_select = Some(snap.entry.path.clone());
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Remove from list").clicked() {
+                                    to_remove = Some((snap.entry.path.clone(), false));
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button("Remove and delete local .trackertop cache")
+                                    .clicked()
+                                {
+                                    to_remove = Some((snap.entry.path.clone(), true));
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                    });
+
+                // Agent status card, pinned to the bottom.
+                {
+                    ui.add_space((ui.available_height() - 60.0).max(0.0));
+                    let connected = self.connected_agents.iter().filter(|(_, ok)| *ok).count();
+                    let resp = T::card()
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.vertical(|ui| {
+                            T::dot_label(
+                                ui,
+                                if connected > 0 { T::SUCCESS } else { T::CONTROL_STRONG },
+                                T::strong(
+                                    if connected > 0 {
+                                        format!("{connected} AI agent(s) connected")
+                                    } else {
+                                        "No AI agent connected".to_string()
+                                    },
+                                    12.0,
+                                )
+                                .color(T::TEXT),
+                            );
+                            ui.label(
+                                RichText::new("Manage MCP connections")
+                                    .size(11.0)
+                                    .color(T::TEXT_3),
+                            );
+                            });
+                        })
+                        .response
+                        .interact(Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        self.show_agents_modal = true;
+                    }
+                }
+            });
+
+        if let Some((rem, wipe)) = to_remove {
+            let _ = remove_project_with_cache(&rem, wipe);
+            if matches!(&self.selection, Selection::Project(p) if p.eq_ignore_ascii_case(&rem)) {
+                self.selection = Selection::AllProjects;
+                self.loaded = None;
+            }
+            self.status_banner = if wipe {
+                "Removed project and deleted its local .trackertop index.".to_string()
+            } else {
+                "Removed project from sidebar (local .trackertop cache kept; re-appears if Claude Code opens it).".to_string()
+            };
+            self.reload_overview();
+        }
+        if let Some(sel) = to_select {
+            self.selection = Selection::Project(sel);
+            self.reload_selected_project();
+        }
+
+        // Header: project, branch-free path, index summary, search-free actions.
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(52.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(T::BG)
+                    .inner_margin(Margin::symmetric(20, 0))
+                    .stroke(Stroke::new(1.0_f32, T::BORDER)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    // Glowing brand badge
-                    egui::Frame::NONE
-                        .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 28))
-                        .stroke(Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgba_unmultiplied(56, 189, 248, 90),
-                        ))
-                        .corner_radius(CornerRadius::same(12))
-                        .inner_margin(Margin::symmetric(10, 5))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("TrackerTop")
-                                    .strong()
-                                    .size(16.0)
-                                    .color(Color32::from_rgb(125, 211, 252)),
-                            );
-                        });
-
-                    ui.add_space(10.0);
-
                     match &self.selection {
                         Selection::AllProjects => {
+                            ui.label(T::strong("Global workspace", 14.0).color(T::TEXT));
                             ui.label(
-                                RichText::new("Global Workspace")
-                                    .strong()
-                                    .size(14.5)
-                                    .color(Color32::from_rgb(226, 232, 240)),
+                                RichText::new(format!("{} projects", self.overview.projects.len()))
+                                    .size(12.0)
+                                    .color(T::TEXT_3),
                             );
                         }
                         Selection::Project(path) => {
@@ -432,82 +587,47 @@ impl eframe::App for TrackerTopApp {
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(path);
-                            ui.label(
-                                RichText::new(name)
-                                    .strong()
-                                    .size(15.0)
-                                    .color(Color32::WHITE),
-                            );
-                            ui.label(
-                                RichText::new(path)
-                                    .small()
-                                    .color(Color32::from_rgb(130, 148, 178)),
-                            );
+                            ui.label(T::strong(name, 14.0).color(T::TEXT));
+                            ui.label(T::mono(path, 11.0).color(T::TEXT_3));
+                            if let Some(lp) = &self.loaded {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "· {} files · {} symbols",
+                                        fmt_num(lp.total_files),
+                                        fmt_num(lp.total_symbols)
+                                    ))
+                                    .size(12.0)
+                                    .color(T::TEXT_3),
+                                );
+                            }
                         }
                     }
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let connected_count =
-                            self.connected_agents.iter().filter(|(_, ok)| *ok).count();
-                        let agents_label = if connected_count > 0 {
-                            format!("AI Agents ({connected_count} connected)")
-                        } else {
-                            "Connect AI Agents".to_string()
-                        };
-                        let agents_btn =
-                            egui::Button::new(RichText::new(agents_label).strong().color(
-                                if connected_count > 0 {
-                                    Color32::from_rgb(110, 231, 183)
-                                } else {
-                                    Color32::WHITE
-                                },
-                            ))
-                            .corner_radius(CornerRadius::same(18))
-                            .fill(if connected_count > 0 {
-                                Color32::from_rgba_unmultiplied(16, 185, 129, 34)
-                            } else {
-                                Color32::from_rgb(37, 99, 235)
-                            })
-                            .stroke(Stroke::new(
-                                1.0_f32,
-                                if connected_count > 0 {
-                                    Color32::from_rgba_unmultiplied(52, 211, 153, 110)
-                                } else {
-                                    Color32::from_rgb(96, 165, 250)
-                                },
-                            ));
-                        if ui.add(agents_btn).clicked() {
-                            self.show_agents_modal = true;
-                        }
-
-                        if let Selection::Project(ref p) = self.selection.clone() {
-                            ui.add_space(6.0);
-                            if ui
-                                .add_enabled(
-                                    !self.bg_busy,
-                                    egui::Button::new("Re-Index")
-                                        .corner_radius(CornerRadius::same(16))
-                                        .fill(Color32::from_rgba_unmultiplied(30, 41, 59, 180)),
-                                )
+                        if let Selection::Project(ref p) = self.selection.clone()
+                            && ui
+                                .add_enabled(!self.bg_busy, T::button("Re-index"))
+                                .on_hover_text("Rebuild this project's index from scratch")
                                 .clicked()
-                            {
-                                self.start_bg_index(PathBuf::from(p), true, false);
-                            }
+                        {
+                            self.start_bg_index(PathBuf::from(p), true, false);
+                        }
+                        let connected = self.connected_agents.iter().filter(|(_, ok)| *ok).count();
+                        if connected == 0
+                            && ui.add(T::primary_button("Connect AI agents")).clicked()
+                        {
+                            self.show_agents_modal = true;
                         }
                     });
                 });
             });
 
-        // Bottom Status Bar
+        // Status bar.
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(8, 12, 22))
-                    .inner_margin(Margin::symmetric(16, 6))
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgba_unmultiplied(148, 163, 184, 18),
-                    )),
+                    .fill(T::PANEL)
+                    .inner_margin(Margin::symmetric(16, 5))
+                    .stroke(Stroke::new(1.0_f32, T::BORDER)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -516,8 +636,8 @@ impl eframe::App for TrackerTopApp {
                     }
                     ui.label(
                         RichText::new(&self.status_banner)
-                            .small()
-                            .color(Color32::from_rgb(148, 163, 184)),
+                            .size(11.0)
+                            .color(T::TEXT_3),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let langs: Vec<String> = default_registry()
@@ -525,244 +645,20 @@ impl eframe::App for TrackerTopApp {
                             .into_iter()
                             .map(|l| l.display_name)
                             .collect();
-                        ui.label(
-                            RichText::new(format!("Open Core: {}", langs.join(" · ")))
-                                .small()
-                                .color(Color32::from_rgb(100, 116, 139)),
-                        );
+                        ui.label(RichText::new(langs.join(" · ")).size(11.0).color(T::TEXT_3));
                     });
                 });
             });
 
-        // Left Sidebar: Soft Rounded Multi-Project Switcher
-        egui::SidePanel::left("projects_sidebar")
-            .resizable(true)
-            .default_width(260.0)
-            .min_width(215.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(Color32::from_rgb(10, 15, 27))
-                    .inner_margin(Margin::same(14))
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgba_unmultiplied(148, 163, 184, 20),
-                    )),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("PROJECTS")
-                            .strong()
-                            .small()
-                            .color(Color32::from_rgb(130, 148, 178)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let add_btn = egui::Button::new(
-                            RichText::new("+ Add")
-                                .strong()
-                                .color(Color32::from_rgb(125, 211, 252)),
-                        )
-                        .corner_radius(CornerRadius::same(14))
-                        .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 24))
-                        .stroke(Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgba_unmultiplied(56, 189, 248, 80),
-                        ));
-                        if ui.add_enabled(!self.bg_busy, add_btn).clicked() {
-                            self.pick_and_add_project();
-                        }
-                    });
-                });
-                ui.add_space(10.0);
-
-                // All Projects pill
-                let all_selected = self.selection == Selection::AllProjects;
-                let all_btn = egui::Button::new(
-                    RichText::new(format!("All Projects  ({})", self.overview.projects.len()))
-                        .strong()
-                        .color(if all_selected {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(203, 213, 225)
-                        }),
-                )
-                .min_size(Vec2::new(ui.available_width(), 38.0))
-                .corner_radius(CornerRadius::same(14))
-                .fill(if all_selected {
-                    Color32::from_rgba_unmultiplied(56, 189, 248, 42)
-                } else {
-                    Color32::from_rgba_unmultiplied(30, 41, 59, 110)
-                })
-                .stroke(Stroke::new(
-                    1.0_f32,
-                    if all_selected {
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 140)
-                    } else {
-                        Color32::from_rgba_unmultiplied(148, 163, 184, 24)
-                    },
-                ));
-                if ui.add(all_btn).clicked() {
-                    self.selection = Selection::AllProjects;
-                    self.loaded = None;
-                }
-
-                ui.add_space(10.0);
-
-                let mut to_select: Option<String> = None;
-                let mut to_remove: Option<(String, bool)> = None;
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if self.overview.projects.is_empty() {
-                        soft_card_frame(12).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                RichText::new("No projects pinned yet.")
-                                    .strong()
-                                    .small()
-                                    .color(Color32::from_rgb(203, 213, 225)),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(
-                                    "Add a folder above, or just open any repo in Claude Code — it appears here automatically.",
-                                )
-                                .small()
-                                .color(Color32::from_rgb(130, 148, 178)),
-                            );
-                        });
-                    }
-
-                    for snap in &self.overview.projects {
-                        let is_sel = matches!(&self.selection, Selection::Project(p) if p.eq_ignore_ascii_case(&snap.entry.path));
-                        let frame = egui::Frame::NONE
-                            .fill(if is_sel {
-                                Color32::from_rgba_unmultiplied(56, 189, 248, 32)
-                            } else {
-                                Color32::from_rgba_unmultiplied(22, 31, 49, 185)
-                            })
-                            .stroke(Stroke::new(
-                                1.0_f32,
-                                if is_sel {
-                                    Color32::from_rgba_unmultiplied(56, 189, 248, 150)
-                                } else {
-                                    Color32::from_rgba_unmultiplied(148, 163, 184, 24)
-                                },
-                            ))
-                            .corner_radius(CornerRadius::same(14))
-                            .inner_margin(Margin::same(11));
-
-                        frame.show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let dot_col = if snap.stats.total_tokens_saved > 0 {
-                                    Color32::from_rgb(52, 211, 153)
-                                } else {
-                                    Color32::from_rgb(56, 189, 248)
-                                };
-                                let (dot_rect, _) =
-                                    ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                ui.painter().circle_filled(dot_rect.center(), 4.0, dot_col);
-
-                                let title = ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&snap.entry.name)
-                                            .strong()
-                                            .color(Color32::WHITE),
-                                    )
-                                    .sense(Sense::click()),
-                                );
-                                if title.clicked() {
-                                    to_select = Some(snap.entry.path.clone());
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(RichText::new("×").small())
-                                                    .corner_radius(CornerRadius::same(10))
-                                                    .fill(Color32::TRANSPARENT),
-                                            )
-                                            .on_hover_text(
-                                                "Remove from list (Shift+Click to also delete local .trackertop cache)",
-                                            )
-                                            .clicked()
-                                        {
-                                            let wipe = ui.input(|i| i.modifiers.shift);
-                                            to_remove = Some((snap.entry.path.clone(), wipe));
-                                        }
-                                    },
-                                );
-                            });
-
-                            ui.add_space(3.0);
-                            let subtitle = if snap.stats.total_queries > 0 {
-                                format!(
-                                    "{} files · saved {} tok ({:.0}%)",
-                                    snap.total_files,
-                                    fmt_num(snap.stats.total_tokens_saved),
-                                    snap.stats.savings_percent
-                                )
-                            } else {
-                                format!(
-                                    "{} files · {} tok · Ready",
-                                    snap.total_files,
-                                    fmt_num(snap.total_repo_tokens)
-                                )
-                            };
-                            let sub_resp = ui.add(
-                                egui::Label::new(
-                                    RichText::new(subtitle)
-                                        .small()
-                                        .color(if snap.stats.total_tokens_saved > 0 {
-                                            Color32::from_rgb(110, 231, 183)
-                                        } else {
-                                            Color32::from_rgb(148, 163, 184)
-                                        }),
-                                )
-                                .sense(Sense::click()),
-                            );
-                            if sub_resp.clicked() {
-                                to_select = Some(snap.entry.path.clone());
-                            }
-                        });
-                        ui.add_space(8.0);
-                    }
-                });
-
-                if let Some((rem, wipe)) = to_remove {
-                    let _ = remove_project_with_cache(&rem, wipe);
-                    if matches!(&self.selection, Selection::Project(p) if p.eq_ignore_ascii_case(&rem))
-                    {
-                        self.selection = Selection::AllProjects;
-                        self.loaded = None;
-                    }
-                    self.status_banner = if wipe {
-                        "Removed project and deleted its local .trackertop index.".to_string()
-                    } else {
-                        "Removed project from sidebar (local .trackertop cache kept; re-appears if Claude Code opens it).".to_string()
-                    };
-                    self.reload_overview();
-                }
-                if let Some(sel) = to_select {
-                    self.selection = Selection::Project(sel);
-                    self.reload_selected_project();
-                }
-            });
-
-        // Main Central Panel with Ambient Radial Glow Backdrop
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(Color32::from_rgb(7, 11, 20))
-                    .inner_margin(Margin::same(18)),
-            )
-            .show(ctx, |ui| {
-                paint_smooth_aurora(ui.painter(), ui.max_rect(), bg_tex_id);
-                match &self.selection {
-                    Selection::AllProjects => self.render_all_projects(ui),
-                    Selection::Project(_) => self.render_single_project(ui),
+            .frame(egui::Frame::NONE.fill(T::BG).inner_margin(Margin::ZERO))
+            .show(ctx, |ui| match &self.selection {
+                Selection::AllProjects => {
+                    egui::Frame::NONE
+                        .inner_margin(Margin::same(20))
+                        .show(ui, |ui| self.render_all_projects(ui));
                 }
+                Selection::Project(_) => self.render_single_project(ui),
             });
 
         if self.show_agents_modal {
@@ -782,12 +678,12 @@ impl TrackerTopApp {
             .fixed_size(Vec2::new(520.0, 420.0))
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(15, 22, 38))
+                    .fill(T::PANEL)
                     .stroke(Stroke::new(
                         1.0_f32,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 90),
+                        T::ACCENT_LINE,
                     ))
-                    .corner_radius(CornerRadius::same(18))
+                    .corner_radius(CornerRadius::same(T::R_CARD))
                     .inner_margin(Margin::same(20)),
             )
             .show(ctx, |ui| {
@@ -796,7 +692,7 @@ impl TrackerTopApp {
                         "Connect TrackerTop once globally — every repository you open in any connected AI agent is indexed and tracked automatically.",
                     )
                     .small()
-                    .color(Color32::from_rgb(148, 163, 184)),
+                    .color(T::TEXT_3),
                 );
                 ui.add_space(12.0);
 
@@ -815,29 +711,29 @@ impl TrackerTopApp {
                             ui.vertical(|ui| {
                                 ui.label(
                                     RichText::new(agent.display_name())
-                                        .strong()
+                                        .family(T::semibold_family())
                                         .color(Color32::WHITE),
                                 );
                                 ui.label(
                                     RichText::new(agent.description())
                                         .small()
-                                        .color(Color32::from_rgb(130, 148, 178)),
+                                        .color(T::TEXT_3),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let label = if connected { "Connected ✓" } else { "Connect" };
-                                let btn = egui::Button::new(RichText::new(label).strong().color(
+                                let btn = egui::Button::new(RichText::new(label).family(T::semibold_family()).color(
                                     if connected {
-                                        Color32::from_rgb(110, 231, 183)
+                                        T::SUCCESS
                                     } else {
                                         Color32::WHITE
                                     },
                                 ))
-                                .corner_radius(CornerRadius::same(14))
+                                .corner_radius(CornerRadius::same(T::R_CARD))
                                 .fill(if connected {
-                                    Color32::from_rgba_unmultiplied(16, 185, 129, 32)
+                                    T::CARD
                                 } else {
-                                    Color32::from_rgb(37, 99, 235)
+                                    T::ACCENT
                                 });
                                 if ui.add(btn).clicked() {
                                     agent_to_install = Some(agent);
@@ -866,14 +762,14 @@ impl TrackerTopApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("Other MCP Clients (VS Code, Zed, Cline, Antigravity)")
-                                .strong()
+                                .family(T::semibold_family())
                                 .small(),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add(
                                     egui::Button::new("Copy MCP JSON")
-                                        .corner_radius(CornerRadius::same(14)),
+                                        .corner_radius(CornerRadius::same(T::R_CARD)),
                                 )
                                 .clicked()
                             {
@@ -900,31 +796,31 @@ impl TrackerTopApp {
                     fmt_num(ov.total_symbols)
                 ),
                 Color32::WHITE,
-                Color32::from_rgb(129, 140, 248),
+                T::ACCENT,
             );
             glow_kpi_card(
                 &mut cols[1],
                 "TOTAL AI QUERIES",
                 &fmt_num(ov.total_queries),
                 &format!("Sent {} tok", fmt_num(ov.total_tokens_sent)),
-                Color32::from_rgb(125, 211, 252),
-                Color32::from_rgb(56, 189, 248),
+                T::ACCENT,
+                T::ACCENT,
             );
             glow_kpi_card(
                 &mut cols[2],
                 "NET TOKENS SAVED",
                 &fmt_num(ov.total_tokens_saved),
                 &format!("{:.1}% reduction vs raw reads", ov.savings_percent),
-                Color32::from_rgb(110, 231, 183),
-                Color32::from_rgb(52, 211, 153),
+                T::SUCCESS,
+                T::SUCCESS,
             );
             glow_kpi_card(
                 &mut cols[3],
                 "EST. USD SAVED",
                 &format!("${:.4}", ov.est_usd_saved_sonnet),
                 &format!("Sonnet · ${:.4} Opus", ov.est_usd_saved_opus),
-                Color32::from_rgb(110, 231, 183),
-                Color32::from_rgb(16, 185, 129),
+                T::SUCCESS,
+                T::SUCCESS,
             );
         });
 
@@ -939,7 +835,7 @@ impl TrackerTopApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("Welcome to TrackerTop")
-                            .strong()
+                            .family(T::semibold_family())
                             .size(20.0)
                             .color(Color32::WHITE),
                     );
@@ -948,18 +844,18 @@ impl TrackerTopApp {
                         RichText::new(
                             "Add any project folder to inspect its architecture and token savings, or simply open a repository in Claude Code — TrackerTop tracks it automatically in the background.",
                         )
-                        .color(Color32::from_rgb(148, 163, 184)),
+                        .color(T::TEXT_3),
                     );
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.add_space(100.0);
                         let add = egui::Button::new(
                             RichText::new("+ Add Your First Project")
-                                .strong()
+                                .family(T::semibold_family())
                                 .color(Color32::WHITE),
                         )
-                        .corner_radius(CornerRadius::same(18))
-                        .fill(Color32::from_rgb(37, 99, 235));
+                        .corner_radius(CornerRadius::same(T::R_CARD))
+                        .fill(T::ACCENT);
                         if ui.add(add).clicked() {
                             self.pick_and_add_project();
                         }
@@ -967,7 +863,7 @@ impl TrackerTopApp {
                         if ui
                             .add(
                                 egui::Button::new("Connect AI Agents")
-                                    .corner_radius(CornerRadius::same(18)),
+                                    .corner_radius(CornerRadius::same(T::R_CARD)),
                             )
                             .clicked()
                         {
@@ -985,9 +881,9 @@ impl TrackerTopApp {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new("PROJECTS BREAKDOWN")
-                    .strong()
+                    .family(T::semibold_family())
                     .small()
-                    .color(Color32::from_rgb(148, 163, 184)),
+                    .color(T::TEXT_3),
             );
             ui.add_space(10.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1007,27 +903,32 @@ impl TrackerTopApp {
                         ] {
                             ui.label(
                                 RichText::new(h)
-                                    .strong()
+                                    .family(T::semibold_family())
                                     .small()
-                                    .color(Color32::from_rgb(130, 148, 178)),
+                                    .color(T::TEXT_3),
                             );
                         }
                         ui.end_row();
 
                         for p in &ov.projects {
-                            ui.label(RichText::new(&p.entry.name).strong().color(Color32::WHITE));
+                            ui.label(
+                                RichText::new(&p.entry.name)
+                                    .family(T::semibold_family())
+                                    .color(Color32::WHITE),
+                            );
                             ui.label(fmt_num(p.total_files));
                             ui.label(fmt_num(p.total_repo_tokens));
                             ui.label(fmt_num(p.stats.total_queries));
                             ui.label(
                                 RichText::new(fmt_num(p.stats.total_tokens_saved))
-                                    .strong()
-                                    .color(Color32::from_rgb(110, 231, 183)),
+                                    .family(T::semibold_family())
+                                    .color(T::SUCCESS),
                             );
                             ui.label(format!("{:.1}%", p.stats.savings_percent));
                             if ui
                                 .add(
-                                    egui::Button::new("Open").corner_radius(CornerRadius::same(14)),
+                                    egui::Button::new("Open")
+                                        .corner_radius(CornerRadius::same(T::R_CARD)),
                                 )
                                 .clicked()
                             {
@@ -1046,67 +947,66 @@ impl TrackerTopApp {
     }
 
     fn render_single_project(&mut self, ui: &mut egui::Ui) {
-        // Floating Rounded Pill Tab Bar
-        egui::Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(15, 23, 42, 200))
-            .stroke(Stroke::new(
-                1.0_f32,
-                Color32::from_rgba_unmultiplied(148, 163, 184, 28),
-            ))
-            .corner_radius(CornerRadius::same(20))
-            .inner_margin(Margin::symmetric(6, 5))
-            .show(ui, |ui| {
+        // Tab bar: underlined tabs with counts.
+        let (bar, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 41.0), Sense::hover());
+        ui.painter().line_segment(
+            [bar.left_bottom(), bar.right_bottom()],
+            Stroke::new(1.0_f32, T::BORDER),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(20.0, 0.0))),
+            |ui| {
                 ui.horizontal(|ui| {
-                    for (tab, label) in [
-                        (ProjectTab::Savings, "Overview & Savings"),
-                        (ProjectTab::Graph, "Code Graph"),
-                        (ProjectTab::Architecture, "Architecture & Health"),
-                        (ProjectTab::Memory, "AI Memory"),
+                    ui.spacing_mut().item_spacing.x = 22.0;
+                    let (files, notes) = self
+                        .loaded
+                        .as_ref()
+                        .map(|l| {
+                            (
+                                Some(fmt_num(l.total_files)),
+                                Some(l.notes.len().to_string()),
+                            )
+                        })
+                        .unwrap_or((None, None));
+                    for (tab, label, count) in [
+                        (ProjectTab::Savings, "Savings", None),
+                        (ProjectTab::Graph, "Code Graph", files),
+                        (ProjectTab::Architecture, "Architecture", None),
+                        (ProjectTab::Memory, "Memory", notes),
                     ] {
                         let active = self.active_tab == tab;
-                        let btn = egui::Button::new(
-                            RichText::new(label).strong().size(13.5).color(if active {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(148, 163, 184)
-                            }),
-                        )
-                        .corner_radius(CornerRadius::same(16))
-                        .fill(if active {
-                            Color32::from_rgba_unmultiplied(56, 189, 248, 52)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .stroke(if active {
-                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 140))
-                        } else {
-                            Stroke::NONE
-                        });
-                        if ui.add(btn).clicked() {
-                            if tab == ProjectTab::Graph && self.active_tab != ProjectTab::Graph {
-                                self.needs_fit_view = true;
-                            }
+                        if T::tab(ui, label, count, active).clicked() {
                             self.active_tab = tab;
                         }
                     }
                 });
-            });
-
-        ui.add_space(12.0);
+            },
+        );
 
         if self.loaded.is_none() {
-            soft_card_frame(16).show(ui, |ui| {
-                ui.label("Project is not indexed yet. Click 'Re-Index' in the top bar.");
-            });
+            egui::Frame::NONE
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    T::card().show(ui, |ui| {
+                        ui.label("This project is not indexed yet. Click Re-index in the header.");
+                    });
+                });
             return;
         }
 
-        match self.active_tab {
-            ProjectTab::Savings => self.render_savings_tab(ui),
-            ProjectTab::Graph => self.render_graph_tab(ui),
-            ProjectTab::Architecture => self.render_architecture_tab(ui),
-            ProjectTab::Memory => self.render_memory_tab(ui),
+        if self.active_tab == ProjectTab::Graph {
+            self.render_graph_tab(ui);
+            return;
         }
+        egui::Frame::NONE
+            .inner_margin(Margin::same(20))
+            .show(ui, |ui| match self.active_tab {
+                ProjectTab::Savings => self.render_savings_tab(ui),
+                ProjectTab::Architecture => self.render_architecture_tab(ui),
+                ProjectTab::Memory => self.render_memory_tab(ui),
+                ProjectTab::Graph => {}
+            });
     }
 
     fn render_savings_tab(&mut self, ui: &mut egui::Ui) {
@@ -1131,16 +1031,16 @@ impl TrackerTopApp {
                     "{:.0}–{:.0}% · conservative–upper · AI agents only",
                     s.conservative_savings_percent, s.savings_percent
                 ),
-                Color32::from_rgb(110, 231, 183),
-                Color32::from_rgb(52, 211, 153),
+                T::SUCCESS,
+                T::SUCCESS,
             );
             glow_kpi_card(
                 &mut cols[1],
                 "SENT VS BASELINE",
                 &fmt_num(s.total_tokens_sent),
                 &format!("vs {} raw baseline tok", fmt_num(s.total_baseline_tokens)),
-                Color32::from_rgb(125, 211, 252),
-                Color32::from_rgb(56, 189, 248),
+                T::ACCENT,
+                T::ACCENT,
             );
             glow_kpi_card(
                 &mut cols[2],
@@ -1152,15 +1052,15 @@ impl TrackerTopApp {
                     fmt_num(lp.total_repo_tokens)
                 ),
                 Color32::WHITE,
-                Color32::from_rgb(129, 140, 248),
+                T::ACCENT,
             );
             glow_kpi_card(
                 &mut cols[3],
                 "EST. USD SAVED",
                 &format!("${:.4}", s.est_usd_saved_sonnet),
                 &format!("Sonnet · ${:.4} Opus", s.est_usd_saved_opus),
-                Color32::from_rgb(110, 231, 183),
-                Color32::from_rgb(16, 185, 129),
+                T::SUCCESS,
+                T::SUCCESS,
             );
         });
 
@@ -1168,12 +1068,12 @@ impl TrackerTopApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             if s.total_queries == 0 {
                 egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(16, 185, 129, 22))
+                    .fill(T::CARD)
                     .stroke(Stroke::new(
                         1.0_f32,
-                        Color32::from_rgba_unmultiplied(52, 211, 153, 95),
+                        T::SUCCESS,
                     ))
-                    .corner_radius(CornerRadius::same(16))
+                    .corner_radius(CornerRadius::same(T::R_CARD))
                     .inner_margin(Margin::same(16))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -1184,25 +1084,25 @@ impl TrackerTopApp {
                                 fmt_num(lp.total_symbols),
                                 fmt_num(lp.total_repo_tokens)
                             ))
-                            .strong()
+                            .family(T::semibold_family())
                             .size(14.5)
-                            .color(Color32::from_rgb(110, 231, 183)),
+                            .color(T::SUCCESS),
                         );
                         ui.add_space(5.0);
                         ui.label(
                             RichText::new(
                                 "TrackerTop works immediately on any existing or new project. Open this folder in Claude Code (or Cursor / Codex) and ask a question — real token savings will stream in automatically.",
                             )
-                            .color(Color32::from_rgb(203, 213, 225)),
+                            .color(T::TEXT_2),
                         );
                         ui.add_space(10.0);
                         let test_btn = egui::Button::new(
                             RichText::new("Preview Savings (Dry-Run)")
-                                .strong()
+                                .family(T::semibold_family())
                                 .color(Color32::WHITE),
                         )
-                        .corner_radius(CornerRadius::same(16))
-                        .fill(Color32::from_rgb(16, 185, 129));
+                        .corner_radius(CornerRadius::same(T::R_CARD))
+                        .fill(T::SUCCESS);
                         if ui
                             .add(test_btn)
                             .on_hover_text("Simulates an AI repo_map query without inflating your real stats counter")
@@ -1222,12 +1122,12 @@ impl TrackerTopApp {
                     0.0
                 };
                 egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 22))
+                    .fill(T::ACCENT_SOFT)
                     .stroke(Stroke::new(
                         1.0_f32,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 110),
+                        T::ACCENT_LINE,
                     ))
-                    .corner_radius(CornerRadius::same(16))
+                    .corner_radius(CornerRadius::same(T::R_CARD))
                     .inner_margin(Margin::same(15))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -1240,13 +1140,13 @@ impl TrackerTopApp {
                                     pct,
                                     prev.latency_ms
                                 ))
-                                .strong()
+                                .family(T::semibold_family())
                                 .small()
-                                .color(Color32::from_rgb(125, 211, 252)),
+                                .color(T::ACCENT),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui
-                                    .add(egui::Button::new("Close").corner_radius(CornerRadius::same(12)))
+                                    .add(egui::Button::new("Close").corner_radius(CornerRadius::same(T::R_CARD)))
                                     .clicked()
                                 {
                                     clear_preview = true;
@@ -1262,7 +1162,7 @@ impl TrackerTopApp {
                                     RichText::new(&prev.text)
                                         .monospace()
                                         .small()
-                                        .color(Color32::from_rgb(203, 213, 225)),
+                                        .color(T::TEXT_2),
                                 );
                             });
                     });
@@ -1274,9 +1174,9 @@ impl TrackerTopApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("SAVINGS BY MCP TOOL (REAL AI USAGE)")
-                            .strong()
+                            .family(T::semibold_family())
                             .small()
-                            .color(Color32::from_rgb(148, 163, 184)),
+                            .color(T::TEXT_3),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if s.total_queries > 0 {
@@ -1285,9 +1185,9 @@ impl TrackerTopApp {
                                     egui::Button::new(
                                         RichText::new("Reset Stats")
                                             .small()
-                                            .color(Color32::from_rgb(252, 165, 165)),
+                                            .color(T::DANGER),
                                     )
-                                    .corner_radius(CornerRadius::same(14)),
+                                    .corner_radius(CornerRadius::same(T::R_CARD)),
                                 )
                                 .on_hover_text("Clear recorded telemetry back to 0 for this project")
                                 .clicked()
@@ -1298,7 +1198,7 @@ impl TrackerTopApp {
                             if ui
                                 .add(
                                     egui::Button::new("Preview Savings")
-                                        .corner_radius(CornerRadius::same(14)),
+                                        .corner_radius(CornerRadius::same(T::R_CARD)),
                                 )
                                 .on_hover_text("Dry-run preview — does NOT add to your real token savings counter")
                                 .clicked()
@@ -1312,7 +1212,7 @@ impl TrackerTopApp {
                 if s.by_tool.is_empty() {
                     ui.label(
                         RichText::new("Waiting for the first real AI query in this project...")
-                            .color(Color32::from_rgb(130, 148, 178)),
+                            .color(T::TEXT_3),
                     );
                 } else {
                     for t in &s.by_tool {
@@ -1320,7 +1220,7 @@ impl TrackerTopApp {
                             ui.label(
                                 RichText::new(format!("{} ({}x)", t.tool, t.queries))
                                     .monospace()
-                                    .strong(),
+                                    .family(T::semibold_family()),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(
@@ -1329,8 +1229,8 @@ impl TrackerTopApp {
                                         fmt_num(t.tokens_saved),
                                         t.savings_percent
                                     ))
-                                    .strong()
-                                    .color(Color32::from_rgb(110, 231, 183)),
+                                    .family(T::semibold_family())
+                                    .color(T::SUCCESS),
                                 );
                             });
                         });
@@ -1339,7 +1239,7 @@ impl TrackerTopApp {
                             egui::ProgressBar::new(frac)
                                 .desired_height(9.0)
                                 .corner_radius(CornerRadius::same(5))
-                                .fill(Color32::from_rgb(52, 211, 153)),
+                                .fill(T::SUCCESS),
                         );
                         ui.add_space(8.0);
                     }
@@ -1352,9 +1252,9 @@ impl TrackerTopApp {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new("LIVE AI QUERY LOG")
-                        .strong()
+                        .family(T::semibold_family())
                         .small()
-                        .color(Color32::from_rgb(148, 163, 184)),
+                        .color(T::TEXT_3),
                 );
                 ui.add_space(8.0);
                 if s.recent.is_empty() {
@@ -1362,7 +1262,7 @@ impl TrackerTopApp {
                         RichText::new(
                             "Live queries from Claude Code, Cursor, or Codex stream in here every 2 seconds.",
                         )
-                        .color(Color32::from_rgb(130, 148, 178)),
+                        .color(T::TEXT_3),
                     );
                 } else {
                     egui::Grid::new("recent_queries_grid")
@@ -1372,9 +1272,9 @@ impl TrackerTopApp {
                             for h in ["Tool", "Query", "Sent", "Baseline", "Saved", "Latency"] {
                                 ui.label(
                                     RichText::new(h)
-                                        .strong()
+                                        .family(T::semibold_family())
                                         .small()
-                                        .color(Color32::from_rgb(130, 148, 178)),
+                                        .color(T::TEXT_3),
                                 );
                             }
                             ui.end_row();
@@ -1387,7 +1287,7 @@ impl TrackerTopApp {
                                 ui.label(
                                     RichText::new(&r.tool)
                                         .monospace()
-                                        .color(Color32::from_rgb(125, 211, 252)),
+                                        .color(T::ACCENT),
                                 );
                                 ui.label(truncate_label(&r.query, 40));
                                 ui.label(fmt_num(r.tokens_sent));
@@ -1398,7 +1298,7 @@ impl TrackerTopApp {
                                         fmt_num(r.tokens_saved),
                                         pct
                                     ))
-                                    .color(Color32::from_rgb(110, 231, 183)),
+                                    .color(T::SUCCESS),
                                 );
                                 ui.label(format!("{} ms", r.latency_ms));
                                 ui.end_row();
@@ -1420,863 +1320,575 @@ impl TrackerTopApp {
     }
 
     fn render_graph_tab(&mut self, ui: &mut egui::Ui) {
-        let mut layout_dirty = false;
-
-        // Floating rounded toolbar
-        soft_card_frame(16).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.graph_search)
-                        .desired_width(165.0)
-                        .hint_text("Search file or symbol..."),
-                );
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    layout_dirty = true;
-                }
-
-                let prev_lang = self.graph_lang_filter.clone();
-                egui::ComboBox::from_id_salt("lang_filter")
-                    .selected_text(if self.graph_lang_filter == "all" {
-                        "All Languages".to_string()
-                    } else {
-                        default_registry().display_name_for(&self.graph_lang_filter)
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.graph_lang_filter,
-                            "all".to_string(),
-                            "All Languages",
-                        );
-                        for l in default_registry().languages() {
-                            ui.selectable_value(&mut self.graph_lang_filter, l.id, l.display_name);
-                        }
-                    });
-                if self.graph_lang_filter != prev_lang {
-                    layout_dirty = true;
-                }
-
-                if ui
-                    .checkbox(&mut self.graph_code_only, "Code Only (hide .toml/.md)")
-                    .changed()
-                {
-                    layout_dirty = true;
-                }
-
-                let prev_layout = self.graph_layout_mode;
-                egui::ComboBox::from_id_salt("layout_mode")
-                    .selected_text(match self.graph_layout_mode {
-                        GraphLayoutMode::Folders => "Layout: Folders",
-                        GraphLayoutMode::Clusters => "Layout: Clusters",
-                        GraphLayoutMode::Nested => "Layout: Nested",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.graph_layout_mode,
-                            GraphLayoutMode::Folders,
-                            "Layout: Folders",
-                        );
-                        ui.selectable_value(
-                            &mut self.graph_layout_mode,
-                            GraphLayoutMode::Clusters,
-                            "Layout: Clusters",
-                        );
-                        ui.selectable_value(
-                            &mut self.graph_layout_mode,
-                            GraphLayoutMode::Nested,
-                            "Layout: Nested",
-                        )
-                        .on_hover_text(
-                            "Project → communities → files → symbols, one level at a time",
-                        );
-                    });
-                if self.graph_layout_mode != prev_layout {
-                    layout_dirty = true;
-                }
-
-                egui::ComboBox::from_id_salt("color_mode")
-                    .selected_text(match self.graph_color_mode {
-                        GraphColorMode::Language => "Color: Language",
-                        GraphColorMode::Cluster => "Color: Cluster",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.graph_color_mode,
-                            GraphColorMode::Language,
-                            "Color: Language",
-                        );
-                        ui.selectable_value(
-                            &mut self.graph_color_mode,
-                            GraphColorMode::Cluster,
-                            "Color: Cluster",
-                        );
-                    });
-
-                if ui
-                    .add(egui::Button::new("Fit View").corner_radius(CornerRadius::same(14)))
-                    .clicked()
-                {
-                    self.needs_fit_view = true;
-                }
-            });
-        });
-
-        if layout_dirty {
-            self.recompute_graph_layout();
-        }
-        ui.add_space(10.0);
-
-        if self.graph_layout_mode == GraphLayoutMode::Nested {
-            self.render_nested_graph(ui);
+        if self.loaded.is_none() {
             return;
         }
-
-        let avail = ui.available_size();
-        let inspector_w = if self.selected_node_idx.is_some() {
-            300.0
-        } else {
-            0.0
-        };
-        let canvas_w = (avail.x - inspector_w - 10.0).max(240.0);
-
-        ui.horizontal_top(|ui| {
-            let (rect, resp) = ui.allocate_exact_size(
-                Vec2::new(canvas_w, (avail.y - 6.0).max(200.0)),
-                Sense::click_and_drag(),
-            );
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(9, 13, 24));
-            if let Some(ref tex) = self.backdrop_tex {
-                paint_smooth_aurora(&painter, rect, tex.id());
+        // Nested view of the current level (cached per project and level).
+        if self.graph_layout_mode == GraphLayoutMode::Nested {
+            let lp = self.loaded.as_ref().expect("checked above");
+            let key = (lp.path.clone(), self.nested_level.clone());
+            if self.nested_cache.as_ref().map(|(k, _)| k) != Some(&key) {
+                let view = NestedGraph::new(&lp.graph)
+                    .view(&self.nested_level)
+                    .map_err(|e| e.to_string());
+                self.nested_cache = Some((key, view));
             }
-            painter.rect_stroke(
-                rect,
-                CornerRadius::same(18),
-                Stroke::new(
-                    1.0_f32,
-                    Color32::from_rgba_unmultiplied(148, 163, 184, 34),
-                ),
-                StrokeKind::Inside,
-            );
-
-            let center = rect.center();
-            let reg = default_registry();
-
-            if let Some(ref mut lp) = self.loaded {
-                let visible = compute_visible_mask(
-                    &lp.nodes,
-                    &self.graph_search,
-                    &self.graph_lang_filter,
-                    self.graph_code_only,
-                );
-
-                if self.needs_fit_view {
-                    let (min_x, max_x, min_y, max_y) =
-                        compute_bounds(&lp.nodes, &lp.islands, &visible);
-                    let span_x = (max_x - min_x).max(160.0);
-                    let span_y = (max_y - min_y).max(160.0);
-                    let fit_x = (rect.width() - 68.0) / span_x;
-                    let fit_y = (rect.height() - 68.0) / span_y;
-                    self.cam_zoom = fit_x.min(fit_y).clamp(0.12, 2.2);
-                    self.cam_offset = Vec2::new(-(min_x + max_x) * 0.5, -(min_y + max_y) * 0.5);
-                    self.needs_fit_view = false;
+        }
+        let scene_key = self.scene_key();
+        if self.scene.as_ref().map(|(k, _)| k) != Some(&scene_key) {
+            let lp = self.loaded.as_ref().expect("checked above");
+            let scene = match self.graph_layout_mode {
+                GraphLayoutMode::Nested => match self.nested_cache.as_ref().map(|(_, v)| v) {
+                    Some(Ok(view)) => Some(nested_scene(lp, view)),
+                    _ => None,
+                },
+                mode => {
+                    let visible = compute_visible_mask(
+                        &lp.nodes,
+                        &self.graph_search,
+                        &self.graph_lang_filter,
+                        self.graph_code_only,
+                    );
+                    Some(all_files_scene(
+                        lp,
+                        mode == GraphLayoutMode::Folders,
+                        &visible,
+                    ))
                 }
+            };
+            self.scene = scene.map(|s| (scene_key, s));
+        }
 
-                let to_screen = |wx: f32, wy: f32, cam_off: Vec2, zoom: f32| -> Pos2 {
-                    Pos2::new(
-                        center.x + (wx + cam_off.x) * zoom,
-                        center.y + (wy + cam_off.y) * zoom,
-                    )
-                };
+        let full = ui.available_rect_before_wrap();
+        let mut next_level: Option<(NestedLevel, Option<Pos2>, Option<String>, bool)> = None;
 
-                if resp.hovered() {
-                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
-                    if scroll.abs() > 0.1 {
-                        let factor = if scroll > 0.0 { 1.12 } else { 0.89 };
-                        self.cam_zoom = (self.cam_zoom * factor).clamp(0.10, 4.0);
+        // Toolbar.
+        let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), 48.0));
+        ui.painter().line_segment(
+            [bar.left_bottom(), bar.right_bottom()],
+            Stroke::new(1.0_f32, T::BORDER),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(16.0, 0.0))),
+            |ui| {
+                ui.horizontal_centered(|ui| {
+                    let modes = [
+                        GraphLayoutMode::Nested,
+                        GraphLayoutMode::Clusters,
+                        GraphLayoutMode::Folders,
+                    ];
+                    let cur = modes
+                        .iter()
+                        .position(|m| *m == self.graph_layout_mode)
+                        .unwrap_or(0);
+                    if let Some(i) = T::segmented(ui, &["Nested", "Clusters", "Folders"], cur)
+                        && i != cur
+                    {
+                        self.graph_layout_mode = modes[i];
+                        self.graph_view.begin_transition(None, None, false);
                     }
-                }
-
-                let pointer_pos = resp.hover_pos().or_else(|| resp.interact_pointer_pos());
-                let hovered_node = pointer_pos.and_then(|pos| {
-                    lp.nodes.iter().enumerate().rev().find_map(|(idx, n)| {
-                        if !visible[idx] {
-                            return None;
+                    ui.add_space(T::S2);
+                    if self.graph_layout_mode == GraphLayoutMode::Nested {
+                        if let Some((_, Ok(view))) = &self.nested_cache {
+                            let depth = |l: &NestedLevel| match l {
+                                NestedLevel::Project => 0,
+                                NestedLevel::Community(_) => 1,
+                                NestedLevel::File(_) => 2,
+                            };
+                            let here = depth(&view.level);
+                            for (i, (label, level)) in view.breadcrumbs.iter().enumerate() {
+                                if i > 0 {
+                                    ui.label(RichText::new("/").color(T::CONTROL_STRONG));
+                                }
+                                let current = i + 1 == view.breadcrumbs.len();
+                                let text = if matches!(level, NestedLevel::File(_)) {
+                                    T::mono(truncate_label_tail(label, 40), 12.0)
+                                } else {
+                                    RichText::new(truncate_label_tail(label, 40)).size(12.0)
+                                };
+                                let text = text.color(if current { T::TEXT } else { T::TEXT_3 });
+                                let resp = ui.add(
+                                    egui::Button::new(text)
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE)
+                                        .min_size(Vec2::new(0.0, 24.0)),
+                                );
+                                if resp.clicked() && !current {
+                                    // Going up: the parent settles around the node we left.
+                                    let focus = match (&view.level, depth(level)) {
+                                        (NestedLevel::Community(c), _) => Some(c.clone()),
+                                        (NestedLevel::File(f), 1) => Some(format!("f:{f}")),
+                                        (NestedLevel::File(_), _) => view
+                                            .breadcrumbs
+                                            .get(1)
+                                            .and_then(|(_, l)| match l {
+                                                NestedLevel::Community(c) => Some(c.clone()),
+                                                _ => None,
+                                            }),
+                                        _ => None,
+                                    };
+                                    next_level =
+                                        Some((level.clone(), None, focus, depth(level) < here));
+                                }
+                            }
                         }
-                        let sp = to_screen(n.x, n.y, self.cam_offset, self.cam_zoom);
-                        let r = (n.radius * self.cam_zoom + 5.0).max(7.0);
-                        if sp.distance(pos) <= r {
-                            Some(idx)
-                        } else {
-                            None
+                    } else {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.graph_search)
+                                .desired_width(170.0)
+                                .hint_text("Filter files or symbols"),
+                        );
+                        let reg = default_registry();
+                        egui::ComboBox::from_id_salt("lang_filter")
+                            .width(130.0)
+                            .selected_text(if self.graph_lang_filter == "all" {
+                                "All languages".to_string()
+                            } else {
+                                reg.display_name_for(&self.graph_lang_filter)
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.graph_lang_filter,
+                                    "all".to_string(),
+                                    "All languages",
+                                );
+                                for l in reg.languages() {
+                                    ui.selectable_value(
+                                        &mut self.graph_lang_filter,
+                                        l.id,
+                                        l.display_name,
+                                    );
+                                }
+                            });
+                        ui.checkbox(&mut self.graph_code_only, "Code only");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let gv = &mut self.graph_view;
+                        if T::toggle_chip(ui, "Badges", gv.show_badges, T::ACCENT)
+                            .on_hover_text("Notes, decisions and health findings on nodes")
+                            .clicked()
+                        {
+                            gv.show_badges = !gv.show_badges;
                         }
-                    })
+                        if T::toggle_chip(ui, "Trail", gv.show_trail, T::HEAT)
+                            .on_hover_text("The latest agent session, step by step")
+                            .clicked()
+                        {
+                            gv.show_trail = !gv.show_trail;
+                        }
+                        if T::toggle_chip(ui, "Agent heat", gv.show_heat, T::HEAT)
+                            .on_hover_text(format!(
+                                "Glow = agent calls naming the node (last {} days); dashed ring = uncommitted changes",
+                                crate::activity::HEAT_DAYS
+                            ))
+                            .clicked()
+                        {
+                            gv.show_heat = !gv.show_heat;
+                        }
+                    });
                 });
+            },
+        );
 
-                if resp.drag_started() {
-                    self.dragged_node_idx = hovered_node;
-                    if hovered_node.is_some() {
-                        self.selected_node_idx = hovered_node;
-                    }
-                }
-                if resp.dragged() {
-                    let delta = resp.drag_delta() / self.cam_zoom;
-                    if let Some(idx) = self.dragged_node_idx {
-                        if let Some(n) = lp.nodes.get_mut(idx) {
-                            n.x += delta.x;
-                            n.y += delta.y;
-                        }
-                    } else {
-                        self.cam_offset += delta;
-                    }
-                }
-                if resp.drag_stopped() {
-                    self.dragged_node_idx = None;
-                }
-                if resp.clicked() {
-                    self.selected_node_idx = hovered_node;
-                }
+        let body = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), full.max);
+        let inspector_w = 300.0_f32.min(body.width() * 0.4);
+        let canvas = Rect::from_min_max(
+            body.min,
+            Pos2::new(body.right() - inspector_w, body.bottom()),
+        );
+        let side = Rect::from_min_max(Pos2::new(canvas.right(), body.top()), body.max);
 
-                let focus_idx = hovered_node.or(self.selected_node_idx);
-                let mut focused_set: HashSet<usize> = HashSet::new();
-                if let Some(fi) = focus_idx {
-                    focused_set.insert(fi);
-                    for e in &lp.edges {
-                        if !visible[e.src] || !visible[e.tgt] {
-                            continue;
-                        }
-                        if e.src == fi {
-                            focused_set.insert(e.tgt);
-                        } else if e.tgt == fi {
-                            focused_set.insert(e.src);
-                        }
+        match (&self.scene, self.graph_layout_mode, &self.nested_cache) {
+            (_, GraphLayoutMode::Nested, Some((_, Err(msg)))) => {
+                let msg = msg.clone();
+                ui.scope_builder(egui::UiBuilder::new().max_rect(canvas.shrink(24.0)), |ui| {
+                    ui.colored_label(T::DANGER, msg);
+                    if ui.add(T::button("Back to Project")).clicked() {
+                        next_level = Some((NestedLevel::Project, None, None, true));
                     }
+                });
+            }
+            (Some((_, scene)), _, _) => {
+                let lp = self.loaded.as_ref().expect("checked above");
+                let out = graph_view::show(
+                    ui,
+                    canvas,
+                    scene,
+                    &mut self.graph_view,
+                    &lp.activity.session,
+                );
+                if let Some((level, origin)) = out.drill {
+                    next_level = Some((level, Some(origin), None, false));
                 }
+            }
+            _ => {}
+        }
 
-                // 1. Soft radial island halos & headers
-                for isl in &lp.islands {
-                    let sp = to_screen(isl.center_x, isl.center_y, self.cam_offset, self.cam_zoom);
-                    let sr = isl.radius * self.cam_zoom;
-                    if !rect.expand(sr + 30.0).contains(sp) {
-                        continue;
+        ui.painter().rect_filled(side, CornerRadius::ZERO, T::PANEL);
+        ui.painter().line_segment(
+            [side.left_top(), side.left_bottom()],
+            Stroke::new(1.0_f32, T::BORDER),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(side.shrink(T::S4)), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("graph_inspector")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some(action) = self.render_inspector(ui) {
+                        next_level = Some(action);
                     }
-                    let base_col = cluster_color(isl.color_idx);
-                    painter.circle_filled(
-                        sp,
-                        sr * 1.06,
-                        Color32::from_rgba_unmultiplied(
-                            base_col.r(),
-                            base_col.g(),
-                            base_col.b(),
-                            7,
-                        ),
-                    );
-                    painter.circle_filled(
-                        sp,
-                        sr,
-                        Color32::from_rgba_unmultiplied(
-                            base_col.r(),
-                            base_col.g(),
-                            base_col.b(),
-                            15,
-                        ),
-                    );
-                    painter.circle_stroke(
-                        sp,
-                        sr,
-                        Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgba_unmultiplied(
-                                base_col.r(),
-                                base_col.g(),
-                                base_col.b(),
-                                56,
-                            ),
-                        ),
-                    );
+                });
+        });
+        ui.allocate_rect(full, Sense::hover());
 
-                    if sr >= 14.0 {
-                        let title_text = format!("{} ({})", isl.title, isl.count);
-                        painter.text(
-                            Pos2::new(sp.x, sp.y - sr - 10.0),
-                            egui::Align2::CENTER_CENTER,
-                            title_text,
-                            egui::FontId::proportional(11.5),
-                            Color32::from_rgba_unmultiplied(215, 224, 238, 228),
+        if let Some((level, origin, focus, out)) = next_level {
+            self.graph_layout_mode = GraphLayoutMode::Nested;
+            self.nested_level = level;
+            self.graph_view.begin_transition(origin, focus, out);
+        }
+    }
+
+    fn scene_key(&self) -> String {
+        let path = self.loaded.as_ref().map(|l| l.path.as_str()).unwrap_or("");
+        let gen_ = self.loaded.as_ref().map(|l| l.activity_gen).unwrap_or(0);
+        match self.graph_layout_mode {
+            GraphLayoutMode::Nested => format!("{path}|nested|{:?}|{gen_}", self.nested_level),
+            m => format!(
+                "{path}|{m:?}|{}|{}|{}|{gen_}",
+                self.graph_search.trim().to_lowercase(),
+                self.graph_lang_filter,
+                self.graph_code_only
+            ),
+        }
+    }
+
+    /// Right-hand panel: the selected node, or the project's agent activity and legend.
+    /// Returns a level to open.
+    fn render_inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<(NestedLevel, Option<Pos2>, Option<String>, bool)> {
+        let lp = self.loaded.as_ref()?;
+        let (_, scene) = self.scene.as_ref()?;
+        let mut action = None;
+        let selected = self
+            .graph_view
+            .selected
+            .as_ref()
+            .and_then(|id| scene.index_of(id));
+        let Some(i) = selected else {
+            // Overview: agent activity, communities, how to read the graph.
+            let act = &lp.activity;
+            T::tinted_card(T::CARD, T::BORDER).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(T::strong("Agent activity", 12.0).color(T::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("last {} days", crate::activity::HEAT_DAYS))
+                                .size(11.0)
+                                .color(T::TEXT_3),
                         );
-                    }
+                    });
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "{} MCP calls, {} named a file or symbol",
+                        fmt_num(act.calls),
+                        fmt_num(act.attributed)
+                    ))
+                    .size(12.0)
+                    .color(T::TEXT_3),
+                );
+                ui.add_space(T::S1);
+                let mut hot: Vec<(&String, &usize)> = act.heat.iter().collect();
+                hot.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                let max = act.max_heat().max(1) as f32;
+                if hot.is_empty() {
+                    ui.label(
+                        RichText::new("No agent calls named a file yet.")
+                            .size(12.0)
+                            .color(T::TEXT_3),
+                    );
                 }
-
-                // 2. Edges
-                for e in &lp.edges {
-                    if !visible[e.src] || !visible[e.tgt] {
-                        continue;
-                    }
-                    let is_hl = focus_idx.is_some_and(|fi| e.src == fi || e.tgt == fi);
-                    if focus_idx.is_some() && !is_hl {
-                        continue;
-                    }
-                    let a = &lp.nodes[e.src];
-                    let b = &lp.nodes[e.tgt];
-                    let p1 = to_screen(a.x, a.y, self.cam_offset, self.cam_zoom);
-                    let p2 = to_screen(b.x, b.y, self.cam_offset, self.cam_zoom);
-                    let stroke = if is_hl {
-                        Stroke::new(
-                            1.8_f32,
-                            Color32::from_rgba_unmultiplied(56, 189, 248, 225),
-                        )
-                    } else {
-                        Stroke::new(
-                            0.9_f32,
-                            Color32::from_rgba_unmultiplied(148, 163, 184, 34),
-                        )
-                    };
-                    painter.line_segment([p1, p2], stroke);
-                }
-
-                // 3. Nodes with soft outer glow on hover/focus
-                for (idx, n) in lp.nodes.iter().enumerate() {
-                    if !visible[idx] {
-                        continue;
-                    }
-                    let sp = to_screen(n.x, n.y, self.cam_offset, self.cam_zoom);
-                    if !rect.expand(30.0).contains(sp) {
-                        continue;
-                    }
-                    let base = match self.graph_color_mode {
-                        GraphColorMode::Language => parse_hex_color(reg.color_for(&n.language)),
-                        GraphColorMode::Cluster => cluster_color(n.community),
-                    };
-                    let dimmed = focus_idx.is_some() && !focused_set.contains(&idx);
-                    let color = if dimmed {
-                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 42)
-                    } else {
-                        base
-                    };
-                    let r = (n.radius * self.cam_zoom).clamp(3.0, 26.0);
-                    if !dimmed {
-                        painter.circle_filled(
-                            sp,
-                            r + 4.0,
-                            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 26),
-                        );
-                    }
-                    painter.circle_filled(sp, r, color);
-
-                    if Some(idx) == self.selected_node_idx || Some(idx) == hovered_node {
-                        painter.circle_stroke(sp, r + 2.5, Stroke::new(2.2_f32, Color32::WHITE));
-                    } else if focus_idx.is_some() && focused_set.contains(&idx) {
-                        painter.circle_stroke(
-                            sp,
-                            r + 1.5,
-                            Stroke::new(1.4_f32, Color32::from_rgb(56, 189, 248)),
-                        );
-                    }
-                }
-
-                // 4. Collision-free labels
-                let mut label_order: Vec<usize> =
-                    (0..lp.nodes.len()).filter(|&i| visible[i]).collect();
-                label_order.sort_by(|&a, &b| {
-                    let prio = |i: usize| -> i32 {
-                        if Some(i) == hovered_node {
-                            4
-                        } else if Some(i) == self.selected_node_idx {
-                            3
-                        } else if focus_idx.is_some() && focused_set.contains(&i) {
-                            2
-                        } else {
-                            0
-                        }
-                    };
-                    prio(b)
-                        .cmp(&prio(a))
-                        .then_with(|| lp.nodes[b].degree.cmp(&lp.nodes[a].degree))
-                        .then_with(|| {
-                            lp.nodes[b]
-                                .rank
-                                .partial_cmp(&lp.nodes[a].rank)
-                                .unwrap_or(std::cmp::Ordering::Equal)
+                for (path, n) in hot.into_iter().take(6) {
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.label(T::mono(truncate_label_tail(path, 30), 11.0).color(T::TEXT_2));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| ui.label(T::mono(n.to_string(), 11.0).color(T::HEAT)),
+                            );
                         })
-                        .then_with(|| lp.nodes[b].tokens.cmp(&lp.nodes[a].tokens))
-                });
-
-                let mut occupied_labels: Vec<Rect> = Vec::new();
-                let font = egui::FontId::proportional(11.0);
-                for idx in label_order {
-                    let is_special = Some(idx) == hovered_node
-                        || Some(idx) == self.selected_node_idx
-                        || (focus_idx.is_some() && focused_set.contains(&idx));
-                    if focus_idx.is_some() && !is_special {
-                        continue;
+                        .response
+                        .interact(Sense::click())
+                        .on_hover_text("Open this file's symbols")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let (bar, _) = ui
+                        .allocate_exact_size(Vec2::new(ui.available_width(), 3.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(bar, CornerRadius::same(2), T::BORDER);
+                    let mut fill = bar;
+                    fill.set_width(bar.width() * (*n as f32 / max));
+                    ui.painter()
+                        .rect_filled(fill, CornerRadius::same(2), T::HEAT);
+                    if resp.clicked() {
+                        action = Some((NestedLevel::File(path.clone()), None, None, false));
                     }
-                    let n = &lp.nodes[idx];
-                    let sp = to_screen(n.x, n.y, self.cam_offset, self.cam_zoom);
-                    if !rect.contains(sp) {
-                        continue;
-                    }
-                    let r = (n.radius * self.cam_zoom).clamp(3.0, 26.0);
-                    let est_w = (n.label.len() as f32 * 6.4 + 10.0).min(170.0);
-                    let est_h = 15.0;
-                    let label_center = Pos2::new(sp.x, sp.y + r + 9.0);
-                    let label_rect = Rect::from_center_size(label_center, Vec2::new(est_w, est_h));
-
-                    if !is_special && occupied_labels.iter().any(|o| o.intersects(label_rect)) {
-                        continue;
-                    }
-                    occupied_labels.push(label_rect.expand(2.0));
-
-                    if is_special {
-                        painter.rect_filled(
-                            label_rect.expand2(Vec2::new(4.0, 2.0)),
-                            CornerRadius::same(6),
-                            Color32::from_rgba_unmultiplied(10, 14, 24, 225),
-                        );
-                    }
-                    painter.text(
-                        label_center,
-                        egui::Align2::CENTER_CENTER,
-                        &n.label,
-                        font.clone(),
-                        if is_special {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(203, 213, 225)
-                        },
-                    );
                 }
-
-                // 5. Floating rounded tooltip
-                if let Some(hi) = hovered_node {
-                    let n = &lp.nodes[hi];
-                    let tip_text = format!(
-                        "{}  ·  {}  ·  {} tok  ·  {} symbols  ·  {} links",
-                        n.id,
-                        reg.display_name_for(&n.language),
-                        fmt_num(n.tokens),
-                        n.symbols.len(),
-                        n.degree
-                    );
-                    let tip_rect = Rect::from_min_size(
-                        Pos2::new(rect.left() + 12.0, rect.top() + 12.0),
-                        Vec2::new(
-                            (tip_text.len() as f32 * 6.5 + 22.0).min(rect.width() - 24.0),
-                            28.0,
-                        ),
-                    );
-                    painter.rect_filled(
-                        tip_rect,
-                        CornerRadius::same(12),
-                        Color32::from_rgba_unmultiplied(15, 23, 42, 235),
-                    );
-                    painter.rect_stroke(
-                        tip_rect,
-                        CornerRadius::same(12),
-                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 150)),
-                        StrokeKind::Inside,
-                    );
-                    painter.text(
-                        Pos2::new(tip_rect.left() + 11.0, tip_rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        tip_text,
-                        egui::FontId::proportional(11.5),
-                        Color32::WHITE,
-                    );
-                }
-
-                let vis_count = visible.iter().filter(|&&v| v).count();
-                painter.text(
-                    Pos2::new(rect.left() + 14.0, rect.bottom() - 14.0),
-                    egui::Align2::LEFT_CENTER,
-                    format!(
-                        "{vis_count}/{} files in {} groups · Scroll to zoom · Drag to pan · Click node to inspect",
-                        lp.nodes.len(),
-                        lp.islands.len()
-                    ),
-                    egui::FontId::proportional(11.0),
-                    Color32::from_rgb(130, 148, 178),
-                );
-            }
-
-            // Right: Floating Rounded Inspector Drawer
-            if let (Some(idx), Some(lp)) = (self.selected_node_idx, &self.loaded)
-                && let Some(node) = lp.nodes.get(idx) {
-                    ui.add_space(8.0);
-                    ui.allocate_ui(Vec2::new(inspector_w, (avail.y - 6.0).max(200.0)), |ui| {
-                        soft_card_frame(16).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&node.label)
-                                        .strong()
-                                        .size(14.5)
-                                        .color(Color32::WHITE),
+            });
+            ui.add_space(T::S3);
+            if self.graph_layout_mode == GraphLayoutMode::Nested
+                && self.nested_level == NestedLevel::Project
+            {
+                T::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(T::strong("Communities", 12.0).color(T::TEXT));
+                    for n in &scene.nodes {
+                        let resp = ui
+                            .horizontal(|ui| {
+                                T::dot_label(
+                                    ui,
+                                    n.color,
+                                    RichText::new(truncate_label(&n.label, 24)).size(12.0),
                                 );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui
-                                            .add(
-                                                egui::Button::new("×")
-                                                    .corner_radius(CornerRadius::same(10)),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.selected_node_idx = None;
-                                        }
+                                        ui.label(
+                                            T::mono(format!("{} files", n.child_count), 11.0)
+                                                .color(T::TEXT_3),
+                                        )
                                     },
                                 );
-                            });
-                            ui.label(
-                                RichText::new(&node.id)
-                                    .small()
-                                    .color(Color32::from_rgb(130, 148, 178)),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {} lines · {} tok · {} links",
-                                    reg.display_name_for(&node.language),
-                                    node.lines,
-                                    fmt_num(node.tokens),
-                                    node.degree
-                                ))
-                                .small()
-                                .color(Color32::from_rgb(125, 211, 252)),
-                            );
-                            ui.separator();
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                for (name, kind, line, sig) in &node.symbols {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new(format!("[{kind}]"))
-                                                .monospace()
-                                                .small()
-                                                .color(Color32::from_rgb(125, 211, 252)),
-                                        );
-                                        ui.label(RichText::new(name).strong().small());
-                                        ui.label(
-                                            RichText::new(format!("L{line}"))
-                                                .small()
-                                                .color(Color32::from_rgb(130, 148, 178)),
-                                        );
+                            })
+                            .response
+                            .interact(Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            action = n.drill.clone().map(|l| (l, None, None, false));
+                        }
+                    }
+                });
+                ui.add_space(T::S3);
+            }
+            T::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(T::strong("Reading the graph", 12.0).color(T::TEXT));
+                for (c, text) in [
+                    (T::NOTE, "Size = PageRank (summed for groups)"),
+                    (T::HEAT, "Glow = agent calls that named it"),
+                    (T::HEAT, "Dashed ring = uncommitted changes"),
+                    (T::HEAT, "Numbered path = latest agent session"),
+                    (T::ACCENT, "Badges: N note · D decision · ! finding"),
+                ] {
+                    T::dot_label(ui, c, RichText::new(text).size(12.0).color(T::TEXT_2));
+                }
+                ui.label(
+                    RichText::new(
+                        "Hover dims what is not connected. Click selects, double-click opens. Drag to pan, scroll to zoom.",
+                    )
+                    .size(11.0)
+                    .color(T::TEXT_3),
+                );
+            });
+            return action;
+        };
+
+        let n = &scene.nodes[i];
+        let kind = match n.kind {
+            graph_view::NodeKind::Community => "Community".to_string(),
+            graph_view::NodeKind::File => format!("File · {}", n.detail),
+            graph_view::NodeKind::Symbol => format!("Symbol · {}", n.detail),
+        };
+        ui.horizontal(|ui| {
+            T::dot_label(ui, n.color, RichText::new(kind).size(11.0).color(T::TEXT_3));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new("×")
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text("Close")
+                    .clicked()
+                {
+                    self.graph_view.selected = None;
+                }
+            });
+        });
+        ui.add(egui::Label::new(T::strong(&n.label, 16.0).color(T::TEXT)).wrap());
+        if let Some(loc) = &n.location {
+            ui.add(egui::Label::new(T::mono(loc, 11.0).color(T::TEXT_3)).wrap());
+        }
+        if !n.signature.is_empty() {
+            ui.add_space(T::S1);
+            egui::Frame::NONE
+                .fill(T::BG)
+                .stroke(Stroke::new(1.0_f32, T::BORDER))
+                .corner_radius(CornerRadius::same(T::R_CONTROL))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(T::mono(&n.signature, 11.0).color(T::TEXT_2)).wrap());
+                });
+        }
+        ui.add_space(T::S3);
+
+        let (edges_in, edges_out) = scene.edges.iter().fold((0, 0), |(a, b), e| {
+            (
+                a + if e.tgt == i { e.weight } else { 0 },
+                b + if e.src == i { e.weight } else { 0 },
+            )
+        });
+        let leaving: usize = scene
+            .portals
+            .iter()
+            .flat_map(|p| p.from.iter())
+            .filter(|(k, _)| *k == i)
+            .map(|(_, c)| c)
+            .sum();
+        let mut stats: Vec<(&str, String)> = vec![
+            ("PageRank", format!("{:.4}", n.rank)),
+            ("Tokens", fmt_num(n.tokens)),
+        ];
+        match n.kind {
+            graph_view::NodeKind::Community => stats.push(("Files", fmt_num(n.child_count))),
+            graph_view::NodeKind::File => stats.push(("Symbols", fmt_num(n.child_count))),
+            graph_view::NodeKind::Symbol => {}
+        }
+        stats.push(("Edges in (here)", fmt_num(edges_in)));
+        stats.push(("Edges out (here)", fmt_num(edges_out)));
+        if !scene.portals.is_empty() {
+            stats.push(("Edges leaving", fmt_num(leaving)));
+        }
+        egui::Frame::NONE
+            .fill(T::BORDER)
+            .corner_radius(CornerRadius::same(T::R_CARD))
+            .inner_margin(Margin::same(1))
+            .show(ui, |ui| {
+                egui::Grid::new("inspector_stats")
+                    .num_columns(2)
+                    .spacing(Vec2::splat(1.0))
+                    .min_col_width((ui.available_width() - 1.0) * 0.5)
+                    .show(ui, |ui| {
+                        for (k, (label, value)) in stats.iter().enumerate() {
+                            egui::Frame::NONE
+                                .fill(T::CARD)
+                                .inner_margin(Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.set_width((ui.available_width()).max(100.0));
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.label(RichText::new(*label).size(11.0).color(T::TEXT_3));
+                                        ui.label(T::mono(value, 14.0).color(T::TEXT));
                                     });
-                                    ui.label(
-                                        RichText::new(sig)
-                                            .monospace()
-                                            .small()
-                                            .color(Color32::from_rgb(148, 163, 184)),
-                                    );
-                                    ui.add_space(5.0);
-                                }
-                            });
-                        });
+                                });
+                            if k % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
                     });
-                }
-        });
-    }
+            });
+        ui.add_space(T::S3);
 
-    /// Matryoshka view: shows one level (project → communities → files → symbols) with
-    /// aggregated edges. Click a node to drill in, a breadcrumb to go back up.
-    fn render_nested_graph(&mut self, ui: &mut egui::Ui) {
-        let Some(ref lp) = self.loaded else {
-            ui.label("No project loaded.");
-            return;
-        };
-        let key = (lp.path.clone(), self.nested_level.clone());
-        if self.nested_cache.as_ref().map(|(k, _)| k) != Some(&key) {
-            let view = NestedGraph::new(&lp.graph)
-                .view(&self.nested_level)
-                .map_err(|e| e.to_string());
-            self.nested_cache = Some((key, view));
-        }
-        let Some((_, view)) = self.nested_cache.as_ref() else {
-            return;
-        };
-        let view = match view {
-            Ok(v) => v,
-            Err(msg) => {
-                ui.colored_label(Color32::from_rgb(248, 113, 113), msg.clone());
-                if ui.button("Back to Project").clicked() {
-                    self.nested_level = NestedLevel::Project;
-                }
-                return;
-            }
-        };
-
-        let mut next_level: Option<NestedLevel> = None;
-        ui.horizontal_wrapped(|ui| {
-            for (i, (label, level)) in view.breadcrumbs.iter().enumerate() {
-                if i > 0 {
-                    ui.label(RichText::new("›").color(Color32::from_rgb(148, 163, 184)));
-                }
-                let current = i + 1 == view.breadcrumbs.len();
-                let text = RichText::new(truncate_label_tail(label, 48)).strong();
-                if current {
-                    ui.label(text);
-                } else if ui.link(text).clicked() {
-                    next_level = Some(level.clone());
-                }
-            }
-        });
-        ui.label(
-            RichText::new(NestedGraph::coverage_line(view))
-                .small()
-                .color(Color32::from_rgb(148, 163, 184)),
-        );
-        ui.add_space(6.0);
-
-        let avail = ui.available_size();
-        let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(avail.x.max(240.0), (avail.y - 6.0).max(200.0)),
-            Sense::click(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(9, 13, 24));
-        if let Some(ref tex) = self.backdrop_tex {
-            paint_smooth_aurora(&painter, rect, tex.id());
-        }
-
-        let n = view.nodes.len();
-        if n == 0 {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "This level has no children.",
-                egui::FontId::proportional(14.0),
-                Color32::from_rgb(148, 163, 184),
+        // Agent activity for this node.
+        let steps: Vec<usize> = lp
+            .activity
+            .session
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| scene.locate_step(s) == Some(graph_view::Target::Node(i)))
+            .map(|(k, _)| k + 1)
+            .collect();
+        T::tinted_card(
+            Color32::from_rgb(0x14, 0x11, 0x0E),
+            Color32::from_rgb(0x3A, 0x2A, 0x1E),
+        )
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(T::strong("Agent activity", 12.0).color(Color32::from_rgb(0xFF, 0xB2, 0x7F)));
+            let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(k).size(12.0).color(T::TEXT_2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(T::mono(v, 11.0).color(T::TEXT));
+                    });
+                });
+            };
+            row(
+                ui,
+                &format!("Calls (last {} days)", crate::activity::HEAT_DAYS),
+                fmt_num(n.heat),
             );
-        }
-
-        // Ring layout on an ellipse. No three points of a strictly convex curve are
-        // collinear, so an edge never runs through a third node (as it did on a grid), and
-        // labels sit outside the ring, away from the edges.
-        let center = Pos2::new(rect.center().x, rect.center().y - 10.0);
-        let rx0 = (rect.width() * 0.5 - 150.0).max(60.0);
-        let ry0 = (rect.height() * 0.5 - 44.0).max(60.0);
-        let perimeter = std::f32::consts::TAU * ((rx0 * rx0 + ry0 * ry0) * 0.5).sqrt();
-        let max_r = (perimeter / n.max(1) as f32 * 0.4).clamp(3.0, 40.0);
-        let (rx, ry) = ((rx0 - max_r).max(40.0), (ry0 - max_r).max(40.0));
-        let angle = |i: usize| {
-            -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n.max(1) as f32
-        };
-        let max_tok = view
-            .nodes
-            .iter()
-            .map(|x| x.tokens)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f32;
-        let reg = default_registry();
-        let pos: Vec<Pos2> = (0..n)
-            .map(|i| {
-                let a = angle(i);
-                Pos2::new(center.x + rx * a.cos(), center.y + ry * a.sin())
-            })
-            .collect();
-        let radius: Vec<f32> = view
-            .nodes
-            .iter()
-            .map(|x| (max_r * (x.tokens as f32 / max_tok).sqrt()).max(3.0))
-            .collect();
-
-        let hovered: Option<usize> = resp.hover_pos().and_then(|h| {
-            (0..n)
-                .filter(|&i| h.distance(pos[i]) <= radius[i].max(6.0))
-                .min_by(|&a, &b| h.distance(pos[a]).total_cmp(&h.distance(pos[b])))
-        });
-
-        // Edges are directed. Both directions of one pair are drawn side by side with
-        // arrowheads instead of on top of each other. Counts are drawn for every edge when
-        // there are few, otherwise for the hovered node's edges only.
-        const OUT_RGB: (u8, u8, u8) = (125, 211, 252);
-        const IN_RGB: (u8, u8, u8) = (251, 191, 36);
-        let pairs: HashSet<(usize, usize)> = view.edges.iter().map(|e| (e.src, e.tgt)).collect();
-        let max_w = view.edges.iter().map(|e| e.weight).max().unwrap_or(1) as f32;
-        let label_all = view.edges.len() <= 30;
-        let mut count_labels: Vec<(Pos2, String, Color32)> = Vec::new();
-        let (mut out_edges, mut in_edges) = (0usize, 0usize);
-        for e in &view.edges {
-            let (a, b) = (pos[e.src], pos[e.tgt]);
-            let len = (b - a).length();
-            if e.src == e.tgt || len < 1.0 {
-                continue;
-            }
-            let dir = (b - a) / len;
-            let normal = Vec2::new(-dir.y, dir.x);
-            let off = if pairs.contains(&(e.tgt, e.src)) {
-                normal * 3.0
-            } else {
-                Vec2::ZERO
-            };
-            let start = a + dir * radius[e.src] + off;
-            let end = b - dir * (radius[e.tgt] + 1.0) + off;
-            if (end - start).length() < 2.0 {
-                continue;
-            }
-            let t = (e.weight as f32 / max_w).sqrt();
-            let rgba = |(r, g, b): (u8, u8, u8), alpha: f32| {
-                Color32::from_rgba_unmultiplied(r, g, b, alpha as u8)
-            };
-            let incident = hovered.map(|h| h == e.src || h == e.tgt);
-            let (color, width) = match incident {
-                Some(true) if hovered == Some(e.src) => {
-                    out_edges += 1;
-                    (rgba(OUT_RGB, 235.0), 1.6 + 2.4 * t)
-                }
-                Some(true) => {
-                    in_edges += 1;
-                    (rgba(IN_RGB, 235.0), 1.6 + 2.4 * t)
-                }
-                Some(false) => (rgba(OUT_RGB, 22.0), 0.8),
-                None => (rgba(OUT_RGB, 70.0 + 140.0 * t), 0.8 + 2.2 * t),
-            };
-            painter.line_segment([start, end], Stroke::new(width, color));
-            if incident != Some(false) {
-                let head = 7.0_f32.min((end - start).length() * 0.3);
-                let back = end - dir * head;
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        end,
-                        back + normal * head * 0.45,
-                        back - normal * head * 0.45,
-                    ],
-                    color,
-                    Stroke::NONE,
-                ));
-            }
-            if incident == Some(true) || (hovered.is_none() && label_all) {
-                // Hovered: put the count near the other node, so counts spread around the ring.
-                let at = match incident {
-                    Some(true) if hovered == Some(e.src) => 0.75,
-                    Some(true) => 0.25,
-                    // The two directions of one pair get separate spots (each toward its
-                    // own target) so their counts do not cover each other.
-                    _ if off != Vec2::ZERO => 0.62,
-                    _ => 0.5,
-                };
-                let at_pos = start + (end - start) * at + off * 3.0;
-                count_labels.push((at_pos, fmt_num(e.weight), color));
-            }
-        }
-
-        let label_color = Color32::from_rgb(226, 232, 240);
-        let obstacles: Vec<Rect> = (0..n)
-            .map(|i| Rect::from_center_size(pos[i], Vec2::splat(radius[i] * 2.0)))
-            .collect();
-        for (i, node) in view.nodes.iter().enumerate() {
-            let color = match node.kind {
-                NestedKind::Community => cluster_color(i),
-                NestedKind::File => parse_hex_color(reg.color_for(&node.detail)),
-                NestedKind::Symbol => Color32::from_rgb(167, 139, 250),
-            };
-            painter.circle_filled(pos[i], radius[i], color);
-            if hovered == Some(i) {
-                painter.circle_stroke(
-                    pos[i],
-                    radius[i] + 2.0,
-                    Stroke::new(2.0_f32, Color32::WHITE),
+            row(
+                ui,
+                "Latest session steps",
+                if steps.is_empty() {
+                    "none".to_string()
+                } else {
+                    steps
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            );
+            if n.kind != graph_view::NodeKind::Symbol {
+                row(
+                    ui,
+                    "Uncommitted changes",
+                    if n.changed { "yes" } else { "no" }.to_string(),
                 );
             }
-        }
+        });
+        ui.add_space(T::S3);
 
-        // Labels: largest nodes first; a label that would overlap another label or node, or
-        // leave the canvas, is skipped (hover still names the node) rather than drawn on top.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| view.nodes[b].tokens.cmp(&view.nodes[a].tokens));
-        let mut placed: Vec<Rect> = Vec::new();
-        let mut skipped_labels = 0usize;
-        for i in order {
-            let (c, s) = (angle(i).cos(), angle(i).sin());
-            let galley = painter.layout_no_wrap(
-                truncate_label_tail(&view.nodes[i].label, 28),
-                egui::FontId::proportional(11.0),
-                label_color,
+        ui.label(T::strong(format!("Memory & findings  {}", n.mem.len()), 12.0).color(T::TEXT));
+        if n.mem.is_empty() {
+            ui.label(
+                RichText::new("No notes, decisions or health findings.")
+                    .size(12.0)
+                    .color(T::TEXT_3),
             );
-            let size = galley.size();
-            let anchor = pos[i] + Vec2::new(c, s) * (radius[i] + 4.0);
-            let min = if c > 0.35 {
-                Pos2::new(anchor.x, anchor.y - size.y * 0.5)
-            } else if c < -0.35 {
-                Pos2::new(anchor.x - size.x, anchor.y - size.y * 0.5)
-            } else if s < 0.0 {
-                Pos2::new(anchor.x - size.x * 0.5, anchor.y - size.y)
-            } else {
-                Pos2::new(anchor.x - size.x * 0.5, anchor.y)
+        }
+        for m in &n.mem {
+            let (c, k) = match m.kind {
+                graph_view::MemKind::Note => (T::NOTE, "note"),
+                graph_view::MemKind::Decision => (T::ACCENT, "decision"),
+                graph_view::MemKind::Finding => (T::DANGER, "finding"),
             };
-            let r = Rect::from_min_size(min, size);
-            let blocked = !rect.contains_rect(r)
-                || placed.iter().any(|p| p.expand(2.0).intersects(r))
-                || obstacles
-                    .iter()
-                    .enumerate()
-                    .any(|(j, o)| j != i && o.intersects(r));
-            if blocked {
-                skipped_labels += 1;
-                continue;
-            }
-            placed.push(r);
-            painter.galley(min, galley, label_color);
+            T::card().inner_margin(Margin::same(10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    T::dot_label(
+                        ui,
+                        c,
+                        RichText::new(if m.when.is_empty() {
+                            k.to_string()
+                        } else {
+                            format!("{k} · {}", m.when)
+                        })
+                        .size(11.0)
+                        .color(T::TEXT_3),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            T::mono(truncate_label_tail(&m.target, 22), 10.0).color(T::TEXT_3),
+                        );
+                    });
+                });
+                ui.add(egui::Label::new(RichText::new(&m.text).size(12.0).color(T::TEXT)).wrap());
+            });
         }
-
-        for (p, text, color) in count_labels {
-            let galley =
-                painter.layout_no_wrap(text, egui::FontId::proportional(10.0), Color32::WHITE);
-            let r = Rect::from_center_size(p, galley.size() + Vec2::new(8.0, 2.0));
-            painter.rect_filled(
-                r,
-                CornerRadius::same(4),
-                Color32::from_rgba_unmultiplied(9, 13, 24, 225),
-            );
-            painter.rect_stroke(
-                r,
-                CornerRadius::same(4),
-                Stroke::new(1.0_f32, color),
-                StrokeKind::Inside,
-            );
-            painter.galley(r.center() - galley.size() * 0.5, galley, Color32::WHITE);
+        ui.add_space(T::S3);
+        if let Some(level) = n.drill.clone()
+            && ui.add(T::primary_button("Open level")).clicked()
+        {
+            action = Some((level, None, None, false));
         }
-
-        let footer = if let Some(i) = hovered {
-            let node = &view.nodes[i];
-            let mut info = format!("{}  ·  {} tok", node.label, fmt_num(node.tokens));
-            match node.kind {
-                NestedKind::Community => info.push_str(&format!("  ·  {} files", node.child_count)),
-                NestedKind::File => info.push_str(&format!("  ·  {} symbols", node.child_count)),
-                NestedKind::Symbol => info.push_str(&format!("  ·  {}", node.detail)),
-            }
-            if let Some(loc) = &node.location {
-                info.push_str(&format!("  ·  {loc}"));
-            }
-            info.push_str(&format!(
-                "  ·  edges here: {out_edges} out (blue), {in_edges} in (amber)"
-            ));
-            if node.drill.is_some() {
-                info.push_str("  ·  click to open");
-            }
-            if resp.clicked() {
-                next_level = node.drill.clone();
-            }
-            (info, Color32::WHITE)
-        } else {
-            let mut hint = String::from("Hover a node for its edges and counts; click to open.");
-            if skipped_labels > 0 {
-                hint.push_str(&format!(
-                    "  {skipped_labels} labels hidden to avoid overlap."
-                ));
-            }
-            (hint, Color32::from_rgb(148, 163, 184))
-        };
-        painter.text(
-            Pos2::new(rect.left() + 12.0, rect.bottom() - 8.0),
-            egui::Align2::LEFT_BOTTOM,
-            footer.0,
-            egui::FontId::proportional(12.0),
-            footer.1,
-        );
-
-        if let Some(level) = next_level {
-            self.nested_level = level;
-        }
+        action
     }
 
     fn render_architecture_tab(&mut self, ui: &mut egui::Ui) {
@@ -2288,9 +1900,9 @@ impl TrackerTopApp {
             // Code Health Summary Row
             ui.columns(3, |cols| {
                 let bloat_col = if lp.health.bloated_files.is_empty() {
-                    Color32::from_rgb(110, 231, 183)
+                    T::SUCCESS
                 } else {
-                    Color32::from_rgb(251, 191, 36)
+                    T::WARN
                 };
                 glow_kpi_card(
                     &mut cols[0],
@@ -2301,9 +1913,9 @@ impl TrackerTopApp {
                     bloat_col,
                 );
                 let cyc_col = if lp.health.circular_groups.is_empty() {
-                    Color32::from_rgb(110, 231, 183)
+                    T::SUCCESS
                 } else {
-                    Color32::from_rgb(248, 113, 113)
+                    T::DANGER
                 };
                 glow_kpi_card(
                     &mut cols[1],
@@ -2318,8 +1930,8 @@ impl TrackerTopApp {
                     "ORPHAN CODE FILES",
                     &lp.health.orphan_files.len().to_string(),
                     "Zero incoming graph references",
-                    Color32::from_rgb(125, 211, 252),
-                    Color32::from_rgb(56, 189, 248),
+                    T::ACCENT,
+                    T::ACCENT,
                 );
             });
 
@@ -2330,9 +1942,9 @@ impl TrackerTopApp {
                     ui.set_width(ui.available_width());
                     ui.label(
                         RichText::new("CODE HEALTH DIAGNOSTICS")
-                            .strong()
+                            .family(T::semibold_family())
                             .small()
-                            .color(Color32::from_rgb(251, 191, 36)),
+                            .color(T::WARN),
                     );
                     ui.add_space(6.0);
                     for (p, toks, lines) in lp.health.bloated_files.iter().take(6) {
@@ -2342,14 +1954,14 @@ impl TrackerTopApp {
                                 fmt_num(*toks)
                             ))
                             .small()
-                            .color(Color32::from_rgb(253, 224, 71)),
+                            .color(T::WARN),
                         );
                     }
                     for cyc in lp.health.circular_groups.iter().take(4) {
                         ui.label(
                             RichText::new(format!("Cycle: {}", cyc.join(" <-> ")))
                                 .small()
-                                .color(Color32::from_rgb(252, 165, 165)),
+                                .color(T::DANGER),
                         );
                     }
                 });
@@ -2366,29 +1978,27 @@ impl TrackerTopApp {
                         fmt_num(lp.total_symbols),
                         fmt_num(lp.total_edges)
                     ))
-                    .strong()
+                    .family(T::semibold_family())
                     .small()
-                    .color(Color32::from_rgb(148, 163, 184)),
+                    .color(T::TEXT_3),
                 );
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     for (_, display, hex, files, toks) in &lp.lang_breakdown {
                         let col = parse_hex_color(hex);
                         egui::Frame::NONE
-                            .fill(Color32::from_rgba_unmultiplied(
-                                col.r(),
-                                col.g(),
-                                col.b(),
-                                20,
-                            ))
-                            .stroke(Stroke::new(
-                                1.0_f32,
-                                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 100),
-                            ))
-                            .corner_radius(CornerRadius::same(14))
-                            .inner_margin(Margin::symmetric(12, 8))
+                            .fill(T::PANEL)
+                            .stroke(Stroke::new(1.0_f32, T::CONTROL))
+                            .corner_radius(CornerRadius::same(T::R_CONTROL))
+                            .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(display).strong().color(col));
+                                T::dot_label(
+                                    ui,
+                                    col,
+                                    RichText::new(display)
+                                        .family(T::semibold_family())
+                                        .color(T::TEXT),
+                                );
                                 ui.label(
                                     RichText::new(format!(
                                         "{files} files · {} tok",
@@ -2408,9 +2018,9 @@ impl TrackerTopApp {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new("ARCHITECTURAL HUBS (GOD NODES)")
-                        .strong()
+                        .family(T::semibold_family())
                         .small()
-                        .color(Color32::from_rgb(148, 163, 184)),
+                        .color(T::TEXT_3),
                 );
                 ui.add_space(8.0);
                 egui::Grid::new("god_nodes_grid")
@@ -2420,18 +2030,19 @@ impl TrackerTopApp {
                         for h in ["Symbol", "Kind", "File", "In", "Out", "Score"] {
                             ui.label(
                                 RichText::new(h)
-                                    .strong()
+                                    .family(T::semibold_family())
                                     .small()
-                                    .color(Color32::from_rgb(130, 148, 178)),
+                                    .color(T::TEXT_3),
                             );
                         }
                         ui.end_row();
                         for g in &lp.god_nodes {
-                            ui.label(RichText::new(&g.name).monospace().strong());
                             ui.label(
-                                RichText::new(g.kind.as_str())
-                                    .color(Color32::from_rgb(125, 211, 252)),
+                                RichText::new(&g.name)
+                                    .monospace()
+                                    .family(T::semibold_family()),
                             );
+                            ui.label(RichText::new(g.kind.as_str()).color(T::ACCENT));
                             ui.label(&g.file_path);
                             ui.label(g.in_degree.to_string());
                             ui.label(g.out_degree.to_string());
@@ -2448,17 +2059,20 @@ impl TrackerTopApp {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new("MODULE CLUSTERS")
-                        .strong()
+                        .family(T::semibold_family())
                         .small()
-                        .color(Color32::from_rgb(148, 163, 184)),
+                        .color(T::TEXT_3),
                 );
                 ui.add_space(8.0);
                 for c in &lp.communities {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             RichText::new(format!("C{} {}", c.id, c.label))
-                                .strong()
-                                .color(cluster_color(c.id)),
+                                .family(T::semibold_family())
+                                .color(comm_color(
+                                    lp,
+                                    c.files.iter().min().map(|p| format!("c:{p}")).as_deref(),
+                                )),
                         );
                         ui.label(
                             RichText::new(format!(
@@ -2468,7 +2082,7 @@ impl TrackerTopApp {
                                 fmt_num(c.total_tokens)
                             ))
                             .small()
-                            .color(Color32::from_rgb(130, 148, 178)),
+                            .color(T::TEXT_3),
                         );
                     });
                     if !c.top_hubs.is_empty() {
@@ -2497,9 +2111,9 @@ impl TrackerTopApp {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new("PERSISTENT AI MEMORY (AUTO-INJECTED ON READS)")
-                    .strong()
+                    .family(T::semibold_family())
                     .small()
-                    .color(Color32::from_rgb(125, 211, 252)),
+                    .color(T::ACCENT),
             );
             ui.add_space(4.0);
             ui.label(
@@ -2507,7 +2121,7 @@ impl TrackerTopApp {
                     "Notes saved here (or by AI agents via `remember`) are automatically attached whenever any AI reads that symbol or opens `repo_map`.",
                 )
                 .small()
-                .color(Color32::from_rgb(148, 163, 184)),
+                .color(T::TEXT_3),
             );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -2523,9 +2137,9 @@ impl TrackerTopApp {
                         .desired_width((ui.available_width() - 110.0).max(180.0))
                         .hint_text("e.g. Coordinate system is Y-up; shader bindings 0-2 are reserved"),
                 );
-                let save_btn = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE))
-                    .corner_radius(CornerRadius::same(14))
-                    .fill(Color32::from_rgb(37, 99, 235));
+                let save_btn = egui::Button::new(RichText::new("Save").family(T::semibold_family()).color(Color32::WHITE))
+                    .corner_radius(CornerRadius::same(T::R_CARD))
+                    .fill(T::ACCENT);
                 if ui.add(save_btn).clicked() && !self.note_content_input.trim().is_empty() {
                     add_note_req = Some((
                         repo_path.clone(),
@@ -2545,7 +2159,7 @@ impl TrackerTopApp {
                     ui.set_width(ui.available_width());
                     ui.label(
                         RichText::new("No memory notes saved yet for this project.")
-                            .color(Color32::from_rgb(130, 148, 178)),
+                            .color(T::TEXT_3),
                     );
                 });
             } else {
@@ -2554,16 +2168,16 @@ impl TrackerTopApp {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             egui::Frame::NONE
-                                .fill(Color32::from_rgba_unmultiplied(56, 189, 248, 28))
-                                .corner_radius(CornerRadius::same(10))
+                                .fill(T::ACCENT_SOFT)
+                                .corner_radius(CornerRadius::same(T::R_CONTROL))
                                 .inner_margin(Margin::symmetric(8, 3))
                                 .show(ui, |ui| {
                                     ui.label(
                                         RichText::new(&note.target)
                                             .monospace()
                                             .small()
-                                            .strong()
-                                            .color(Color32::from_rgb(125, 211, 252)),
+                                            .family(T::semibold_family())
+                                            .color(T::ACCENT),
                                     );
                                 });
                             ui.add_space(6.0);
@@ -2574,7 +2188,7 @@ impl TrackerTopApp {
                                     if ui
                                         .add(
                                             egui::Button::new("Delete")
-                                                .corner_radius(CornerRadius::same(12)),
+                                                .corner_radius(CornerRadius::same(T::R_CARD)),
                                         )
                                         .clicked()
                                     {
@@ -2627,7 +2241,10 @@ pub fn run_desktop_app(initial_repo: Option<PathBuf>) -> Result<()> {
     eframe::run_native(
         "TrackerTop",
         options,
-        Box::new(move |_cc| Ok(Box::new(TrackerTopApp::new(initial_repo)))),
+        Box::new(move |cc| {
+            T::install(&cc.egui_ctx);
+            Ok(Box::new(TrackerTopApp::new(initial_repo)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
@@ -2741,6 +2358,51 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
     let stats = db.get_token_stats(30)?;
     let notes = db.list_notes(None)?;
     let health = cg.health_report();
+    let activity = load_activity(&db, &cg, repo_root);
+    let mut findings: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, tokens, lines) in &health.bloated_files {
+        findings.entry(path.clone()).or_default().push(format!(
+            "Large file: {} tokens, {} lines",
+            fmt_num(*tokens),
+            fmt_num(*lines)
+        ));
+    }
+    for group in &health.circular_groups {
+        for path in group {
+            findings
+                .entry(path.clone())
+                .or_default()
+                .push(format!("In a dependency cycle of {} files", group.len()));
+        }
+    }
+    for path in &health.orphan_files {
+        findings
+            .entry(path.clone())
+            .or_default()
+            .push("No incoming references (orphan)".to_string());
+    }
+    let (community_color, community_label, community_files) = {
+        let ng = NestedGraph::new(&cg);
+        let pv = ng.view(&NestedLevel::Project)?;
+        let color: HashMap<String, usize> = pv
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.clone(), i))
+            .collect();
+        let label: HashMap<String, String> = pv
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.label.clone()))
+            .collect();
+        let mut files: HashMap<String, Vec<String>> = HashMap::new();
+        for path in cg.files.keys() {
+            if let Some(c) = ng.community_id_of(path) {
+                files.entry(c.to_string()).or_default().push(path.clone());
+            }
+        }
+        (color, label, files)
+    };
     let reg = default_registry();
 
     let mut file_ranks: HashMap<String, f64> = HashMap::new();
@@ -2794,22 +2456,14 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         syms.sort_by_key(|s| s.2);
 
         let rank = *file_ranks.get(&f.path).unwrap_or(&0.01);
-        let radius =
-            (6.0 + (f.token_count as f32).sqrt() * 0.11 + (rank as f32) * 24.0).clamp(6.0, 20.0);
-
         nodes.push(GraphNodeVis {
             id: f.path.clone(),
             label: f.path.rsplit('/').next().unwrap_or(&f.path).to_string(),
             group_folder: folder_bucket(&f.path),
             language: f.language.clone(),
-            community: *cg.file_communities.get(&f.path).unwrap_or(&0),
             tokens: f.token_count,
-            lines: f.line_count,
             rank,
             degree: 0,
-            x: 0.0,
-            y: 0.0,
-            radius,
             symbols: syms,
         });
     }
@@ -2858,7 +2512,13 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
         stats,
         nodes,
         edges,
-        islands: Vec::new(),
+        activity,
+        activity_gen: 0,
+        file_rank: file_ranks,
+        community_color,
+        community_label,
+        community_files,
+        findings,
         graph: cg,
     })
 }
@@ -2899,264 +2559,8 @@ fn compute_visible_mask(
         .collect()
 }
 
-fn arrange_structured_islands(
-    nodes: &mut [GraphNodeVis],
-    visible: &[bool],
-    mode: GraphLayoutMode,
-) -> Vec<GraphIsland> {
-    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (idx, n) in nodes.iter().enumerate() {
-        if !visible[idx] {
-            continue;
-        }
-        let key = match mode {
-            GraphLayoutMode::Folders | GraphLayoutMode::Nested => n.group_folder.clone(),
-            GraphLayoutMode::Clusters => format!("Cluster {}", n.community + 1),
-        };
-        groups.entry(key).or_default().push(idx);
-    }
-
-    let mut group_list: Vec<(String, Vec<usize>)> = groups.into_iter().collect();
-    group_list.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-
-    struct LocalIsland {
-        title: String,
-        indices: Vec<usize>,
-        local_pos: Vec<(f32, f32)>,
-        radius: f32,
-        color_idx: usize,
-    }
-
-    let mut local_islands = Vec::with_capacity(group_list.len());
-    for (g_idx, (title, mut indices)) in group_list.into_iter().enumerate() {
-        indices.sort_by(|&a, &b| {
-            nodes[b]
-                .degree
-                .cmp(&nodes[a].degree)
-                .then_with(|| nodes[b].tokens.cmp(&nodes[a].tokens))
-        });
-
-        let mut local_pos = Vec::with_capacity(indices.len());
-        let mut max_extent = 38.0_f32;
-
-        if indices.len() == 1 {
-            local_pos.push((0.0, 0.0));
-            max_extent = nodes[indices[0]].radius + 26.0;
-        } else {
-            let mut placed = 0usize;
-            let mut ring_radius = 0.0_f32;
-            while placed < indices.len() {
-                if placed == 0 {
-                    local_pos.push((0.0, 0.0));
-                    ring_radius = nodes[indices[0]].radius + 36.0;
-                    placed = 1;
-                } else {
-                    let spacing = 34.0_f32;
-                    let circumference = std::f32::consts::TAU * ring_radius;
-                    let cap = (circumference / spacing).floor().max(6.0) as usize;
-                    let count = (indices.len() - placed).min(cap);
-                    let angle_offset = (g_idx as f32) * 0.37;
-                    for k in 0..count {
-                        let angle =
-                            angle_offset + (k as f32 / count as f32) * std::f32::consts::TAU;
-                        let x = angle.cos() * ring_radius;
-                        let y = angle.sin() * ring_radius;
-                        let nr = nodes[indices[placed + k]].radius;
-                        max_extent = max_extent.max(ring_radius + nr + 22.0);
-                        local_pos.push((x, y));
-                    }
-                    placed += count;
-                    ring_radius += 38.0;
-                }
-            }
-        }
-
-        local_islands.push(LocalIsland {
-            title,
-            indices,
-            local_pos,
-            radius: max_extent,
-            color_idx: g_idx,
-        });
-    }
-
-    let total_islands = local_islands.len().max(1);
-    let cols = (total_islands as f32).sqrt().ceil().max(1.0) as usize;
-    let gap = 58.0_f32;
-
-    let mut islands = Vec::with_capacity(local_islands.len());
-    let mut row_y = 0.0_f32;
-    let mut i = 0usize;
-
-    while i < local_islands.len() {
-        let row_end = (i + cols).min(local_islands.len());
-        let row_slice = &local_islands[i..row_end];
-        let row_max_r = row_slice
-            .iter()
-            .map(|isl| isl.radius)
-            .fold(0.0_f32, f32::max);
-        let row_total_w: f32 = row_slice.iter().map(|isl| isl.radius * 2.0).sum::<f32>()
-            + gap * (row_slice.len().saturating_sub(1) as f32);
-
-        let mut cursor_x = -row_total_w * 0.5;
-        let cy = row_y + row_max_r;
-
-        for isl in row_slice {
-            let cx = cursor_x + isl.radius;
-            for (&node_idx, &(lx, ly)) in isl.indices.iter().zip(isl.local_pos.iter()) {
-                nodes[node_idx].x = cx + lx;
-                nodes[node_idx].y = cy + ly;
-            }
-            islands.push(GraphIsland {
-                title: isl.title.clone(),
-                center_x: cx,
-                center_y: cy,
-                radius: isl.radius,
-                count: isl.indices.len(),
-                color_idx: isl.color_idx,
-            });
-            cursor_x += isl.radius * 2.0 + gap;
-        }
-
-        row_y += row_max_r * 2.0 + gap + 22.0;
-        i = row_end;
-    }
-
-    islands
-}
-
-fn compute_bounds(
-    nodes: &[GraphNodeVis],
-    islands: &[GraphIsland],
-    visible: &[bool],
-) -> (f32, f32, f32, f32) {
-    let mut min_x = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-
-    for isl in islands {
-        min_x = min_x.min(isl.center_x - isl.radius);
-        max_x = max_x.max(isl.center_x + isl.radius);
-        min_y = min_y.min(isl.center_y - isl.radius - 20.0);
-        max_y = max_y.max(isl.center_y + isl.radius);
-    }
-
-    if !min_x.is_finite() {
-        for (i, n) in nodes.iter().enumerate() {
-            if !visible[i] {
-                continue;
-            }
-            min_x = min_x.min(n.x - n.radius);
-            max_x = max_x.max(n.x + n.radius);
-            min_y = min_y.min(n.y - n.radius);
-            max_y = max_y.max(n.y + n.radius);
-        }
-    }
-
-    if !min_x.is_finite() {
-        (-100.0, 100.0, -100.0, 100.0)
-    } else {
-        (min_x, max_x, min_y, max_y)
-    }
-}
-
-/// Generates a silky-smooth, zero-banding 256x256 GPU-filtered radial aurora gradient texture
-/// using true exponential Gaussian falloff + subtle blue-noise-like dithering.
-fn build_smooth_aurora_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    const W: usize = 256;
-    const H: usize = 256;
-    let mut pixels = vec![Color32::TRANSPARENT; W * H];
-
-    let base = (7.0_f32, 11.0_f32, 20.0_f32);
-    // (center, radius, rgb, strength)
-    type SoftLight = ((f32, f32), f32, (f32, f32, f32), f32);
-    let lights: [SoftLight; 3] = [
-        ((0.16, 0.14), 0.42, (56.0, 189.0, 248.0), 0.16), // soft cyan top-left
-        ((0.86, 0.84), 0.48, (129.0, 140.0, 248.0), 0.15), // soft indigo bottom-right
-        ((0.50, 0.92), 0.38, (16.0, 185.0, 129.0), 0.10), // whisper emerald bottom
-    ];
-
-    for y in 0..H {
-        let ny = y as f32 / (H - 1) as f32;
-        for x in 0..W {
-            let nx = x as f32 / (W - 1) as f32;
-            let mut r = base.0;
-            let mut g = base.1;
-            let mut b = base.2;
-
-            for &((lx, ly), sigma, (cr, cg, cb), strength) in &lights {
-                let dx = nx - lx;
-                let dy = ny - ly;
-                let dist_sq = dx * dx + dy * dy;
-                let falloff = (-dist_sq / (2.0 * sigma * sigma)).exp() * strength;
-                r += (cr - base.0) * falloff;
-                g += (cg - base.1) * falloff;
-                b += (cb - base.2) * falloff;
-            }
-
-            // Tiny deterministic sub-pixel dither (+/- 0.4) to completely eliminate 8-bit banding
-            let hash = ((x.wrapping_mul(374761393) ^ y.wrapping_mul(668265263)) & 255) as f32
-                / 255.0
-                - 0.5;
-            let rr = (r + hash * 0.8).clamp(0.0, 255.0) as u8;
-            let gg = (g + hash * 0.8).clamp(0.0, 255.0) as u8;
-            let bb = (b + hash * 0.8).clamp(0.0, 255.0) as u8;
-            pixels[y * W + x] = Color32::from_rgb(rr, gg, bb);
-        }
-    }
-
-    let image = egui::ColorImage {
-        size: [W, H],
-        pixels,
-    };
-    ctx.load_texture("trackertop_aurora_bg", image, egui::TextureOptions::LINEAR)
-}
-
-fn paint_smooth_aurora(painter: &egui::Painter, rect: Rect, tex_id: egui::TextureId) {
-    painter.image(
-        tex_id,
-        rect,
-        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-        Color32::WHITE,
-    );
-}
-
-fn apply_soft_modern_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-    style.spacing.button_padding = Vec2::new(13.0, 6.0);
-
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(9, 13, 24);
-    visuals.window_fill = Color32::from_rgb(15, 22, 38);
-    visuals.extreme_bg_color = Color32::from_rgb(11, 17, 30);
-    visuals.window_corner_radius = CornerRadius::same(16);
-    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(12);
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(12);
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(12);
-    visuals.widgets.active.corner_radius = CornerRadius::same(12);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgba_unmultiplied(30, 41, 59, 185);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgba_unmultiplied(51, 65, 85, 215);
-    visuals.widgets.active.bg_fill = Color32::from_rgba_unmultiplied(56, 189, 248, 80);
-    visuals.widgets.inactive.bg_stroke =
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(148, 163, 184, 34));
-    visuals.widgets.hovered.bg_stroke =
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 120));
-
-    style.visuals = visuals;
-    ctx.set_style(style);
-}
-
-fn soft_card_frame(radius: u8) -> egui::Frame {
-    egui::Frame::NONE
-        .fill(Color32::from_rgba_unmultiplied(17, 24, 41, 220))
-        .stroke(Stroke::new(
-            1.0_f32,
-            Color32::from_rgba_unmultiplied(148, 163, 184, 30),
-        ))
-        .corner_radius(CornerRadius::same(radius))
-        .inner_margin(Margin::same(15))
+fn soft_card_frame(_radius: u8) -> egui::Frame {
+    T::card()
 }
 
 fn glow_kpi_card(
@@ -3165,33 +2569,413 @@ fn glow_kpi_card(
     value: &str,
     sub: &str,
     text_col: Color32,
-    accent: Color32,
+    _accent: Color32,
 ) {
-    egui::Frame::NONE
-        .fill(Color32::from_rgba_unmultiplied(17, 24, 41, 228))
-        .stroke(Stroke::new(
-            1.0_f32,
-            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 68),
-        ))
-        .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::same(15))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(label)
-                    .small()
-                    .strong()
-                    .color(Color32::from_rgb(130, 148, 178)),
-            );
-            ui.add_space(4.0);
-            ui.label(RichText::new(value).strong().size(24.0).color(text_col));
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(sub)
-                    .small()
-                    .color(Color32::from_rgb(148, 163, 184)),
-            );
+    T::kpi_card(ui, label, value, sub, text_col);
+}
+
+/// A sidebar row: optional status dot, label, right-aligned mono count.
+fn sidebar_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    dot: Option<Color32>,
+    label: &str,
+    count: &str,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    let p = ui.painter_at(rect);
+    let fill = if selected {
+        T::HOVER
+    } else if resp.hovered() {
+        Color32::from_rgb(0x14, 0x18, 0x1D)
+    } else {
+        Color32::TRANSPARENT
+    };
+    p.rect_filled(rect, CornerRadius::same(T::R_CONTROL), fill);
+    let mut x = rect.left() + 10.0;
+    if let Some(c) = dot {
+        p.circle_filled(Pos2::new(x + 3.0, rect.center().y), 3.0, c);
+        x += 14.0;
+    }
+    let cg = p.layout_no_wrap(count.to_string(), T::mono_font(11.0), T::TEXT_3);
+    let max_w = (rect.right() - 10.0 - cg.size().x - 8.0 - x).max(20.0);
+    let color = if selected { T::TEXT } else { T::TEXT_2 };
+    let g = p.layout(label.to_string(), T::ui_font(13.0), color, max_w);
+    let g = if g.rows.len() > 1 {
+        p.layout_no_wrap(truncate_label(label, 22), T::ui_font(13.0), color)
+    } else {
+        g
+    };
+    p.galley(Pos2::new(x, rect.center().y - g.size().y * 0.5), g, color);
+    p.galley(
+        Pos2::new(
+            rect.right() - 10.0 - cg.size().x,
+            rect.center().y - cg.size().y * 0.5,
+        ),
+        cg,
+        T::TEXT_3,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Agent activity for a project: MCP telemetry plus uncommitted changes.
+fn load_activity(db: &Database, cg: &CodeGraph, repo_root: &Path) -> AgentActivity {
+    let rows = db.agent_telemetry(5000).unwrap_or_default();
+    let resolver = QueryResolver::new(&cg.files, &cg.symbols);
+    build_activity(
+        &rows,
+        &resolver,
+        crate::git::working_tree_changes(repo_root),
+        chrono::Utc::now(),
+    )
+}
+
+/// Cheap fingerprint to tell whether reloaded activity differs from what is shown.
+fn activity_fingerprint(a: &AgentActivity) -> (usize, usize, usize, Option<String>, usize) {
+    (
+        a.calls,
+        a.attributed,
+        a.session.len(),
+        a.session.last().map(|s| s.timestamp.clone()),
+        a.changed.len(),
+    )
+}
+
+fn note_when(created_at: &str) -> String {
+    created_at.chars().take(10).collect()
+}
+
+fn note_item(n: &ProjectNote) -> MemItem {
+    let kind = if n.kind == "note" {
+        MemKind::Note
+    } else {
+        MemKind::Decision
+    };
+    let text = if n.reason.trim().is_empty() {
+        n.content.clone()
+    } else {
+        format!("{} ({}: {})", n.content, n.kind, n.reason)
+    };
+    MemItem {
+        kind,
+        text,
+        target: n.target.clone(),
+        when: note_when(&n.created_at),
+    }
+}
+
+/// Notes, decisions and health findings attached to a file.
+fn file_mem(lp: &LoadedProject, path: &str) -> Vec<MemItem> {
+    let mut out: Vec<MemItem> = lp
+        .notes
+        .iter()
+        .filter(|n| note_target_matches(&n.target, path))
+        .map(note_item)
+        .collect();
+    if let Some(fs) = lp.findings.get(path) {
+        out.extend(fs.iter().map(|f| MemItem {
+            kind: MemKind::Finding,
+            text: f.clone(),
+            target: path.to_string(),
+            when: String::new(),
+        }));
+    }
+    out
+}
+
+fn comm_color(lp: &LoadedProject, cid: Option<&str>) -> Color32 {
+    cid.and_then(|c| lp.community_color.get(c))
+        .map(|&i| T::community_color(i))
+        .unwrap_or(T::NOTE)
+}
+
+/// Scene for one nested level. Counts come from the view; nothing is added or dropped.
+fn nested_scene(lp: &LoadedProject, view: &NestedView) -> Scene {
+    let ng = NestedGraph::new(&lp.graph);
+    let act = &lp.activity;
+    let mut nodes = Vec::with_capacity(view.nodes.len());
+    for nn in &view.nodes {
+        let node = match nn.kind {
+            NestedKind::Community => {
+                let files = lp
+                    .community_files
+                    .get(&nn.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                SceneNode {
+                    id: nn.id.clone(),
+                    label: nn.label.clone(),
+                    kind: NodeKind::Community,
+                    color: comm_color(lp, Some(&nn.id)),
+                    group: 0,
+                    rank: files
+                        .iter()
+                        .map(|f| lp.file_rank.get(f).copied().unwrap_or(0.0))
+                        .sum(),
+                    tokens: nn.tokens,
+                    child_count: nn.child_count,
+                    location: None,
+                    detail: String::new(),
+                    signature: String::new(),
+                    drill: nn.drill.clone(),
+                    heat: files
+                        .iter()
+                        .map(|f| act.heat.get(f).copied().unwrap_or(0))
+                        .sum(),
+                    changed: files.iter().any(|f| act.changed.contains(f)),
+                    mem: files.iter().flat_map(|f| file_mem(lp, f)).collect(),
+                }
+            }
+            NestedKind::File => {
+                let path = nn.id.strip_prefix("f:").unwrap_or(&nn.id);
+                SceneNode {
+                    id: nn.id.clone(),
+                    label: nn.label.clone(),
+                    kind: NodeKind::File,
+                    color: comm_color(lp, ng.community_id_of(path)),
+                    group: 0,
+                    rank: lp.file_rank.get(path).copied().unwrap_or(0.0),
+                    tokens: nn.tokens,
+                    child_count: nn.child_count,
+                    location: Some(path.to_string()),
+                    detail: default_registry().display_name_for(&nn.detail),
+                    signature: String::new(),
+                    drill: nn.drill.clone(),
+                    heat: act.heat.get(path).copied().unwrap_or(0),
+                    changed: act.changed.contains(path),
+                    mem: file_mem(lp, path),
+                }
+            }
+            NestedKind::Symbol => {
+                let sid = nn.id.strip_prefix("s:").unwrap_or(&nn.id);
+                let sym = lp.graph.symbols.get(sid);
+                let file = sym.map(|s| s.file_path.as_str());
+                SceneNode {
+                    id: nn.id.clone(),
+                    label: nn.label.clone(),
+                    kind: NodeKind::Symbol,
+                    color: comm_color(lp, file.and_then(|f| ng.community_id_of(f))),
+                    group: 0,
+                    rank: lp.graph.pagerank.get(sid).copied().unwrap_or(0.0),
+                    tokens: nn.tokens,
+                    child_count: 0,
+                    location: nn.location.clone(),
+                    detail: nn.detail.clone(),
+                    signature: sym.map(|s| s.signature.clone()).unwrap_or_default(),
+                    drill: None,
+                    heat: act.symbol_heat.get(sid).copied().unwrap_or(0),
+                    changed: false,
+                    mem: lp
+                        .notes
+                        .iter()
+                        .filter(|n| note_target_matches(&n.target, &nn.label))
+                        .map(note_item)
+                        .collect(),
+                }
+            }
+        };
+        nodes.push(node);
+    }
+    let edges: Vec<SceneEdge> = view
+        .edges
+        .iter()
+        .map(|e| SceneEdge {
+            src: e.src,
+            tgt: e.tgt,
+            weight: e.weight,
+        })
+        .collect();
+    let portals: Vec<Portal> = view
+        .external
+        .iter()
+        .map(|g| {
+            let color = match &g.level {
+                Some(NestedLevel::Community(c)) => comm_color(lp, Some(c)),
+                Some(NestedLevel::File(f)) => comm_color(lp, ng.community_id_of(f)),
+                _ => T::NOTE,
+            };
+            Portal {
+                label: g.label.clone(),
+                color,
+                count: g.count,
+                level: g.level.clone(),
+                from: g.from.clone(),
+            }
+        })
+        .collect();
+
+    // Where trail steps land on this level.
+    let node_ix: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    let portal_of = |level: &NestedLevel| {
+        portals
+            .iter()
+            .position(|p| p.level.as_ref() == Some(level))
+            .map(Target::Portal)
+    };
+    let mut locate: HashMap<String, Target> = HashMap::new();
+    for step in &act.session {
+        for f in &step.files {
+            let cid = ng.community_id_of(f);
+            let t = match &view.level {
+                NestedLevel::Project => cid.and_then(|c| node_ix.get(c)).map(|&i| Target::Node(i)),
+                NestedLevel::Community(c) if cid == Some(c.as_str()) => node_ix
+                    .get(format!("f:{f}").as_str())
+                    .map(|&i| Target::Node(i)),
+                NestedLevel::Community(_) => {
+                    cid.and_then(|c| portal_of(&NestedLevel::Community(c.to_string())))
+                }
+                NestedLevel::File(p) if p == f => None,
+                NestedLevel::File(_) => portal_of(&NestedLevel::File(f.clone())),
+            };
+            if let Some(t) = t {
+                locate.insert(f.clone(), t);
+            }
+        }
+        if let (NestedLevel::File(_), Some(sid)) = (&view.level, &step.symbol)
+            && let Some(&i) = node_ix.get(format!("s:{sid}").as_str())
+        {
+            locate.insert(sid.clone(), Target::Node(i));
+        }
+    }
+
+    let project_name = Path::new(&lp.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Project")
+        .to_string();
+    let (title, hint) = match &view.level {
+        NestedLevel::Project => (
+            project_name,
+            format!(
+                "{} communities · double-click one to open it",
+                fmt_num(view.nodes.len())
+            ),
+        ),
+        NestedLevel::Community(_) => (
+            view.breadcrumbs
+                .last()
+                .map(|b| b.0.clone())
+                .unwrap_or_default(),
+            format!(
+                "{} files · pills lead to the communities these edges reach",
+                fmt_num(view.nodes.len())
+            ),
+        ),
+        NestedLevel::File(p) => (
+            p.clone(),
+            format!(
+                "{} symbols · pills are the files these edges reach",
+                fmt_num(view.nodes.len())
+            ),
+        ),
+    };
+    Scene::new(
+        title,
+        hint,
+        NestedGraph::coverage_line(view),
+        nodes,
+        edges,
+        portals,
+        Vec::new(),
+        false,
+        locate,
+    )
+}
+
+/// Scene with every visible file, clustered by community or by folder.
+fn all_files_scene(lp: &LoadedProject, by_folder: bool, visible: &[bool]) -> Scene {
+    let ng = NestedGraph::new(&lp.graph);
+    let act = &lp.activity;
+    let mut new_ix: HashMap<usize, usize> = HashMap::new();
+    let mut group_ix: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(String, Color32)> = Vec::new();
+    let mut nodes = Vec::new();
+    let mut locate = HashMap::new();
+    for (i, gn) in lp.nodes.iter().enumerate() {
+        if !visible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let cid = ng.community_id_of(&gn.id);
+        let color = comm_color(lp, cid);
+        let (gkey, glabel, gcolor) = if by_folder {
+            (gn.group_folder.clone(), gn.group_folder.clone(), T::TEXT_3)
+        } else {
+            let c = cid.unwrap_or("").to_string();
+            let label = cid
+                .and_then(|c| lp.community_label.get(c))
+                .cloned()
+                .unwrap_or_default();
+            (c, label, color)
+        };
+        let next = groups.len();
+        let g = *group_ix.entry(gkey).or_insert_with(|| {
+            groups.push((glabel, gcolor));
+            next
         });
+        new_ix.insert(i, nodes.len());
+        locate.insert(gn.id.clone(), Target::Node(nodes.len()));
+        nodes.push(SceneNode {
+            id: format!("f:{}", gn.id),
+            label: gn.label.clone(),
+            kind: NodeKind::File,
+            color,
+            group: g,
+            rank: gn.rank,
+            tokens: gn.tokens,
+            child_count: gn.symbols.len(),
+            location: Some(gn.id.clone()),
+            detail: default_registry().display_name_for(&gn.language),
+            signature: String::new(),
+            drill: Some(NestedLevel::File(gn.id.clone())),
+            heat: act.heat.get(&gn.id).copied().unwrap_or(0),
+            changed: act.changed.contains(&gn.id),
+            mem: file_mem(lp, &gn.id),
+        });
+    }
+    let edges: Vec<SceneEdge> = lp
+        .edges
+        .iter()
+        .filter_map(|e| {
+            Some(SceneEdge {
+                src: *new_ix.get(&e.src)?,
+                tgt: *new_ix.get(&e.tgt)?,
+                weight: 1,
+            })
+        })
+        .collect();
+    let hidden = lp.nodes.len() - nodes.len();
+    let coverage = format!(
+        "{} of {} files{} · {} file-to-file edges between shown files",
+        fmt_num(nodes.len()),
+        fmt_num(lp.nodes.len()),
+        if hidden > 0 {
+            format!(" ({} hidden by filters)", fmt_num(hidden))
+        } else {
+            String::new()
+        },
+        fmt_num(edges.len())
+    );
+    let title = if by_folder {
+        "All files by folder"
+    } else {
+        "All files by community"
+    };
+    Scene::new(
+        title.to_string(),
+        "Scroll to zoom · drag to pan · labels appear as you zoom in".to_string(),
+        coverage,
+        nodes,
+        edges,
+        Vec::new(),
+        groups,
+        true,
+        locate,
+    )
 }
 
 fn parse_hex_color(hex: &str) -> Color32 {
@@ -3205,22 +2989,7 @@ fn parse_hex_color(hex: &str) -> Color32 {
     {
         return Color32::from_rgb(r, g, b);
     }
-    Color32::from_rgb(148, 163, 184)
-}
-
-fn cluster_color(id: usize) -> Color32 {
-    const PALETTE: [(u8, u8, u8); 8] = [
-        (56, 189, 248),
-        (52, 211, 153),
-        (251, 146, 60),
-        (167, 139, 250),
-        (244, 114, 182),
-        (251, 191, 36),
-        (34, 211, 238),
-        (248, 113, 113),
-    ];
-    let (r, g, b) = PALETTE[id % PALETTE.len()];
-    Color32::from_rgb(r, g, b)
+    T::TEXT_3
 }
 
 fn fmt_num(n: usize) -> String {

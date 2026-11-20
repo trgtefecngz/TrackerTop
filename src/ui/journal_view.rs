@@ -1,6 +1,7 @@
 //! AI Memory tab: the work journal as a readable timeline ("what the agent did and why").
 //! Kept in its own file so the tab itself changes by a single call.
 
+use super::theme as T;
 use crate::db::Database;
 use crate::journal::{TimelineItem, fmt_ts, timeline};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText};
@@ -47,28 +48,28 @@ fn load(repo: &Path) -> (Vec<TimelineItem>, usize) {
 
 fn badge(kind: &str) -> (&'static str, Color32) {
     match kind {
-        "error" => ("ERROR", Color32::from_rgb(248, 113, 113)),
-        "check" => ("CHECK", Color32::from_rgb(52, 211, 153)),
-        "progress" => ("PROGRESS", Color32::from_rgb(74, 222, 128)),
-        "tried" => ("TRIED", Color32::from_rgb(251, 191, 36)),
-        "blocked" => ("BLOCKED", Color32::from_rgb(248, 113, 113)),
-        "decision" => ("DECISION", Color32::from_rgb(192, 132, 252)),
-        "dismissed" => ("DISMISSED", Color32::from_rgb(148, 163, 184)),
-        "note" => ("NOTE", Color32::from_rgb(125, 211, 252)),
-        _ => ("CALLS", Color32::from_rgb(100, 116, 139)),
+        "error" => ("ERROR", T::DANGER),
+        "check" => ("CHECK", T::SUCCESS),
+        "progress" => ("PROGRESS", T::SUCCESS),
+        "tried" => ("TRIED", T::WARN),
+        "blocked" => ("BLOCKED", T::DANGER),
+        "decision" => ("DECISION", T::ACCENT),
+        "dismissed" => ("DISMISSED", T::TEXT_3),
+        "note" => ("NOTE", T::ACCENT),
+        _ => ("CALLS", T::TEXT_3),
     }
 }
 
 /// The collapsible timeline card shown above the notes list.
 pub(super) fn render_timeline(ui: &mut egui::Ui, repo: &Path) {
     let (items, hidden) = load(repo);
-    super::soft_card_frame(16).show(ui, |ui| {
+    T::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::CollapsingHeader::new(
             RichText::new("WORK JOURNAL: WHAT THE AGENT DID AND WHY")
-                .strong()
                 .small()
-                .color(Color32::from_rgb(125, 211, 252)),
+                .family(T::semibold_family())
+                .color(T::ACCENT),
         )
         .default_open(true)
         .show(ui, |ui| {
@@ -78,7 +79,7 @@ pub(super) fn render_timeline(ui: &mut egui::Ui, repo: &Path) {
                         "Nothing yet. Agent tool calls over MCP and remember(kind=progress|tried|blocked) entries appear here.",
                     )
                     .small()
-                    .color(Color32::from_rgb(130, 148, 178)),
+                    .color(T::TEXT_3),
                 );
                 return;
             }
@@ -86,19 +87,21 @@ pub(super) fn render_timeline(ui: &mut egui::Ui, repo: &Path) {
                 let (label, color) = badge(&item.kind);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        RichText::new(fmt_ts(&item.timestamp))
-                            .monospace()
-                            .small()
-                            .color(Color32::from_rgb(130, 148, 178)),
+                        T::mono(fmt_ts(&item.timestamp), 11.0).color(T::TEXT_3),
                     );
                     egui::Frame::NONE
                         .fill(color.gamma_multiply(0.18))
-                        .corner_radius(CornerRadius::same(8))
+                        .corner_radius(CornerRadius::same(T::R_CARD))
                         .inner_margin(Margin::symmetric(6, 1))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(label).small().strong().color(color));
+                            ui.label(
+                                RichText::new(label)
+                                    .small()
+                                    .family(T::semibold_family())
+                                    .color(color),
+                            );
                         });
-                    ui.label(RichText::new(&item.title).color(Color32::WHITE));
+                    ui.label(RichText::new(&item.title).color(T::TEXT));
                 });
                 if !item.detail.is_empty() {
                     let prefix = if matches!(item.kind.as_str(), "calls" | "check" | "error") {
@@ -109,7 +112,7 @@ pub(super) fn render_timeline(ui: &mut egui::Ui, repo: &Path) {
                     ui.label(
                         RichText::new(format!("    {prefix}{}", item.detail))
                             .small()
-                            .color(Color32::from_rgb(148, 163, 184)),
+                            .color(T::TEXT_2),
                     );
                 }
                 ui.add_space(3.0);
@@ -120,7 +123,7 @@ pub(super) fn render_timeline(ui: &mut egui::Ui, repo: &Path) {
                         "+{hidden} older entries not shown (the `resume` tool summarizes recent sessions)"
                     ))
                     .small()
-                    .color(Color32::from_rgb(130, 148, 178)),
+                    .color(T::TEXT_3),
                 );
             }
         });

@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod changes;
 pub mod checks;
 pub mod context;
