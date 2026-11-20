@@ -2027,7 +2027,8 @@ fn orphan_ignores_functions_reached_outside_the_call_graph() {
                 impl std::ops::Add for P {\n    type Output = P;\n    fn add(self, o: P) -> P {\n        P(self.0 + o.0)\n    }\n}\n\
                 fn job_handler_x() -> i32 { 1 }\n\
                 #[my_framework::route]\nfn route_handler_y() -> i32 { 2 }\n\
-                pub fn run() -> i32 {\n    let p = P(1).add(P(2));\n    p.0 + job_handler_x() + route_handler_y()\n}\n";
+                #[my_framework::command(\n    rename_all = \"x\",\n)]\nfn multi_attr_w() -> i32 { 3 }\n\
+                pub fn run() -> i32 {\n    let p = P(1).add(P(2));\n    p.0 + job_handler_x() + route_handler_y() + multi_attr_w()\n}\n";
     std::fs::write(root.join("src/lib.rs"), base).unwrap();
     std::fs::write(root.join("jobs.yml"), "jobs:\n  - job_handler_x\n").unwrap();
     git_in(root, &["init", "-q", "-b", "main"]);
@@ -2035,7 +2036,7 @@ fn orphan_ignores_functions_reached_outside_the_call_graph() {
     git_in(root, &["commit", "-q", "-m", "base"]);
     git_in(root, &["checkout", "-q", "-b", "work"]);
     let head = base.replace(
-        "    let p = P(1).add(P(2));\n    p.0 + job_handler_x() + route_handler_y()\n",
+        "    let p = P(1).add(P(2));\n    p.0 + job_handler_x() + route_handler_y() + multi_attr_w()\n",
         "    let p = P(1) + P(2);\n    p.0\n",
     );
     std::fs::write(root.join("src/lib.rs"), head).unwrap();
@@ -2092,6 +2093,15 @@ fn read_symbol_reads_a_line_range() {
         .unwrap()
         .text;
     assert!(out.contains("NOT INDEXED"), "{out}");
+    // `path::name` with a numeric name is a symbol lookup, not a range
+    let out = engine
+        .read_symbol("src/lib.rs::7", false, 1_000)
+        .unwrap()
+        .text;
+    assert!(
+        !out.contains("# LINES") && !out.contains("`src/lib.rs:`"),
+        "{out}"
+    );
 }
 
 /// A struct-like enum variant (`Msg::Move { x }`) or an associated type (`T::Output`,

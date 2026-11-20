@@ -1816,7 +1816,7 @@ fn parse_line_range(query: &str) -> Option<(String, usize, usize)> {
     let (a, b) = range.split_once('-').unwrap_or((range, range));
     let b = b.strip_prefix('L').unwrap_or(b);
     let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
-    if a == 0 || b < a || path.is_empty() {
+    if a == 0 || b < a || path.is_empty() || path.ends_with(':') {
         return None;
     }
     Some((path.trim().replace('\\', "/"), a, b))

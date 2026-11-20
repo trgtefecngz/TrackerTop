@@ -91,12 +91,28 @@ fn registered(text: Option<&String>, sym: &Symbol) -> bool {
     let Some(text) = text else { return true };
     let lines: Vec<&str> = text.lines().collect();
     let is_attr = |l: &str| l.starts_with("#[") || l.starts_with('@');
-    // Attributes above the span, skipping doc comments, and any inside its first lines
+    // Lines above the span back to the previous item, so a decorator or attribute spread
+    // over several lines (`@app.route(\n  "/x",\n)`) is seen from its first line: stop at
+    // a blank line, the end of the previous item, or another definition
+    let starts_item = |l: &str| {
+        [
+            "def ",
+            "async def ",
+            "class ",
+            "fn ",
+            "pub fn ",
+            "pub(crate) fn ",
+            "func ",
+        ]
+        .iter()
+        .any(|p| l.starts_with(p))
+    };
     let above = lines[..sym.start_line.saturating_sub(1).min(lines.len())]
         .iter()
         .rev()
+        .take(30)
         .map(|l| l.trim())
-        .take_while(|l| is_attr(l) || l.starts_with("///") || l.starts_with('#'));
+        .take_while(|l| !l.is_empty() && !l.ends_with('}') && !l.ends_with(';') && !starts_item(l));
     let inside = lines
         .iter()
         .skip(sym.start_line.saturating_sub(1))
