@@ -103,9 +103,10 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
     );
     let copied = (|| -> std::io::Result<()> {
         let mut src = File::open(path)?;
-        let mut out = File::create(&tmp)?;
+        let mut out = create_private_file(&tmp)?;
         std::io::copy(&mut src, &mut out)?;
-        out.sync_all()
+        out.sync_all()?;
+        copy_unix_permissions(path, &tmp)
     })();
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&tmp);
@@ -113,13 +114,7 @@ pub fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
             .with_context(|| format!("failed to back up {} to {}", path.display(), bak.display()));
     }
 
-    let published = match std::fs::hard_link(&tmp, &bak) {
-        Ok(()) => Ok(()),
-        // Another installer published its (equally pristine) copy first: keep that one.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        // No hard-link support on this filesystem (e.g. FAT32).
-        Err(_) => publish_by_locked_rename(&tmp, &bak).map(|_| ()),
-    };
+    let published = publish_backup(&tmp, &bak, true);
     let _ = std::fs::remove_file(&tmp);
     published.with_context(|| format!("failed to publish backup {}", bak.display()))?;
     // Whoever published (us or a racing installer), it must be a real file.
@@ -143,16 +138,54 @@ fn ensure_backup_is_regular_file(bak: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fallback publish for filesystems without hard links. `rename` replaces an existing
-/// destination, so the exists-check and the rename run under an OS lock: two racing
-/// installers can never both publish. Returns whether THIS call published the backup.
-fn publish_by_locked_rename(tmp: &Path, bak: &Path) -> Result<bool> {
+/// Publishes the finished temp copy as the backup unless one already exists. Returns whether
+/// THIS call published it.
+///
+/// The whole check-and-publish runs under one OS lock, so it is race-free whichever way a
+/// racer publishes: with a hard link (no-clobber on its own) or, on filesystems without hard
+/// links (e.g. FAT32), with `rename`, which would otherwise replace an existing backup.
+fn publish_backup(tmp: &Path, bak: &Path, try_hard_link: bool) -> Result<bool> {
     let _guard = FileLock::acquire(bak, Duration::from_secs(3))?;
-    if bak.exists() {
+    if std::fs::symlink_metadata(bak).is_ok() {
         return Ok(false);
+    }
+    if try_hard_link {
+        match std::fs::hard_link(tmp, bak) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(_) => {} // no hard-link support: fall through to rename
+        }
     }
     std::fs::rename(tmp, bak)?;
     Ok(true)
+}
+
+/// Creates a new file readable only by its owner on Unix (so a private config's contents are
+/// never exposed while being copied); a normal create elsewhere.
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Gives the backup the same Unix permission bits as the original config, so a backup is
+/// never more readable than the file it protects. (On Windows the copy inherits the folder's
+/// ACLs, like the original next to it.)
+fn copy_unix_permissions(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+    }
+    Ok(())
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
@@ -330,8 +363,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(bak).unwrap(), "original");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn fallback_publish_lets_exactly_one_racer_win() {
+    fn backup_is_never_more_readable_than_the_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secrets.json");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bak = backup_file(&p).unwrap().unwrap();
+        let mode = std::fs::metadata(bak).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Racers mixing both publish strategies (hard link and the rename fallback, e.g. a
+    /// transient hard-link failure) must still produce exactly one winner.
+    #[test]
+    fn mixed_publish_strategies_let_exactly_one_racer_win() {
         let dir = tempfile::tempdir().unwrap();
         let bak = dir.path().join("cfg.json.trackertop.bak");
         let tmps: Vec<PathBuf> = (0..8)
@@ -350,7 +398,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, t)| {
                     let bak = &bak;
-                    s.spawn(move || publish_by_locked_rename(t, bak).unwrap().then_some(i))
+                    s.spawn(move || publish_backup(t, bak, i % 2 == 0).unwrap().then_some(i))
                 })
                 .collect();
             handles

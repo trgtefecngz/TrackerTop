@@ -646,13 +646,16 @@ fn bump_meta(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replaces all edges and returns how many rows are actually stored. Duplicate edges in
-/// `edges` collapse into one row (`INSERT OR REPLACE`), so `edges.len()` can over-count.
+/// Replaces all edges and returns how many rows are actually stored. Duplicate edges
+/// (same source, target and kind) collapse into one row, so `edges.len()` can over-count;
+/// the strongest weight is kept, independent of the order the resolver produced them in.
 fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<usize> {
     conn.execute("DELETE FROM edges", [])?;
     let mut stmt = conn.prepare(
-        "INSERT OR REPLACE INTO edges (source_id, target_id, kind, weight)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO edges (source_id, target_id, kind, weight)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(source_id, target_id, kind)
+         DO UPDATE SET weight = max(weight, excluded.weight)",
     )?;
     for e in edges {
         stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
@@ -718,14 +721,15 @@ mod tests {
     fn reported_edge_count_matches_stored_rows_after_dedup() {
         let repo = tempfile::tempdir().unwrap();
         let mut db = Database::open_for_repo(repo.path()).unwrap();
-        let e = |s: &str| Edge {
+        let e = |s: &str, weight: f32| Edge {
             source_id: s.to_string(),
             target_id: "t".to_string(),
             kind: EdgeKind::Calls,
-            weight: 1.0,
+            weight,
         };
-        // Duplicate (source, target, kind) collapses into a single stored row
-        let edges = [e("a"), e("a"), e("b")];
+        // Duplicate (source, target, kind) collapses into a single stored row that keeps the
+        // strongest weight, whichever order the duplicates arrive in.
+        let edges = [e("a", 2.0), e("a", 0.5), e("b", 1.0)];
         let built_from = db.files_generation().unwrap();
         let committed = db
             .replace_edges_if_current(&edges, built_from)
@@ -733,6 +737,13 @@ mod tests {
             .unwrap();
         assert_eq!(committed.edge_count, 2);
         assert_eq!(db.index_totals().unwrap().2, 2);
+        let a = db
+            .load_all_edges()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.source_id == "a")
+            .unwrap();
+        assert_eq!(a.weight, 2.0);
     }
 
     #[test]

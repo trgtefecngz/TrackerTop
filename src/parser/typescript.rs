@@ -245,28 +245,12 @@ impl LanguageExtractor for TypeScriptExtractor {
             if (trimmed.starts_with("test(") || trimmed.starts_with("it("))
                 && let Some(test_name) = extract_quoted_path(trimmed)
             {
-                // `it("works", runCase);` has no body of its own: searching for the next `{`
-                // would swallow the following functions/classes into this test. Judge the
-                // line by its code only (no comments, no string contents), and keep
-                // Allman-style tests whose `{` opens on the next line
-                // (`it("x", function ()` + newline + `{`).
-                let code_view = ts_code_only(trimmed);
-                let code = code_view.trim_end();
-                let next_line_opens_body = lines[i + 1..]
-                    .iter()
-                    .map(|l| l.trim())
-                    .find(|l| !l.is_empty())
-                    .is_some_and(|l| l.starts_with('{'));
-                // An argument list still open at the end of the line continues on the next one.
-                let parens_balanced = code.matches('(').count() <= code.matches(')').count();
-                let statement_ends_here = !code.contains('{')
-                    && parens_balanced
-                    && (code.ends_with(';') || (code.ends_with(')') && !next_line_opens_body));
-                let end_idx = if statement_ends_here {
-                    i
-                } else {
-                    find_brace_end(&lines, i)
-                };
+                // A test is exactly the `it(` / `test(` call: it ends where that call's
+                // parenthesis closes. This covers one-line calls (`it("x", runCase);`),
+                // block bodies, Allman braces, comments before the `{`, argument lists that
+                // continue on later lines and expression-bodied arrows, without guessing
+                // from braces (which made the test swallow the following code).
+                let end_idx = find_call_end(&lines, i);
                 let block = lines[i..=end_idx].join("\n");
                 let sym_id = make_symbol_id(file_path, &test_name, line_no);
                 out.symbols.push(Symbol {
@@ -456,6 +440,33 @@ fn normalize_ts_import(spec: &str) -> String {
         .trim_start_matches("../")
         .trim_start_matches('/')
         .to_string()
+}
+
+/// Index of the line where the call whose first `(` is on line `start` closes, scanning the
+/// code-only view (parentheses inside strings and comments are ignored). If the call never
+/// closes (malformed or truncated source), the call is treated as one line rather than
+/// swallowing the rest of the file.
+fn find_call_end(lines: &[&str], start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        for ch in ts_code_only(line).chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    opened = true;
+                }
+                ')' => {
+                    depth -= 1;
+                    if opened && depth <= 0 {
+                        return idx;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    start
 }
 
 /// Index of the line that closes the first `{` opened at or after `start`. Braces inside
@@ -701,5 +712,37 @@ mod tests {
             .find(|s| s.kind == SymbolKind::Test)
             .unwrap();
         assert_eq!((test.start_line, test.end_line), (1, 4));
+    }
+
+    fn test_span(src: &str) -> (usize, usize, bool) {
+        let out = parse(src);
+        let t = out
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Test)
+            .unwrap();
+        let helper_kept = out.symbols.iter().any(|s| s.name == "helperAfter");
+        (t.start_line, t.end_line, helper_kept)
+    }
+
+    #[test]
+    fn comment_between_test_header_and_allman_brace_keeps_the_body() {
+        let src = "it(\"commented\", function ()\n// arrange\n{\n  run();\n});\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        assert_eq!(test_span(src), (1, 5, true));
+    }
+
+    #[test]
+    fn expression_bodied_multi_line_test_does_not_swallow() {
+        let src = "it(\"expr\", () =>\n  expect(run()).toBe(1));\n\
+                   function helperAfter() {\n  return 1;\n}\n";
+        assert_eq!(test_span(src), (1, 2, true));
+    }
+
+    #[test]
+    fn unterminated_test_call_is_one_line_not_the_rest_of_the_file() {
+        let src = "it(\"broken\", () => {\nfunction helperAfter() {\n  return 1;\n}\n";
+        let (start, end, _) = test_span(src);
+        assert_eq!((start, end), (1, 1));
     }
 }

@@ -176,7 +176,11 @@ pub fn index_repository_with_registry(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // Never take the fast path on an untrusted record: an mtime that cannot be read here
+        // falls back to the same value as the UNTRUSTED_MTIME sentinel and would otherwise
+        // "match" it.
         if let Some(prev) = existing.get(&rel_path)
+            && prev.mtime_secs != UNTRUSTED_MTIME
             && prev.mtime_secs == mtime
             && prev.size_bytes == size
         {
