@@ -71,7 +71,7 @@ Two things stay deliberate:
 | `new-cycle` | A dependency cycle present in head but not in base |
 | `broken-ref` | A removed or renamed symbol that is still referenced |
 | `cochange-miss` | Files that changed together with these files in ≥ N past commits but not in this PR |
-| `bloat` | Files that crossed the token-bloat threshold in this PR |
+| `bloat` | Files that crossed the repository's oversized-file threshold (same as `health_check`) in this PR |
 | `orphan` | Code made unreachable by this PR |
 
 4. **Output.**

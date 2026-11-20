@@ -305,7 +305,10 @@ fn walk_items(
                         parent_id: Some(parent_id.to_string()),
                     });
 
+                    // A call to a local closure (`let base = |p| ..; base(x)`) is not a
+                    // call to a namesake function: marking its name seen skips it
                     let mut seen_calls = HashSet::new();
+                    local_closures(node, bytes, &mut seen_calls);
                     let mut seen_types = HashSet::new();
                     let call_kind = if is_test {
                         EdgeKind::Tests
@@ -356,7 +359,9 @@ fn collect_calls(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "call_expression" => {
-                if let Some(func) = child.child_by_field_name("function") {
+                if let Some(func) = child.child_by_field_name("function")
+                    && !on_std_iterator(func, bytes)
+                {
                     let raw = node_text(func, bytes).trim();
                     let target = extract_callable_name(raw, self_ty);
                     if is_interesting_call(target.trim_start_matches('.'))
@@ -440,6 +445,16 @@ fn token_tree_calls(tt: Node, bytes: &[u8]) -> Vec<String> {
             .iter()
             .map(|n| node_text(*n, bytes))
             .collect();
+        // `.count()` after `x.lines()` or `.filter(..)` is a std iterator method
+        if start >= 4
+            && toks[start - 1].kind() == "."
+            && toks[start - 2].kind() == "token_tree"
+            && toks[start - 3].kind() == "identifier"
+            && toks[start - 4].kind() == "."
+            && is_std_iterator_adapter(node_text(toks[start - 3], bytes))
+        {
+            continue;
+        }
         if start >= 1 && toks[start - 1].kind() == "." {
             out.push(format!(".{path}"));
         } else {
@@ -447,6 +462,90 @@ fn token_tree_calls(tt: Node, bytes: &[u8]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Names bound to a closure by a `let` inside `node` (`let f = |x| ..;`, `let f = move || ..;`).
+fn local_closures(node: Node, bytes: &[u8], out: &mut HashSet<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "let_declaration"
+            && let (Some(pat), Some(value)) = (
+                child.child_by_field_name("pattern"),
+                child.child_by_field_name("value"),
+            )
+            && pat.kind() == "identifier"
+            && value.kind() == "closure_expression"
+        {
+            out.insert(node_text(pat, bytes).trim().to_string());
+        }
+        local_closures(child, bytes, out);
+    }
+}
+
+/// Whether a call's callee is a method on the result of a standard iterator adapter or
+/// source (`s.chars().count()`, `v.iter().filter(..).all(..)`): the receiver is a std
+/// iterator, so the method is never one of the project's, whatever its name.
+fn on_std_iterator(func: Node, bytes: &[u8]) -> bool {
+    if func.kind() != "field_expression" {
+        return false;
+    }
+    let Some(recv) = func.child_by_field_name("value") else {
+        return false;
+    };
+    if recv.kind() != "call_expression" {
+        return false;
+    }
+    recv.child_by_field_name("function")
+        .filter(|f| f.kind() == "field_expression")
+        .and_then(|f| f.child_by_field_name("field"))
+        .is_some_and(|name| is_std_iterator_adapter(node_text(name, bytes).trim()))
+}
+
+/// Methods of `str`, slices, maps and `Iterator` that return a std iterator.
+fn is_std_iterator_adapter(name: &str) -> bool {
+    matches!(
+        name,
+        "iter"
+            | "iter_mut"
+            | "into_iter"
+            | "chars"
+            | "char_indices"
+            | "bytes"
+            | "lines"
+            | "split"
+            | "rsplit"
+            | "splitn"
+            | "split_whitespace"
+            | "split_terminator"
+            | "matches"
+            | "keys"
+            | "values"
+            | "values_mut"
+            | "drain"
+            | "windows"
+            | "chunks"
+            | "map"
+            | "filter"
+            | "filter_map"
+            | "flat_map"
+            | "flatten"
+            | "take_while"
+            | "skip_while"
+            | "map_while"
+            | "take"
+            | "skip"
+            | "rev"
+            | "enumerate"
+            | "zip"
+            | "chain"
+            | "cloned"
+            | "copied"
+            | "peekable"
+            | "step_by"
+            | "inspect"
+            | "scan"
+            | "fuse"
+    )
 }
 
 fn collect_type_refs(

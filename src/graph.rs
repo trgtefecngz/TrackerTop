@@ -5,7 +5,7 @@ use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CommunitySummary {
@@ -77,9 +77,22 @@ pub struct ImpactReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthReport {
-    pub bloated_files: Vec<(String, usize, usize)>, // (path, tokens, lines)
-    pub circular_groups: Vec<Vec<String>>,          // strongly connected file cycles (>= 2 files)
-    pub orphan_files: Vec<String>, // code files with 0 incoming non-containment edges
+    /// Size outliers `(path, tokens, lines)`, largest first: code files above
+    /// `bloat_threshold`.
+    pub bloated_files: Vec<(String, usize, usize)>,
+    /// The size outliers are measured against (see [`CodeGraph::bloat_threshold`]).
+    pub bloat_threshold: usize,
+    /// Code files the size distribution covers.
+    pub code_files: usize,
+    /// Groups of ≥ 2 files that depend on each other in a cycle through code.
+    pub circular_groups: Vec<Vec<String>>,
+    /// Rust files left out of cycle detection (module cycles in one crate are allowed).
+    pub cycle_exempt_files: usize,
+    /// Code files nothing in another file refers to.
+    pub orphan_files: Vec<String>,
+    /// Unreferenced files that are not orphans: entry points and scripts run directly,
+    /// `(path, reason)`.
+    pub orphan_excluded: Vec<(String, String)>,
 }
 
 /// `(hop distance, edge kind, symbol)` entries returned by [`CodeGraph::neighborhood`].
@@ -482,93 +495,223 @@ impl CodeGraph {
         Some(syms)
     }
 
-    /// Computes AI-focused repository health diagnostics:
-    /// - Bloated files (> 3,500 tokens) that hurt LLM context efficiency
-    /// - Circular file dependency cycles (via Tarjan SCC)
-    /// - Orphan code files with 0 incoming references
-    pub fn health_report(&self) -> HealthReport {
-        // 1. Token-bloat files
-        let mut bloated_files: Vec<(String, usize, usize)> = self
-            .files
-            .values()
-            .filter(|f| f.token_count >= 3500)
-            .map(|f| (f.path.clone(), f.token_count, f.line_count))
-            .collect();
-        bloated_files.sort_by_key(|f| std::cmp::Reverse(f.1));
-
-        // 2. Build directed file-level dependency graph (excluding CoChanges & Contains)
-        let mut file_graph: DiGraph<String, ()> = DiGraph::new();
-        let mut path_to_idx: HashMap<String, NodeIndex> = HashMap::new();
-        let mut sorted_paths: Vec<String> = self.files.keys().cloned().collect();
-        sorted_paths.sort();
-        for p in &sorted_paths {
-            let idx = file_graph.add_node(p.clone());
-            path_to_idx.insert(p.clone(), idx);
-        }
-        let mut seen_file_edges: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
-        let mut has_incoming: HashSet<String> = HashSet::new();
-
+    /// File-to-file dependencies through code only (calls, type uses, impls, imports)
+    /// between code files: doc mentions and co-change history are not dependencies. Rust
+    /// files are left out: modules of one crate depend on each other freely and such cycles
+    /// are not a problem there, unlike import cycles in JS/TS or Python. Each pair keeps one
+    /// example `path:line source symbol -> path:line target symbol`. Shared by
+    /// [`CodeGraph::health_report`] and the review's `new-cycle` rule.
+    pub fn code_file_edges(&self) -> BTreeMap<(String, String), String> {
+        let mut out = BTreeMap::new();
         for e in &self.edges {
-            if matches!(e.kind, EdgeKind::Contains | EdgeKind::CoChanges) {
+            if !matches!(
+                e.kind,
+                EdgeKind::Calls | EdgeKind::UsesType | EdgeKind::Implements | EdgeKind::Imports
+            ) {
                 continue;
             }
-            let (Some(src), Some(tgt)) = (
+            let (Some(s), Some(t)) = (
                 self.symbols.get(&e.source_id),
                 self.symbols.get(&e.target_id),
             ) else {
                 continue;
             };
-            if src.file_path == tgt.file_path {
+            if s.file_path == t.file_path
+                || !self.in_cycle_scope(&s.file_path)
+                || !self.in_cycle_scope(&t.file_path)
+            {
                 continue;
             }
-            has_incoming.insert(tgt.file_path.clone());
-            if let (Some(&si), Some(&ti)) = (
-                path_to_idx.get(&src.file_path),
-                path_to_idx.get(&tgt.file_path),
-            ) && seen_file_edges.insert((si, ti))
-            {
-                file_graph.add_edge(si, ti, ());
-            }
+            out.entry((s.file_path.clone(), t.file_path.clone()))
+                .or_insert_with(|| {
+                    format!(
+                        "{}:{} {} -> {}:{} {}",
+                        s.file_path,
+                        s.start_line,
+                        s.qualified_name,
+                        t.file_path,
+                        t.start_line,
+                        t.qualified_name
+                    )
+                });
         }
+        out
+    }
 
-        // Strongly connected components of size >= 2 are real circular dependency cycles
-        let mut circular_groups: Vec<Vec<String>> = petgraph::algo::tarjan_scc(&file_graph)
-            .into_iter()
-            .filter(|scc| scc.len() >= 2)
-            .map(|scc| {
-                let mut names: Vec<String> =
-                    scc.into_iter().map(|i| file_graph[i].clone()).collect();
-                names.sort();
-                names
-            })
-            .collect();
-        circular_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    /// Whether cycle detection looks at this file: code in a language whose import cycles
+    /// are a problem (see [`CodeGraph::code_file_edges`]).
+    fn in_cycle_scope(&self, path: &str) -> bool {
+        self.files
+            .get(path)
+            .is_some_and(|f| !CYCLE_EXEMPT_LANGUAGES.contains(&f.language.as_str()))
+    }
 
-        // 3. Orphan code files (excluding obvious entry points, tests, docs, configs)
-        let mut orphan_files: Vec<String> = self
+    /// The size above which a code file counts as bloated in this repository: the upper
+    /// Tukey fence of code-file sizes (Q3 + 1.5 × IQR), never below [`BLOAT_FLOOR_TOKENS`].
+    /// A fixed threshold flags half of a repository whose files are all fairly large, which
+    /// makes the warning useless; the fence flags only the files that stand out from the
+    /// rest, and the floor keeps files an agent still reads whole in one read off the list.
+    pub fn bloat_threshold(&self) -> usize {
+        let mut sizes: Vec<usize> = self
             .files
             .values()
-            .filter(|f| !matches!(f.language.as_str(), "markdown" | "toml"))
-            .filter(|f| !has_incoming.contains(&f.path))
-            .filter(|f| {
-                let base = f.path.rsplit('/').next().unwrap_or(&f.path);
-                !matches!(
-                    base,
-                    "main.rs" | "lib.rs" | "mod.rs" | "build.rs" | "index.html"
-                ) && !f.path.starts_with("tests/")
-                    && !f.path.starts_with("examples/")
-                    && !f.path.contains("/tests/")
-            })
-            .map(|f| f.path.clone())
+            .filter(|f| !NOT_CODE_LANGUAGES.contains(&f.language.as_str()))
+            .map(|f| f.token_count)
             .collect();
+        sizes.sort_unstable();
+        tukey_upper_fence(&sizes).map_or(BLOAT_FLOOR_TOKENS, |f| f.max(BLOAT_FLOOR_TOKENS))
+    }
+
+    /// Computes AI-focused repository health diagnostics:
+    /// - bloated files: size outliers among this repository's code files, largest first
+    ///   (see [`CodeGraph::bloat_threshold`]);
+    /// - circular file dependencies through code (Tarjan SCC over
+    ///   [`CodeGraph::code_file_edges`]; Rust module cycles are allowed and not reported);
+    /// - orphan code files with no incoming reference, leaving out entry points and scripts
+    ///   that are run directly (listed in `orphan_excluded` with the reason).
+    pub fn health_report(&self) -> HealthReport {
+        let is_code = |f: &&FileRecord| !NOT_CODE_LANGUAGES.contains(&f.language.as_str());
+
+        // 1. Size outliers, largest first
+        let code_files = self.files.values().filter(is_code).count();
+        let bloat_threshold = self.bloat_threshold();
+        let mut bloated_files: Vec<(String, usize, usize)> = self
+            .files
+            .values()
+            .filter(is_code)
+            .filter(|f| f.token_count > bloat_threshold)
+            .map(|f| (f.path.clone(), f.token_count, f.line_count))
+            .collect();
+        bloated_files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        // 2. Cycles through code, in languages where they matter
+        let mut circular_groups: Vec<Vec<String>> = file_cycles(&self.code_file_edges())
+            .into_iter()
+            .map(|c| c.into_iter().collect())
+            .collect();
+        circular_groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        let cycle_exempt_files = self.files.values().filter(|f| f.language == "rust").count();
+
+        // 3. Orphan code files: nothing in another file refers to them
+        let mut has_incoming: HashSet<&str> = HashSet::new();
+        for e in &self.edges {
+            if matches!(e.kind, EdgeKind::Contains | EdgeKind::CoChanges) {
+                continue;
+            }
+            if let (Some(s), Some(t)) = (
+                self.symbols.get(&e.source_id),
+                self.symbols.get(&e.target_id),
+            ) && s.file_path != t.file_path
+            {
+                has_incoming.insert(t.file_path.as_str());
+            }
+        }
+        let mut orphan_files = Vec::new();
+        let mut orphan_excluded = Vec::new();
+        for f in self.files.values().filter(is_code) {
+            if has_incoming.contains(f.path.as_str()) {
+                continue;
+            }
+            match entry_point_reason(&f.path) {
+                Some(reason) => orphan_excluded.push((f.path.clone(), reason.to_string())),
+                None => orphan_files.push(f.path.clone()),
+            }
+        }
         orphan_files.sort();
+        orphan_excluded.sort();
 
         HealthReport {
             bloated_files,
+            bloat_threshold,
+            code_files,
             circular_groups,
+            cycle_exempt_files,
             orphan_files,
+            orphan_excluded,
         }
     }
+}
+
+/// Languages that are not code: never bloat outliers or orphans.
+const NOT_CODE_LANGUAGES: &[&str] = &["markdown", "toml", "json"];
+
+/// Languages whose files are left out of cycle detection: Rust modules of one crate may
+/// depend on each other in a cycle, and markup/data files have no imports that matter.
+const CYCLE_EXEMPT_LANGUAGES: &[&str] = &["markdown", "toml", "json", "rust", "html", "css"];
+
+/// A file at or under this size is never reported as bloated, whatever the distribution:
+/// about 800 lines, which an agent still reads whole in one ordinary file read.
+pub const BLOAT_FLOOR_TOKENS: usize = 8_000;
+
+/// Upper Tukey fence `Q3 + 1.5 × IQR` of sorted sizes (quartiles by linear
+/// interpolation); `None` below 4 values, where quartiles say nothing.
+fn tukey_upper_fence(sorted: &[usize]) -> Option<usize> {
+    if sorted.len() < 4 {
+        return None;
+    }
+    let q = |p: f64| {
+        let pos = p * (sorted.len() - 1) as f64;
+        let lo = pos.floor() as usize;
+        let hi = pos.ceil() as usize;
+        sorted[lo] as f64 + (sorted[hi] as f64 - sorted[lo] as f64) * (pos - lo as f64)
+    };
+    let (q1, q3) = (q(0.25), q(0.75));
+    Some((q3 + 1.5 * (q3 - q1)).round() as usize)
+}
+
+/// Why a file with no incoming reference is still not an orphan: it is an entry point or a
+/// script that is run directly (by a user, a build tool, CI or a test runner).
+fn entry_point_reason(path: &str) -> Option<&'static str> {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let ext = base.rsplit_once('.').map_or("", |(_, e)| e);
+    let under =
+        |dir: &str| path.starts_with(&format!("{dir}/")) || path.contains(&format!("/{dir}/"));
+    if under("tests") || under("benches") || under("examples") {
+        Some("test, bench or example target")
+    } else if under(".github") || under("ci") {
+        Some("CI script")
+    } else if under("scripts")
+        || under("bin")
+        || matches!(ext, "ps1" | "sh" | "bash" | "bat" | "cmd")
+    {
+        Some("script run directly")
+    } else if base == "build.rs" {
+        Some("build script")
+    } else if matches!(
+        base,
+        "lib.rs"
+            | "mod.rs"
+            | "index.html"
+            | "__main__.py"
+            | "__init__.py"
+            | "setup.py"
+            | "manage.py"
+            | "conftest.py"
+    ) || base.starts_with("main.")
+    {
+        Some("entry point or module root")
+    } else {
+        None
+    }
+}
+
+/// Groups of files that depend on each other in a cycle (strongly connected, ≥ 2 files).
+pub fn file_cycles(edges: &BTreeMap<(String, String), String>) -> Vec<BTreeSet<String>> {
+    let mut g: DiGraph<String, ()> = DiGraph::new();
+    let mut idx: BTreeMap<String, NodeIndex> = BTreeMap::new();
+    for (a, b) in edges.keys() {
+        for p in [a, b] {
+            if !idx.contains_key(p) {
+                idx.insert(p.clone(), g.add_node(p.clone()));
+            }
+        }
+        g.add_edge(idx[a], idx[b], ());
+    }
+    petgraph::algo::tarjan_scc(&g)
+        .into_iter()
+        .filter(|scc| scc.len() >= 2)
+        .map(|scc| scc.into_iter().map(|i| g[i].clone()).collect())
+        .collect()
 }
 
 fn bfs_neighbors(
@@ -809,4 +952,41 @@ pub(crate) fn infer_community_label(files: &[String]) -> String {
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(d, _)| d.to_string())
         .unwrap_or_else(|| "cluster".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tukey_fence_flags_only_outliers() {
+        assert_eq!(tukey_upper_fence(&[1, 2, 3]), None);
+        // Q1 = 2, Q3 = 4 (linear interpolation over 1..=5), IQR = 2: fence = 4 + 3 = 7
+        assert_eq!(tukey_upper_fence(&[1, 2, 3, 4, 5]), Some(7));
+        assert_eq!(tukey_upper_fence(&[10, 10, 10, 10]), Some(10));
+    }
+
+    #[test]
+    fn scripts_and_entry_points_are_not_orphans() {
+        for (path, reason) in [
+            ("scripts/install.ps1", "script run directly"),
+            ("tools/setup.sh", "script run directly"),
+            ("src/bin/cli.rs", "script run directly"),
+            (".github/scripts/release.py", "CI script"),
+            ("build.rs", "build script"),
+            ("tests/api.rs", "test, bench or example target"),
+            ("pkg/__main__.py", "entry point or module root"),
+            ("cmd/main.go", "entry point or module root"),
+        ] {
+            assert_eq!(entry_point_reason(path), Some(reason), "{path}");
+        }
+        for path in [
+            "src/util.rs",
+            "lib/helpers.py",
+            "web/app.ts",
+            "src/binary.rs",
+        ] {
+            assert_eq!(entry_point_reason(path), None, "{path}");
+        }
+    }
 }

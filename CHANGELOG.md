@@ -11,8 +11,16 @@ All notable changes to TrackerTop are documented here.
 - `trackertop hook-hint` (the Claude Code SessionStart hook) now prints a short `resume` (about 500 tokens) after the usual hint, for new sessions and after `/compact`. It reads the hook's stdin JSON for the working directory, never creates an index, takes about 0.3 s on this repository, and falls back to the plain hint on any error or after 0.9 s.
 - The desktop app's AI Memory tab shows the journal as a timeline: what the agent did (runs of calls collapsed, failures and check results on their own rows) and why (notes with their reasons).
 
+### Fixed: the health check reports only real issues
+- **Cycles** now count only dependencies through code: calls, type uses, impls and imports. They use the same language-aware rule as `review`'s `new-cycle`. Doc mentions are not dependencies, and Rust module cycles inside one crate are allowed. The output says how many Rust files were left out.
+- **Orphans** no longer include entry points and scripts that are run directly: installers, `scripts/`, `bin/`, CI scripts, `build.rs`, test, bench and example targets, and `main.*`. These are listed apart with the reason.
+- **Oversized files** replace the fixed 3,500-token "bloat" threshold, which flagged half of a typical repository. A file is oversized when it is a size outlier among the repository's code files: above Q3 + 1.5 × IQR, and never at 8,000 tokens or below. Files are listed largest first, with the threshold. The review's `bloat` rule uses the same threshold.
+- The output states what it covered.
+- Call edges in Rust are more accurate. A method called on a std iterator chain (`s.lines().count()`) no longer binds to a project method with the same name. Nor does a value call that reaches an associated function without `self`, a method that several types define, or a call to a local closure. Existing indexes are re-parsed once (extractor revision 7).
+
 ### Changed
 - `changes_since` and `resume` run their git processes side by side.
+- `src/context.rs`, `src/ui.rs` and `tests/integration_test.rs` are split into modules by tool family, by tab and by feature (`tests/journal.rs` holds the continuity tests). Behaviour is unchanged.
 
 ## [0.8.0] - 2026-11-20
 

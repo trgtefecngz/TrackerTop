@@ -1,0 +1,163 @@
+//! Memory notes, decisions and dismissed leads, and MCP client tagging.
+
+mod common;
+
+use common::*;
+use serde_json::json;
+use tempfile::TempDir;
+use trackertop::context::TrackerEngine;
+use trackertop::indexer::index_repository;
+use trackertop::mcp::handle_jsonrpc_message;
+
+#[test]
+fn decisions_and_dismissed_leads_surface_when_code_is_read() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn run() {}\n\npub fn run_checks() {}\n",
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let saved = engine
+        .remember_kind(
+            "run",
+            "keep run() synchronous",
+            "decision",
+            "callers hold a lock",
+        )
+        .unwrap();
+    assert!(saved.contains("Saved decision #"), "{saved}");
+    engine
+        .remember_kind(
+            "src/lib.rs",
+            "possible race in run_checks",
+            "dismissed",
+            "single-threaded by design, verified",
+        )
+        .unwrap();
+    assert!(engine.remember_kind("run", "x", "decision", "").is_err());
+
+    let run = engine.read_symbol("run", false, 2_000).unwrap().text;
+    assert!(
+        run.contains("Decision #1 [run]: keep run() synchronous (why: callers hold a lock)"),
+        "{run}"
+    );
+    let checks = engine.read_symbol("run_checks", false, 2_000).unwrap().text;
+    assert!(
+        !checks.contains("keep run() synchronous"),
+        "note on `run` leaked: {checks}"
+    );
+    assert!(
+        checks.contains("Dismissed lead #2 [src/lib.rs]: possible race in run_checks"),
+        "{checks}"
+    );
+    let outline = engine.file_outline("src/lib.rs", 2_000).unwrap().text;
+    assert!(outline.contains("Decision #1 [run]"), "{outline}");
+    assert!(outline.contains("Dismissed lead #2"), "{outline}");
+
+    let recalled = engine.recall(Some("dismissed")).unwrap();
+    assert!(recalled.contains("# SAVED MEMORY NOTES (1)"), "{recalled}");
+    assert!(root.join(".trackertop/notes/00001-decision.md").is_file());
+}
+
+#[test]
+fn mcp_calls_are_tagged_with_the_client_name() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "pub fn tagged() {}\n").unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"clientInfo":{"name":"claude-code\n<script>","version":"1"}}}),
+    )
+    .unwrap();
+    handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"read_symbol","arguments":{"symbol":"tagged"}}}),
+    )
+    .unwrap();
+    let stats = engine.token_stats().unwrap();
+    assert_eq!(stats.total_queries, 1);
+    assert_eq!(stats.recent[0].source, "mcp:claude-codescript");
+    assert_eq!(stats.recent[0].tool, "read_symbol");
+
+    // A CLI engine on the same repo is recorded separately, not as agent usage
+    let cli = TrackerEngine::new(tmp.path());
+    cli.read_symbol("tagged", false, 500).unwrap();
+    let stats = cli.token_stats().unwrap();
+    assert_eq!(stats.total_queries, 1);
+    assert!(
+        stats
+            .by_source
+            .iter()
+            .any(|s| s.source == "cli" && s.queries == 1)
+    );
+}
+
+/// Note provenance: a note records the commit and a hash of its target's code. When that
+/// code changes, the note is still shown but flagged, and a dismissed review finding is
+/// raised again instead of staying hidden.
+#[test]
+fn notes_are_flagged_when_their_code_changes() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let v1 = "pub fn old_api() -> i32 { 1 }\npub fn caller() -> i32 {\n    old_api()\n}\npub fn steady() -> i32 {\n    5\n}\n";
+    std::fs::write(root.join("src/lib.rs"), v1).unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+    let v2 = v1.replace("pub fn old_api() -> i32 { 1 }\n", "");
+    std::fs::write(root.join("src/lib.rs"), &v2).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    engine
+        .remember_kind(
+            "caller",
+            "returns the legacy value on purpose",
+            "decision",
+            "API contract",
+        )
+        .unwrap();
+    engine
+        .remember_kind(
+            "steady",
+            "keep it constant",
+            "decision",
+            "used as a sentinel",
+        )
+        .unwrap();
+    let id = "broken-ref:src/lib.rs:old_api";
+    engine
+        .remember_kind(id, "generated by build.rs", "dismissed", "checked build.rs")
+        .unwrap();
+    let recalled = engine.recall(None).unwrap();
+    assert!(!recalled.contains("POSSIBLY OUTDATED"), "{recalled}");
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(
+        out.contains("Dismissed earlier, not shown again (1)"),
+        "{out}"
+    );
+
+    // caller's body changes; steady does not
+    let v3 = v2.replace("    old_api()\n", "    old_api() + 1\n");
+    std::fs::write(root.join("src/lib.rs"), &v3).unwrap();
+    let caller = engine.read_symbol("caller", false, 2_000).unwrap().text;
+    assert!(caller.contains("POSSIBLY OUTDATED"), "{caller}");
+    let steady = engine.read_symbol("steady", false, 2_000).unwrap().text;
+    assert!(steady.contains("keep it constant"), "{steady}");
+    assert!(!steady.contains("POSSIBLY OUTDATED"), "{steady}");
+
+    // The dismissed finding's code changed: it is raised again, with the old dismissal
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(out.contains(&format!("id: `{id}`")), "{out}");
+    assert!(out.contains("dismissed earlier"), "{out}");
+    assert!(!out.contains("Dismissed earlier, not shown again"), "{out}");
+}
