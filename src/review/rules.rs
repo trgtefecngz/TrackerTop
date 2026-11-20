@@ -332,11 +332,21 @@ fn untested(cs: &ChangeSet, head: &CodeGraph, out: &mut Vec<Finding>) {
                 s.change.as_str(),
                 s.qualified_name
             ),
-            evidence: vec![format!(
-                "{} direct and {} transitive callers, none of them a test",
-                report.direct_dependents.len(),
-                report.transitive_dependents.len()
-            )],
+            evidence: vec![if report.direct_dependents.is_empty() {
+                // Nothing in the graph calls it: it may still be used in ways static
+                // resolution does not see (passed as a value, a method sharing a std name
+                // like `push`, a trait call), so this is the weakest kind of evidence
+                "no callers found in the graph at all: it may be unused, or called in a way \
+                 the graph cannot resolve (passed as a value, a std-named method, a trait \
+                 call); grep for it before acting"
+                    .to_string()
+            } else {
+                format!(
+                    "{} direct and {} transitive callers, none of them a test",
+                    report.direct_dependents.len(),
+                    report.transitive_dependents.len()
+                )
+            }],
         });
     }
 }
