@@ -2,6 +2,7 @@
 name = "trackertop"
 version = "0.5.1"
 edition = "2024"
+rust-version = "1.89"
 description = "AI-first codebase knowledge graph, surgical context packer, MCP server, native multi-project desktop app, and token-savings tracker"
 license = "MIT"
 repository = "https://github.com/trgtefecngz/TrackerTop"

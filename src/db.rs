@@ -5,7 +5,7 @@ use crate::model::{
 use crate::tokens::estimate_usd_saved;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -153,12 +153,28 @@ impl Database {
         Ok(v)
     }
 
+    fn meta_value(&self, key: &str) -> i64 {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Bumped (inside the same transaction) whenever file/symbol/raw-ref rows change.
+    pub fn files_generation(&self) -> Result<i64> {
+        Ok(self.meta_value("files_generation"))
+    }
+
+    /// The `files_generation` the current edge set was built from. When it lags behind
+    /// `files_generation` (a crash or a lost race between upsert and edge rebuild), the next
+    /// index run rebuilds the edges.
+    pub fn edges_generation(&self) -> Result<i64> {
+        Ok(self.meta_value("edges_generation"))
+    }
+
     pub fn bump_index_generation(&self) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES('index_generation', 1)
-             ON CONFLICT(key) DO UPDATE SET value = value + 1",
-            [],
-        )?;
+        bump_meta(&self.conn, "index_generation")?;
         self.index_generation()
     }
 
@@ -234,6 +250,7 @@ impl Database {
                 stmt.execute(params![p])?;
             }
         }
+        bump_meta(&tx, "files_generation")?;
         tx.commit()?;
         Ok(())
     }
@@ -310,24 +327,51 @@ impl Database {
                 }
             }
         }
+        bump_meta(&tx, "files_generation")?;
         tx.commit()?;
         Ok(())
     }
 
+    /// Unconditionally replaces all edges (tests / tools). Indexing uses
+    /// [`Database::replace_edges_if_current`].
     pub fn replace_edges(&mut self, edges: &[Edge]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM edges", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO edges (source_id, target_id, kind, weight)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for e in edges {
-                stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
-            }
-        }
+        write_edges(&tx, edges)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replaces the edge set ONLY if no file rows changed since `built_from`
+    /// (`files_generation` read before loading the data the edges were resolved from).
+    ///
+    /// Without this check, a slower concurrent indexer could overwrite a newer, complete
+    /// edge set with one resolved from a stale snapshot, and since later runs see no file
+    /// changes, the missing edges would never come back. Returns `false` when the snapshot
+    /// is stale; the caller re-resolves and retries. On success it also records
+    /// `edges_generation` and bumps `index_generation`, all in one transaction.
+    pub fn replace_edges_if_current(&mut self, edges: &[Edge], built_from: i64) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: i64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'files_generation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if current != built_from {
+            return Ok(false); // dropping `tx` rolls back
+        }
+        write_edges(&tx, edges)?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('edges_generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [built_from],
+        )?;
+        bump_meta(&tx, "index_generation")?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn load_all_files(&self) -> Result<Vec<FileRecord>> {
@@ -602,9 +646,66 @@ impl Database {
     }
 }
 
+/// Increments a `meta` counter. Pass a `Transaction` to make it part of that transaction.
+fn bump_meta(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, 1)
+         ON CONFLICT(key) DO UPDATE SET value = value + 1",
+        [key],
+    )?;
+    Ok(())
+}
+
+fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<()> {
+    conn.execute("DELETE FROM edges", [])?;
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO edges (source_id, target_id, kind, weight)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for e in edges {
+        stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_rec(path: &str, hash: &str) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: hash.to_string(),
+            mtime_secs: 1,
+            size_bytes: 1,
+            line_count: 1,
+            token_count: 1,
+        }
+    }
+
+    #[test]
+    fn stale_edge_snapshot_cannot_overwrite_newer_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut slow = Database::open_for_repo(repo.path()).unwrap();
+        let mut fast = Database::open_for_repo(repo.path()).unwrap();
+
+        // `slow` snapshots the files, then `fast` writes newer file rows
+        let snapshot = slow.files_generation().unwrap();
+        fast.upsert_parsed_files(&[(file_rec("src/a.rs", "h1"), vec![], vec![])])
+            .unwrap();
+
+        assert!(!slow.replace_edges_if_current(&[], snapshot).unwrap());
+        assert_ne!(
+            slow.edges_generation().unwrap(),
+            slow.files_generation().unwrap(),
+            "edges are marked stale so the next index run rebuilds them"
+        );
+
+        let fresh = slow.files_generation().unwrap();
+        assert!(slow.replace_edges_if_current(&[], fresh).unwrap());
+        assert_eq!(slow.edges_generation().unwrap(), fresh);
+    }
 
     #[test]
     fn cache_dir_gets_self_ignoring_gitignore() {
