@@ -17,8 +17,9 @@ use std::time::{Instant, UNIX_EPOCH};
 /// every file whose content did not change. (1: v0.8, Rust macro-argument and method calls;
 /// 2: Rust type uses inside function bodies; 3: Python on tree-sitter;
 /// 4: Go on tree-sitter; 5: Python/Go syntax-error recovery;
-/// 6: Rust paths: variants and associated items are not type uses.)
-pub const EXTRACTOR_REVISION: i64 = 6;
+/// 6: Rust paths: variants and associated items are not type uses;
+/// 7: Rust methods called on a std iterator chain are not references.)
+pub const EXTRACTOR_REVISION: i64 = 7;
 
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -588,7 +589,16 @@ fn resolve_edges(
                     } else {
                         syms
                     };
-                    let candidates = call_candidates(syms, method_call, is_rust);
+                    let mut candidates = call_candidates(syms, method_call, is_rust);
+                    // The receiver's type is unknown: when several types in other files
+                    // define the method (`s.parse()` vs. every extractor's `parse`), any
+                    // pick is a guess. A method in the caller's own file is still preferred.
+                    if method_call
+                        && candidates.len() > 1
+                        && !candidates.iter().any(|s| &s.file_path == src_file)
+                    {
+                        candidates.clear();
+                    }
                     if let Some(best) = pick_nearest_symbol(&candidates, src_file) {
                         resolved_targets.push(best.id.clone());
                     }
@@ -708,7 +718,7 @@ fn call_candidates<'a>(syms: &[&'a Symbol], method_call: bool, is_rust: bool) ->
         return syms
             .iter()
             .copied()
-            .filter(|s| s.kind == SymbolKind::Method)
+            .filter(|s| s.kind == SymbolKind::Method && takes_self(&s.signature))
             .collect();
     }
     let callable: Vec<&Symbol> = syms
@@ -734,6 +744,46 @@ fn call_candidates<'a>(syms: &[&'a Symbol], method_call: bool, is_rust: bool) ->
     } else {
         callable
     }
+}
+
+/// Whether a method signature takes a receiver (`self`, `&self`, `&'a mut self`,
+/// `self: Box<Self>`): only such a method can be called on a value (`x.f()`). An
+/// associated function such as `fn all() -> [Self; 4]` cannot, so `iter.all(..)` must not
+/// bind to it. A signature with no parameter list is kept: nothing proves it wrong.
+fn takes_self(signature: &str) -> bool {
+    let mut depth = 0i32;
+    let mut open = None;
+    for (i, c) in signature.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '(' if depth <= 0 => {
+                open = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return true;
+    };
+    let first = signature[open + 1..]
+        .split([',', ')'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('&')
+        .trim_start();
+    // Drop a lifetime (`'a`) and `mut`
+    let first = match first.strip_prefix('\'') {
+        Some(rest) => rest
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, r)| r)
+            .trim_start(),
+        None => first,
+    };
+    let first = first.strip_prefix("mut ").unwrap_or(first).trim_start();
+    first == "self" || first.starts_with("self:") || first.starts_with("self :")
 }
 
 /// Resolves a Rust callee kept qualified by the extractor (see `extract_callable_name`):
@@ -801,6 +851,28 @@ fn pick_best_symbol<'a>(syms: &[&'a Symbol], src_file: &str, segs: &[&str]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_methods_with_a_receiver_take_self() {
+        for sig in [
+            "pub fn count(&self) -> usize",
+            "fn f(self)",
+            "fn f(mut self, x: u8)",
+            "fn f<'a>(&'a mut self) -> &'a str",
+            "fn f<T: Into<String>>(&self, t: T)",
+            "fn f(self: Box<Self>)",
+            "def f(self, x):",
+        ] {
+            assert!(takes_self(sig), "{sig}");
+        }
+        for sig in [
+            "pub fn all() -> [Self; 4]",
+            "fn new(selfish: u8) -> Self",
+            "fn f<F: Fn(&Self)>(f: F)",
+        ] {
+            assert!(!takes_self(sig), "{sig}");
+        }
+    }
 
     #[test]
     fn refuses_home_directory_and_filesystem_root() {

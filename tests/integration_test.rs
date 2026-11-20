@@ -2141,3 +2141,72 @@ fn rust_variant_and_associated_names_are_not_type_uses() {
     // A module path names the type at its end
     assert_eq!(targets_of("modpath"), vec!["Deep"]);
 }
+
+/// A Rust method call on a value reaches only a project method that takes `self`, and a
+/// call on a standard iterator chain (`s.chars().count()`) reaches no project method at
+/// all: these false edges once tied `src/parser/*` to `ChangeSet::count` in `src/review`.
+/// A value-method name that several other types define (`s.parse()` vs. every extractor's
+/// `parse`) is ambiguous and gets no edge, and a local closure shadows a namesake function.
+#[test]
+fn rust_method_calls_on_std_values_never_bind_to_a_namesake() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/other.rs"),
+        r#"pub struct A;
+pub struct B;
+impl A { pub fn parse(&self) -> u8 { 1 } }
+impl B { pub fn parse(&self) -> u8 { 2 } }
+pub fn base_name(p: &str) -> &str { p }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"mod other;
+pub fn num(s: &str) -> u8 { s.parse().unwrap_or(0) }
+pub fn shadow(p: &str) -> usize { let base_name = |s: &str| s.len(); base_name(p) }
+pub fn real_free(p: &str) -> &str { other::base_name(p) }
+pub struct Set { n: usize }
+impl Set {
+    pub fn count(&self) -> usize { self.n }
+    pub fn all() -> Vec<Set> { Vec::new() }
+}
+pub fn letters(s: &str) -> usize { s.chars().filter(|c| c.is_alphabetic()).count() }
+pub fn lines_in(s: &str) -> usize { s.lines().count().max(1) }
+pub fn hashes(s: &str) -> usize { s.chars().take_while(|c| *c == '#').count() }
+pub fn all_set(mut it: impl Iterator<Item = u8>) -> bool { it.all(|b| b > 0) }
+pub fn in_macro(s: &str) { assert_eq!(s.lines().count(), 1); }
+pub fn real(s: &Set) -> usize { s.count() }
+pub fn real_in_macro(s: &Set) { assert_eq!(s.count(), 0); }
+pub fn real_assoc() -> usize { Set::all().len() }
+"#,
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+
+    let calls: Vec<(String, String)> = edge_set(root)
+        .into_iter()
+        .filter(|(_, _, k)| k == "CALLS")
+        .map(|(s, t, _)| (s, t))
+        .collect();
+    let from = |f: &str| -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|(s, _)| s.contains(&format!("::{f}#")))
+            .map(|(_, t)| t.as_str())
+            .collect()
+    };
+    assert_eq!(from("real_free").len(), 1, "{calls:?}");
+    for f in [
+        "letters", "lines_in", "hashes", "all_set", "in_macro", "num", "shadow",
+    ] {
+        assert!(from(f).is_empty(), "{f}: {calls:?}");
+    }
+    assert_eq!(from("real").len(), 1, "{calls:?}");
+    assert!(from("real")[0].contains("::Set::count#"), "{calls:?}");
+    assert_eq!(from("real_in_macro").len(), 1, "{calls:?}");
+    assert_eq!(from("real_assoc").len(), 1, "{calls:?}");
+    assert!(from("real_assoc")[0].contains("::Set::all#"), "{calls:?}");
+}
