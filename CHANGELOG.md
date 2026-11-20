@@ -2,6 +2,29 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [Unreleased]
+
+### Changed: desktop app redesign
+- New design system: one accent colour on dark neutrals, flat cards with 1px borders, a spacing and type scale. Glows, aurora gradients and saturated fills are gone.
+- Inter (UI) and JetBrains Mono (code) are embedded in the binary (SIL Open Font License; see `assets/fonts/`).
+- Code Graph:
+  - Nested is the default layout.
+  - Every layout is force-directed and clustered: Clusters by community, Folders by folder.
+  - Node colour shows the community; node size shows PageRank.
+  - Edges are curved. In Clusters and Folders, edges between groups are bundled below 110% zoom, and the coverage line says how many.
+  - More labels appear as you zoom in. A label that would cover another is skipped, except for the hovered or selected node and its neighbours.
+  - Hovering a node dims everything not connected to it.
+  - Drilling in or out is animated.
+  - A minimap shows the current view and can be clicked to move it.
+  - Edges that leave a nested level are drawn as pills that name where they go and how many there are. Their counts add up to the coverage line's "edges leave this scope". Click a pill to open that level.
+- Agent activity layer:
+  - Nodes glow by how many MCP calls named them in the last 7 days.
+  - Files with uncommitted changes get a dashed ring.
+  - The latest agent session is drawn as a numbered path you can replay.
+  - Badges mark notes (N), decisions (D) and health findings (!).
+  - A telemetry query counts toward a node only when it names a single file or symbol. Free-text queries and ambiguous names are not counted.
+- An inspector panel shows the selected node: PageRank, tokens, edges, agent activity, notes and findings.
+
 ## [0.7.0] - 2026-11-20
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
