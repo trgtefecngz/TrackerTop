@@ -1,5 +1,7 @@
 #![cfg(feature = "gui")]
 
+mod journal_view;
+
 mod graph_view;
 mod theme;
 #[cfg(debug_assertions)]
@@ -2151,6 +2153,7 @@ impl TrackerTopApp {
         ui.add_space(12.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            journal_view::render_timeline(ui, Path::new(&repo_path));
             if lp.notes.is_empty() {
                 soft_card_frame(16).show(ui, |ui| {
                     ui.set_width(ui.available_width());

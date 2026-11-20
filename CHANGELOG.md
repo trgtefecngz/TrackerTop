@@ -2,6 +2,18 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [Unreleased]
+
+### Added: cross-session continuity
+- **Work journal.** The MCP server records every tool call per agent session (one server process = one session, which survives `/compact`): tool, compacted arguments and outcome (`ok`, the RESULT or findings line of checks and reviews, NOT FOUND misses, or the error). Kept per project in the index DB, newest 20,000 calls.
+- `remember` takes three more kinds: `progress` (a milestone), `tried` (an approach that failed, with why) and `blocked` (with what blocks it). A blocked entry stays open until a later `progress` entry on the same target, or one that mentions its `#id`, closes it. Notes now record the session that wrote them; the Markdown mirror keeps it.
+- New MCP tool `resume` (also `trackertop query resume`): uncommitted work with touched symbols and lines, the `## Next` and `## Kararını bekleyenler` sections of the newest `docs/*PROGRESS*.md` with file:line, open blockers, failed approaches, open review findings (minus later dismissals), decisions with **POSSIBLY OUTDATED** ones first, the progress log, and what recent sessions did (tools, focus, check results, errors). Agent calls recorded as telemetry before the journal existed are included, grouped by day. Every item is dated; capped lists say how many items they hide.
+- `trackertop hook-hint` (the Claude Code SessionStart hook) now prints a short `resume` (about 500 tokens) after the usual hint, for new sessions and after `/compact`. It reads the hook's stdin JSON for the working directory, never creates an index, takes about 0.3 s on this repository, and falls back to the plain hint on any error or after 0.9 s.
+- The desktop app's AI Memory tab shows the journal as a timeline: what the agent did (runs of calls collapsed, failures and check results on their own rows) and why (notes with their reasons).
+
+### Changed
+- `changes_since` and `resume` run their git processes side by side.
+
 ## [0.8.0] - 2026-11-20
 
 

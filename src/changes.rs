@@ -232,10 +232,17 @@ pub fn diff_since(
     ];
     let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     args.extend(&path_refs);
-    let diff = parse_unified_diff(&git(repo_root, &args)?);
     let mut untracked_args = vec!["ls-files", "--others", "--exclude-standard", "--"];
     untracked_args.extend(&path_refs);
-    let untracked = git(repo_root, &untracked_args)?
+    // The two git processes are independent: run them side by side
+    let (diff, untracked) = std::thread::scope(|s| {
+        let untracked = s.spawn(|| git(repo_root, &untracked_args));
+        let diff = git(repo_root, &args);
+        (diff, untracked.join())
+    });
+    let diff = parse_unified_diff(&diff?);
+    let untracked = untracked
+        .map_err(|_| anyhow::anyhow!("git thread panicked"))??
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(str::to_string)
