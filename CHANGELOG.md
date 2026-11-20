@@ -6,6 +6,15 @@ All notable changes to TrackerTop are documented here.
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
+### Added: `run_checks`
+- New MCP tool. It runs the project's own test, lint, build or format command and returns a compact summary instead of the log: pass/fail counts, only the failing test names with their assertion lines and `file:line`, and compiler/linter errors with locations.
+- Commands come from `Cargo.toml`, `package.json` scripts (npm, pnpm, yarn or bun), `go.mod` and pytest/ruff config, each marked as detected or guessed. They run without a shell and are stopped by a timeout.
+- Recognized output: cargo/rustc/clippy/rustfmt, Jest, Vitest, pytest, `go test`.
+- A failure is never hidden:
+  - a failed run with nothing recognized becomes an **UNRECOGNIZED FAILURE** and includes the output tail;
+  - exit code 0 with failures in the log is not reported as passed;
+  - timeouts are marked PARTIAL.
+
 ### Changed: TypeScript / JavaScript extraction uses tree-sitter
 - `.ts`, `.tsx` and `.js`/`.jsx`/`.mjs`/`.cjs` are parsed with the tree-sitter TypeScript, TSX and JavaScript grammars. Strings, template literals, regex literals, comments and JSX can no longer shift where a symbol ends.
 - New: class fields holding arrow functions become methods, interface `extends` edges, dynamic `import("./x")`, `it.only`/`test.skip`, tests nested in `describe`. Calls inside strings and comments are no longer edges.
