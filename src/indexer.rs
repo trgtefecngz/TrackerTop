@@ -52,6 +52,24 @@ fn check_indexable_root(repo_root: &Path, home: Option<&Path>) -> Result<()> {
                 repo_root.display()
             );
         }
+        // Catch-all user folders where terminals are often opened by accident. Only the folder
+        // itself is refused (projects *inside* Desktop etc. are fine), and only when it is not
+        // a git repository on its own.
+        if !canon.join(".git").exists() {
+            for base in [home_canon.clone(), home_canon.join("OneDrive")] {
+                for name in ["Desktop", "Downloads", "Documents"] {
+                    let candidate = base.join(name);
+                    let candidate = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+                    if candidate == canon {
+                        bail!(
+                            "TrackerTop refuses to index `{}` because it is your {name} folder, \
+                             not a project. {hint}",
+                            repo_root.display()
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -497,5 +515,23 @@ mod tests {
 
         let root = home.path().ancestors().last().unwrap();
         assert!(check_indexable_root(root, None).is_err());
+    }
+
+    #[test]
+    fn refuses_bare_desktop_but_allows_projects_inside_it() {
+        let home = tempfile::tempdir().unwrap();
+        let desktop = home.path().join("Desktop");
+        let od_downloads = home.path().join("OneDrive").join("Downloads");
+        let project = desktop.join("MyApp");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&od_downloads).unwrap();
+
+        assert!(check_indexable_root(&desktop, Some(home.path())).is_err());
+        assert!(check_indexable_root(&od_downloads, Some(home.path())).is_err());
+        assert!(check_indexable_root(&project, Some(home.path())).is_ok());
+
+        // A Desktop that is itself a git repository is a deliberate choice
+        std::fs::create_dir_all(desktop.join(".git")).unwrap();
+        assert!(check_indexable_root(&desktop, Some(home.path())).is_ok());
     }
 }

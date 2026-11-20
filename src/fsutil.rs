@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Writes `contents` to `path` atomically: data goes to a sibling temp file first and is
@@ -12,14 +13,36 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let tmp = sibling_path(path, &format!("tmp-{}", std::process::id()));
+    // pid + per-process counter: unique even when several threads write the same target.
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = sibling_path(path, &format!("tmp-{}-{seq}", std::process::id()));
     std::fs::write(&tmp, contents)
         .with_context(|| format!("failed to write {}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = rename_with_retry(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("failed to replace {}", path.display()));
     }
     Ok(())
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// On Windows, replacing a file fails with `PermissionDenied` while another process
+/// (antivirus, OneDrive, search indexer) briefly holds it open without delete-sharing.
+/// Those holds last milliseconds, so retry a few times before giving up.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt + 1 < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(15 * u64::from(attempt)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Copies an existing file to `<name>.trackertop.bak` before TrackerTop modifies it.
