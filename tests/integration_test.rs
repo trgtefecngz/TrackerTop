@@ -906,3 +906,53 @@ fn outlines_state_whether_spans_come_from_a_syntax_tree() {
     let precise = engine.read_symbol("precise", false, 800).unwrap().text;
     assert!(!precise.contains("Span:"), "{precise}");
 }
+
+#[test]
+fn run_checks_summarizes_a_real_cargo_test_run() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"rc_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn passes() { assert_eq!(super::add(1, 2), 3); }\n    #[test]\n    fn fails() { assert_eq!(super::add(2, 2), 5); }\n}\n",
+    )
+    .unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let out = engine.run_checks("test", None, 600, 4_000).unwrap().text;
+    assert!(out.contains("RESULT: FAILED (exit 101)"), "{out}");
+    assert!(out.contains("1 passed, 1 failed"), "{out}");
+    assert!(out.contains("- tests::fails"), "{out}");
+    assert!(out.contains("lib.rs:8:"), "{out}");
+    assert!(!out.contains("- tests::passes"), "{out}");
+
+    let filtered = engine
+        .run_checks("test", Some("passes"), 600, 4_000)
+        .unwrap()
+        .text;
+    assert!(filtered.contains("RESULT: PASSED"), "{filtered}");
+    assert!(filtered.contains("`cargo test passes`"), "{filtered}");
+
+    // Ambiguous extra args and unknown kinds are errors, not empty results.
+    assert!(engine.run_checks("all", Some("x"), 60, 1_000).is_err());
+    let resp = handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+                "params":{"name":"run_checks","arguments":{"kind":"bogus"}}}),
+    )
+    .unwrap();
+    assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+}
+
+#[test]
+fn run_checks_says_when_no_command_is_detected() {
+    let tmp = TempDir::new().unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    let out = engine.run_checks("test", None, 60, 1_000).unwrap().text;
+    assert!(out.contains("test: NOT DETECTED"), "{out}");
+}

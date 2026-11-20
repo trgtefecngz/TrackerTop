@@ -1318,6 +1318,98 @@ impl TrackerEngine {
         Ok(out)
     }
 
+    /// 15. Runs the project's own test/lint/build/format commands (detected from project
+    ///     files) and returns a compact summary that lists every recognized failure and
+    ///     never reports an unexplained failure as success.
+    pub fn run_checks(
+        &self,
+        kind: &str,
+        extra_args: Option<&str>,
+        timeout_secs: u64,
+        max_tokens: usize,
+    ) -> Result<QueryOutput> {
+        use crate::checks::{CheckKind, detect_commands, render, run_command, summarize};
+        let start = Instant::now();
+        let kinds: Vec<CheckKind> = if kind.trim().eq_ignore_ascii_case("all") {
+            vec![CheckKind::Format, CheckKind::Lint, CheckKind::Test]
+        } else {
+            vec![CheckKind::parse(kind).ok_or_else(|| {
+                anyhow::anyhow!("unknown kind `{kind}`: use test, lint, build, format or all")
+            })?]
+        };
+        let extra: Vec<String> = extra_args
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let all = detect_commands(&self.repo_root);
+        let selected: Vec<_> = all.iter().filter(|c| kinds.contains(&c.kind)).collect();
+        if !extra.is_empty() && selected.len() != 1 {
+            anyhow::bail!(
+                "extra_args needs exactly one matching command, but kind `{kind}` matches {}: {}",
+                selected.len(),
+                selected
+                    .iter()
+                    .map(|c| format!("`{}`", c.display(&[])))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let timeout = std::time::Duration::from_secs(timeout_secs.clamp(1, 3600));
+
+        let mut summary_lines = Vec::new();
+        let mut sections = Vec::new();
+        let mut raw_tokens = 0usize;
+        for k in &kinds {
+            let cmds: Vec<_> = selected.iter().filter(|c| c.kind == *k).collect();
+            if cmds.is_empty() {
+                summary_lines.push(format!(
+                    "- {}: NOT DETECTED (checked Cargo.toml, package.json scripts, go.mod, \
+                     pytest/ruff config); run it yourself if the project has one",
+                    k.as_str()
+                ));
+                continue;
+            }
+            for cmd in cmds {
+                match run_command(&self.repo_root, cmd, &extra, timeout) {
+                    Ok(run) => {
+                        raw_tokens += count_tokens(&run.output);
+                        let text = render(cmd, &run, &summarize(&run.output));
+                        let result = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("RESULT: "))
+                            .unwrap_or("?")
+                            .to_string();
+                        summary_lines.push(format!("- {} `{}`: {result}", k.as_str(), run.command));
+                        sections.push(text);
+                    }
+                    Err(e) => summary_lines.push(format!(
+                        "- {} `{}`: COULD NOT RUN: {e:#}",
+                        k.as_str(),
+                        cmd.display(&extra)
+                    )),
+                }
+            }
+        }
+
+        let mut out = format!("# RUN_CHECKS ({kind})\n{}\n", summary_lines.join("\n"));
+        for s in sections {
+            out.push('\n');
+            out.push_str(&s);
+        }
+        let db = Database::open_for_repo(&self.repo_root)?;
+        self.finalize(
+            &db,
+            "run_checks",
+            kind,
+            out,
+            if max_tokens == 0 { 1500 } else { max_tokens },
+            raw_tokens,
+            0,
+            start,
+        )
+    }
+
     /// 8. Token-savings telemetry summary.
     pub fn token_stats(&self) -> Result<TokenStatsSummary> {
         let db = Database::open_for_repo(&self.repo_root)?;

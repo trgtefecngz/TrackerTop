@@ -209,6 +209,17 @@ fn dispatch_tool_call(
             let query = args.get("query").and_then(Value::as_str);
             engine.recall(query)
         }
+        "run_checks" => {
+            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("test");
+            let extra = args.get("extra_args").and_then(Value::as_str);
+            let timeout = args
+                .get("timeout_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(600);
+            engine
+                .run_checks(kind, extra, timeout, max_tokens)
+                .map(|q| q.text)
+        }
         "token_stats" => engine.token_stats().map(|s| {
             format!(
                 "# TRACKERTOP TOKEN SAVINGS\nQueries: {}\nTokens sent: {}\nBaseline avoided: {}\nNet saved: {} tok ({:.1}%)\nEst. USD saved: ${:.4} (Sonnet) / ${:.4} (Opus)",
@@ -401,6 +412,19 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Optional filter keyword" }
+                }
+            }
+        },
+        {
+            "name": "run_checks",
+            "description": "Run the project's tests, lint, build or format check and get a compact summary instead of the full log: pass/fail counts, ONLY the failing test names with their assertion/error lines and file:line, and compiler/linter errors with locations. Use this instead of running `cargo test`, `npm test`, `pytest`, `go test`, clippy or eslint in a shell. Commands are detected from Cargo.toml, package.json scripts, go.mod and pytest/ruff config (marked detected vs guessed). It never hides a failure: a failed run whose output it cannot parse is reported as UNRECOGNIZED FAILURE with the output tail, and timeouts are marked PARTIAL.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "test (default), lint, build, format, or all (format + lint + test)" },
+                    "extra_args": { "type": "string", "description": "Extra arguments for the single matching command, e.g. a test name filter `parser::` or `-p mycrate` (split on whitespace, no shell)" },
+                    "timeout_secs": { "type": "integer", "description": "Kill the command after this many seconds (default 600, max 3600)" },
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1500); failing names are listed before details" }
                 }
             }
         },
