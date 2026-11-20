@@ -39,7 +39,7 @@ pub fn resolve_commit(repo_root: &Path, rev: &str) -> Result<String> {
 
 /// Where the project root sits inside the repository (`""` at the top level,
 /// `packages/app/` in a monorepo package).
-fn project_prefix(repo_root: &Path) -> Result<String> {
+pub fn project_prefix(repo_root: &Path) -> Result<String> {
     Ok(git(repo_root, &["rev-parse", "--show-prefix"])?
         .trim()
         .to_string())

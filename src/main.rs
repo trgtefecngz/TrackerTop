@@ -377,7 +377,10 @@ fn main() -> Result<()> {
                 "json" => println!("{}", serde_json::to_string_pretty(&cs)?),
                 "sarif" => println!(
                     "{}",
-                    serde_json::to_string_pretty(&trackertop::review::sarif::render_sarif(&cs))?
+                    serde_json::to_string_pretty(&trackertop::review::sarif::render_sarif(
+                        &cs,
+                        &trackertop::review::snapshot::project_prefix(&repo_root)?,
+                    ))?
                 ),
                 _ => print!("{}", trackertop::review::render_markdown(&cs)),
             }

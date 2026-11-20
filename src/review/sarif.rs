@@ -41,7 +41,10 @@ fn level(s: Severity) -> &'static str {
     }
 }
 
-pub fn render_sarif(cs: &ChangeSet) -> Value {
+/// `prefix` is where the project sits in the repository (`""`, or `packages/app/` in a
+/// monorepo): review paths are project-relative, SARIF consumers read them from the
+/// repository root.
+pub fn render_sarif(cs: &ChangeSet, prefix: &str) -> Value {
     let mut rules: Vec<&str> = cs.findings.iter().map(|f| f.rule).collect();
     rules.sort_unstable();
     rules.dedup();
@@ -61,7 +64,7 @@ pub fn render_sarif(cs: &ChangeSet) -> Value {
                 "partialFingerprints": { "trackertopFindingId": f.id },
             });
             if let Some((path, region)) = head_location(f) {
-                let mut phys = json!({ "artifactLocation": { "uri": path } });
+                let mut phys = json!({ "artifactLocation": { "uri": format!("{prefix}{path}") } });
                 if let Some((a, b)) = region {
                     phys["region"] = json!({ "startLine": a, "endLine": b.max(a) });
                 }
@@ -80,7 +83,13 @@ pub fn render_sarif(cs: &ChangeSet) -> Value {
                 "informationUri": "https://github.com/trgtefecngz/TrackerTop",
                 "rules": rules.iter().map(|r| json!({ "id": r })).collect::<Vec<_>>(),
             }},
-            "versionControlProvenance": [{ "revisionId": cs.base_commit, "branch": cs.base_ref }],
+            // What was analyzed is the working tree (HEAD plus uncommitted work), compared
+            // with the base: no `versionControlProvenance`, which would name one revision
+            "properties": {
+                "analyzed": "working tree (HEAD plus uncommitted work)",
+                "baseRef": cs.base_ref,
+                "baseCommit": cs.base_commit,
+            },
             "results": results,
         }],
     })
@@ -121,5 +130,23 @@ mod tests {
             Some(("src/b.rs".into(), Some((5, 5))))
         );
         assert_eq!(head_location(&finding("was src/a.rs:L2-2", &[])), None);
+    }
+
+    #[test]
+    fn uris_are_repository_relative_in_a_monorepo_package() {
+        let cs = ChangeSet {
+            base_ref: "main".into(),
+            base_commit: "abc".into(),
+            files: vec![],
+            symbols: vec![],
+            findings: vec![finding("src/a.rs:L3-9", &[])],
+        };
+        let v = render_sarif(&cs, "packages/app/");
+        let loc = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"];
+        assert_eq!(loc["artifactLocation"]["uri"], "packages/app/src/a.rs");
+        assert_eq!(loc["region"]["startLine"], 3);
+        // The working tree was analyzed, not the base commit
+        assert!(v["runs"][0].get("versionControlProvenance").is_none());
+        assert_eq!(v["runs"][0]["properties"]["baseCommit"], "abc");
     }
 }
