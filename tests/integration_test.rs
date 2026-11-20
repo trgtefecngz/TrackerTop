@@ -1054,3 +1054,34 @@ fn changes_since_maps_working_tree_diffs_to_symbols() {
         "{err:#}"
     );
 }
+
+#[test]
+fn project_playbook_is_served_over_mcp() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run"},"engines":{"node":">=20"}}"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("CLAUDE.md"), "rules\n").unwrap();
+    let engine = TrackerEngine::new(tmp.path());
+    let resp = handle_jsonrpc_message(
+        &engine,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{"name":"project_playbook","arguments":{}}}),
+    )
+    .unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("READ FIRST (instructions for agents): CLAUDE.md"),
+        "{text}"
+    );
+    assert!(
+        text.contains("test: `npm run test` [detected from package.json scripts.test]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Node >=20 [detected from package.json engines.node]"),
+        "{text}"
+    );
+}

@@ -6,6 +6,12 @@ All notable changes to TrackerTop are documented here.
 
 v0.7 is the agent-productivity release (see `docs/ROADMAP.md`).
 
+### Added: `project_playbook`
+- New MCP tool to call once at the start of work.
+- It lists how to build, test, lint and format the project, and what CI actually runs (shell plumbing and release workflows are left out).
+- It also lists toolchain versions (edition and MSRV, Node, Go, Python), format/lint configs, Makefile/justfile targets, and the agent instruction files to read first (`CLAUDE.md`, `AGENTS.md`, …).
+- Each item is marked as detected or guessed. An ecosystem default that CI runs is marked as confirmed.
+
 ### Added: `changes_since`
 - New MCP tool: what changed in the working tree (staged, unstaged, untracked) since a git ref, `HEAD` by default.
   - For each file: the touched symbols with their current line spans, the symbols added or removed since the ref (the old version is parsed with the same extractor), and only the changed lines.

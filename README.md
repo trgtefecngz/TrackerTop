@@ -127,6 +127,7 @@ flowchart LR
 | `shortest_path` | Shortest dependency path between two symbols or files |
 | `remember` / `recall` | Persistent architectural notes, surfaced automatically in later sessions |
 | `changes_since` | What changed since a git ref (default: uncommitted work), mapped onto symbols: touched, added and removed symbols plus only the changed lines |
+| `project_playbook` | Build/test/lint/format commands, what CI runs, toolchain versions, configs and agent instruction files, each marked detected or guessed |
 | `run_checks` | Runs the project's tests, lint, build or format check and returns only counts, failing test names and error lines with file:line; never hides a failure |
 | `token_stats` | Cumulative tokens saved and estimated cost reduction |
 

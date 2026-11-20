@@ -1434,6 +1434,38 @@ impl TrackerEngine {
         )
     }
 
+    /// 17. Build/test/lint/format commands, CI steps, toolchain versions, conventions and
+    ///     agent instruction files, each marked detected (declared by the project) or guessed.
+    pub fn project_playbook(&self, max_tokens: usize) -> Result<QueryOutput> {
+        let start = Instant::now();
+        let pb = crate::playbook::build_playbook(&self.repo_root);
+        let text = crate::playbook::render(&pb);
+        let db = Database::open_for_repo(&self.repo_root)?;
+        // Baseline: the files an agent would otherwise open to learn the same things
+        let baseline: usize = pb
+            .commands
+            .iter()
+            .chain(&pb.ci_steps)
+            .chain(&pb.toolchain)
+            .chain(&pb.conventions)
+            .map(|i| i.source.split_whitespace().next().unwrap_or("").to_string())
+            .collect::<HashSet<String>>()
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(self.repo_root.join(f)).ok())
+            .map(|t| count_tokens(&t))
+            .sum();
+        self.finalize(
+            &db,
+            "project_playbook",
+            "playbook",
+            text,
+            if max_tokens == 0 { 1200 } else { max_tokens },
+            baseline,
+            0,
+            start,
+        )
+    }
+
     /// 8. Token-savings telemetry summary.
     pub fn token_stats(&self) -> Result<TokenStatsSummary> {
         let db = Database::open_for_repo(&self.repo_root)?;

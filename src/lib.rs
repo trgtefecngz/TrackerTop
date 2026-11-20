@@ -10,6 +10,7 @@ pub mod install;
 pub mod mcp;
 pub mod model;
 pub mod parser;
+pub mod playbook;
 pub mod registry;
 pub mod report;
 pub mod tokens;

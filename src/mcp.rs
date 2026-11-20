@@ -237,6 +237,7 @@ fn dispatch_tool_call(
                 .changes_since(since, &list("paths"), &list("symbols"), max_tokens)
                 .map(|q| q.text)
         }
+        "project_playbook" => engine.project_playbook(max_tokens).map(|q| q.text),
         "token_stats" => engine.token_stats().map(|s| {
             format!(
                 "# TRACKERTOP TOKEN SAVINGS\nQueries: {}\nTokens sent: {}\nBaseline avoided: {}\nNet saved: {} tok ({:.1}%)\nEst. USD saved: ${:.4} (Sonnet) / ${:.4} (Opus)",
@@ -455,6 +456,16 @@ fn tool_definitions() -> Value {
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative files or directories to limit the diff to" },
                     "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional symbols: show only hunks that touch them" },
                     "max_tokens": { "type": "integer", "description": "Token budget cap (default 2000)" }
+                }
+            }
+        },
+        {
+            "name": "project_playbook",
+            "description": "Call once at the start of work in a repo: how to build, test, lint and format it, and what CI runs (the bar a change must pass), the toolchain versions, format/lint configs, task-runner targets and agent instruction files to read first (CLAUDE.md, AGENTS.md, ...). Every item is marked detected (declared by the project) or guessed (ecosystem default). Saves opening Cargo.toml, package.json, workflows and configs one by one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": "integer", "description": "Token budget cap (default 1200)" }
                 }
             }
         },
