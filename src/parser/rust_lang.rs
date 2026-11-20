@@ -326,7 +326,15 @@ fn walk_items(
                     );
                     collect_type_refs(node, bytes, &sym_id, &mut seen_types, out);
                     if let Some(body) = node.child_by_field_name("body") {
-                        collect_body_type_refs(body, bytes, &sym_id, &mut seen_types, out);
+                        let generics = generic_names(node, bytes);
+                        collect_body_type_refs(
+                            body,
+                            bytes,
+                            &sym_id,
+                            &generics,
+                            &mut seen_types,
+                            out,
+                        );
                     }
                 }
             }
@@ -476,21 +484,24 @@ fn collect_body_type_refs(
     node: Node,
     bytes: &[u8],
     source_id: &str,
+    generics: &HashSet<String>,
     seen: &mut HashSet<String>,
     out: &mut ParsedFile,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        let name = match child.kind() {
-            "type_identifier" => Some(node_text(child, bytes).trim().to_string()),
-            "scoped_identifier" | "scoped_type_identifier" => child
-                .child_by_field_name("path")
-                .map(|p| clean_rust_type_name(node_text(p, bytes))),
-            _ => None,
+        let scoped = matches!(child.kind(), "scoped_identifier" | "scoped_type_identifier");
+        let name = if child.kind() == "type_identifier" {
+            Some(node_text(child, bytes).trim().to_string())
+        } else if scoped {
+            scoped_type(child, bytes, generics)
+        } else {
+            None
         };
         if let Some(name) = name
             && name.chars().next().is_some_and(char::is_uppercase)
             && name != "Self"
+            && !generics.contains(&name)
             && !is_builtin_rust_type(&name)
             && seen.insert(name.clone())
         {
@@ -501,8 +512,54 @@ fn collect_body_type_refs(
                 line: child.start_position().row + 1,
             });
         }
-        collect_body_type_refs(child, bytes, source_id, seen, out);
+        // A path's last segment was judged above; only its path part (generic arguments
+        // such as `Vec::<Rec>` included) can hold further type names
+        let next = if scoped {
+            child.child_by_field_name("path")
+        } else {
+            Some(child)
+        };
+        if let Some(next) = next {
+            collect_body_type_refs(next, bytes, source_id, generics, seen, out);
+        }
     }
+}
+
+/// The type a path names:
+/// - `crate::model::Symbol` (module path): the last segment, `Symbol`;
+/// - `Level::A`, `Rec::new`, `Msg::Move` (type path): the type, `Level` / `Rec` / `Msg`;
+///   the last segment is a variant or associated item, never a use of a type that
+///   happens to share its name;
+/// - `Self::Item`, `T::Output` (associated item of an unknown type): nothing.
+fn scoped_type(node: Node, bytes: &[u8], generics: &HashSet<String>) -> Option<String> {
+    let path = node_text(node.child_by_field_name("path")?, bytes);
+    let first = path.split("::").next().unwrap_or(path).trim();
+    if first == "Self" || generics.contains(first) {
+        return None;
+    }
+    let last = clean_rust_type_name(path);
+    if last.chars().next().is_some_and(char::is_uppercase) {
+        Some(last)
+    } else {
+        node.child_by_field_name("name")
+            .map(|n| node_text(n, bytes).trim().to_string())
+    }
+}
+
+/// Generic parameter names of a function (`fn f<T: Add, U>`): `T::Output` is not a type.
+fn generic_names(func: Node, bytes: &[u8]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Some(tp) = func.child_by_field_name("type_parameters") {
+        let mut stack = vec![tp];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "type_identifier" {
+                names.insert(node_text(n, bytes).trim().to_string());
+            }
+            let mut c = n.walk();
+            stack.extend(n.children(&mut c));
+        }
+    }
+    names
 }
 
 fn clean_rust_type_name(raw: &str) -> String {

@@ -2093,3 +2093,41 @@ fn read_symbol_reads_a_line_range() {
         .text;
     assert!(out.contains("NOT INDEXED"), "{out}");
 }
+
+/// A struct-like enum variant (`Msg::Move { x }`) or an associated type (`T::Output`,
+/// `Self::Item`) is not a use of an unrelated type that shares the name.
+#[test]
+fn rust_variant_and_associated_names_are_not_type_uses() {
+    use trackertop::graph::CodeGraph;
+    use trackertop::indexer::index_repository;
+    use trackertop::model::EdgeKind;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub enum Msg { Move { x: i32 }, Quit }\npub struct Move;\npub struct Output;\n\
+         pub fn handle(m: Msg) -> i32 {\n    match m {\n        Msg::Move { x } => x,\n        Msg::Quit => 0,\n    }\n}\n\
+         pub fn assoc<T: std::ops::Add>(a: T, b: T) -> i32 {\n    let _y: T::Output = a + b;\n    0\n}\n\
+         pub mod inner {\n    pub struct Deep;\n}\npub fn modpath() {\n    let _d: inner::Deep = inner::Deep;\n}\n",
+    )
+    .unwrap();
+    index_repository(root, false).unwrap();
+    let db = trackertop::db::Database::open_for_repo(root).unwrap();
+    let cg = CodeGraph::load(&db).unwrap();
+    let targets_of = |src: &str| -> Vec<String> {
+        let mut v: Vec<String> = cg
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::UsesType)
+            .filter(|e| cg.symbols.get(&e.source_id).is_some_and(|s| s.name == src))
+            .filter_map(|e| cg.symbols.get(&e.target_id).map(|s| s.name.clone()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(targets_of("handle"), vec!["Msg"]);
+    assert!(targets_of("assoc").is_empty(), "{:?}", targets_of("assoc"));
+    // A module path names the type at its end
+    assert_eq!(targets_of("modpath"), vec!["Deep"]);
+}

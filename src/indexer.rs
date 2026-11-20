@@ -16,8 +16,9 @@ use std::time::{Instant, UNIX_EPOCH};
 /// revision is re-parsed in full on its next run, instead of keeping stale edges for
 /// every file whose content did not change. (1: v0.8, Rust macro-argument and method calls;
 /// 2: Rust type uses inside function bodies; 3: Python on tree-sitter;
-/// 4: Go on tree-sitter; 5: Python/Go syntax-error recovery.)
-pub const EXTRACTOR_REVISION: i64 = 5;
+/// 4: Go on tree-sitter; 5: Python/Go syntax-error recovery;
+/// 6: Rust paths: variants and associated items are not type uses.)
+pub const EXTRACTOR_REVISION: i64 = 6;
 
 #[derive(Debug, Clone)]
 pub struct IndexStats {
