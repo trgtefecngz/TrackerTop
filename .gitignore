@@ -5,3 +5,4 @@
 *.db-shm
 .DS_Store
 Thumbs.db
+.claude/settings.local.json
