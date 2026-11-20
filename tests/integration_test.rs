@@ -2013,3 +2013,39 @@ fn full_reparse_drops_files_it_could_not_reparse() {
         "rows from the old extractor survived a full re-parse"
     );
 }
+
+/// `orphan` stays quiet when a function may still be reached in ways the graph does not
+/// see: named in a non-indexed file (YAML), registered by an attribute, or a trait method
+/// now dispatched through an operator.
+#[test]
+fn orphan_ignores_functions_reached_outside_the_call_graph() {
+    use trackertop::review::review;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let base = "pub struct P(pub i32);\n\
+                impl std::ops::Add for P {\n    type Output = P;\n    fn add(self, o: P) -> P {\n        P(self.0 + o.0)\n    }\n}\n\
+                fn job_handler_x() -> i32 { 1 }\n\
+                #[my_framework::route]\nfn route_handler_y() -> i32 { 2 }\n\
+                pub fn run() -> i32 {\n    let p = P(1).add(P(2));\n    p.0 + job_handler_x() + route_handler_y()\n}\n";
+    std::fs::write(root.join("src/lib.rs"), base).unwrap();
+    std::fs::write(root.join("jobs.yml"), "jobs:\n  - job_handler_x\n").unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+    let head = base.replace(
+        "    let p = P(1).add(P(2));\n    p.0 + job_handler_x() + route_handler_y()\n",
+        "    let p = P(1) + P(2);\n    p.0\n",
+    );
+    std::fs::write(root.join("src/lib.rs"), head).unwrap();
+
+    let cs = review(root, "main").unwrap();
+    let orphans: Vec<&str> = cs
+        .findings
+        .iter()
+        .filter(|f| f.rule == "orphan")
+        .map(|f| f.id.as_str())
+        .collect();
+    assert!(orphans.is_empty(), "{orphans:?}");
+}

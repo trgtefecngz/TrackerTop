@@ -33,6 +33,81 @@ fn mentions(line: &str, name: &str) -> bool {
     false
 }
 
+/// Every file of the project at head that git knows (tracked, or untracked and not
+/// ignored), any type: a name in a YAML job list or an entry-point table keeps a function
+/// alive as surely as a call. `None` when the list cannot be read or a file cannot be read
+/// in full, since "named nowhere" could then not be confirmed.
+fn project_texts(root: &Path) -> Option<HashMap<String, String>> {
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    let list = crate::changes::git(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )
+    .ok()?;
+    let mut out = HashMap::new();
+    for rel in list.split('\0').filter(|p| !p.is_empty()) {
+        let path = root.join(rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue; // listed but deleted in the working tree
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.len() > MAX_BYTES {
+            return None;
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        out.insert(
+            rel.replace('\\', "/"),
+            String::from_utf8_lossy(&bytes).into_owned(),
+        );
+    }
+    Some(out)
+}
+
+/// Attributes and decorators that do not register a function anywhere.
+const PLAIN_ATTRS: [&str; 9] = [
+    "#[allow",
+    "#[inline",
+    "#[must_use",
+    "#[doc",
+    "#[deny",
+    "#[warn",
+    "#[expect",
+    "#[cold",
+    "#[track_caller",
+];
+
+/// Whether the function carries an attribute or decorator that may register it with a
+/// framework (`#[tauri::command]`, `@app.route`, `#[no_mangle]`): it can be reached with
+/// no call anywhere in the code.
+fn registered(text: Option<&String>, sym: &Symbol) -> bool {
+    let Some(text) = text else { return true };
+    let lines: Vec<&str> = text.lines().collect();
+    let is_attr = |l: &str| l.starts_with("#[") || l.starts_with('@');
+    // Attributes above the span, skipping doc comments, and any inside its first lines
+    let above = lines[..sym.start_line.saturating_sub(1).min(lines.len())]
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .take_while(|l| is_attr(l) || l.starts_with("///") || l.starts_with('#'));
+    let inside = lines
+        .iter()
+        .skip(sym.start_line.saturating_sub(1))
+        .map(|l| l.trim())
+        .take_while(|l| !mentions(l, &sym.name));
+    above
+        .chain(inside)
+        .filter(|l| is_attr(l))
+        .any(|l| !PLAIN_ATTRS.iter().any(|p| l.starts_with(p)))
+}
+
 /// The same function at head: same file, qualified name and kind.
 fn at_head<'a>(head: &'a CodeGraph, base_sym: &Symbol) -> Option<&'a Symbol> {
     head.symbols_by_file
@@ -79,8 +154,8 @@ pub fn orphans(
         }
     }
 
-    // Indexed code files at head, read once and only if there is a candidate.
-    let mut texts: Option<HashMap<&str, String>> = None;
+    // The project's files at head, read once and only if there is a candidate.
+    let mut texts: Option<HashMap<String, String>> = None;
     for (callee_id, callers) in lost {
         let Some(c) = base.symbols.get(&callee_id) else {
             continue;
@@ -102,21 +177,22 @@ pub fn orphans(
         if !deps.direct_dependents.is_empty() || !deps.related_tests.is_empty() {
             continue;
         }
-        let texts = texts.get_or_insert_with(|| {
-            head.files
-                .values()
-                .filter(|f| !matches!(f.language.as_str(), "markdown"))
-                .filter_map(|f| {
-                    std::fs::read_to_string(head_root.join(&f.path))
-                        .ok()
-                        .map(|t| (f.path.as_str(), t))
-                })
-                .collect()
-        });
+        if texts.is_none() {
+            match project_texts(head_root) {
+                Some(t) => texts = Some(t),
+                // Without the file list nothing can be confirmed: report nothing
+                None => return,
+            }
+        }
+        let Some(texts) = texts.as_ref() else { return };
+        if registered(texts.get(now.file_path.as_str()), now) {
+            continue;
+        }
         let still_named = texts.iter().any(|(path, text)| {
             text.lines().enumerate().any(|(i, line)| {
                 let n = i + 1;
-                let own = *path == now.file_path && n >= now.start_line && n <= now.end_line;
+                let own =
+                    path.as_str() == now.file_path && n >= now.start_line && n <= now.end_line;
                 !own && mentions(line, &now.name)
             })
         });
@@ -135,7 +211,8 @@ pub fn orphans(
             .map(|c| format!("called before this change from {c}"))
             .collect();
         evidence.push(format!(
-            "`{}` appears nowhere else in the {} indexed code files (docs not counted)",
+            "`{}` appears nowhere else in the project's {} files (git-tracked and untracked, \
+             any type)",
             now.name,
             texts.len()
         ));
@@ -146,8 +223,9 @@ pub fn orphans(
             symbol: now.qualified_name.clone(),
             location: loc(&span),
             message: format!(
-                "`{}` lost its last caller in this change and is now unused{}: delete it, \
-                 or restore the call if dropping it was a mistake",
+                "`{}` lost its last caller in this change and looks unused{}: confirm (dynamic \
+                 dispatch, reflection and other repositories are not visible here), then \
+                 delete it, or restore the call if dropping it was a mistake",
                 now.qualified_name,
                 if public {
                     " in this project (it is public: code outside the project may still use it)"
