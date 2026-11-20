@@ -43,12 +43,32 @@ impl LanguageExtractor for PythonExtractor {
         let mut out = ParsedFile::default();
         let file_id = file_symbol_id(file_path);
         out.symbols.push(make_file_symbol(file_path, source));
-        let cx = Cx {
-            file_path,
-            bytes: source.as_bytes(),
-            file_id: &file_id,
+        if !tree.root_node().has_error() {
+            let cx = Cx {
+                file_path,
+                bytes: source.as_bytes(),
+                file_id: &file_id,
+            };
+            walk(&cx, tree.root_node(), None, &mut out);
+            return Ok(out);
+        }
+        // A syntax error can swallow the rest of the file: parse each top-level piece alone
+        let starts = |l: &str| {
+            ["def ", "async def ", "class ", "@"]
+                .iter()
+                .any(|p| l.starts_with(p))
         };
-        walk(&cx, tree.root_node(), None, &mut out);
+        for piece in crate::parser::recovery_segments(source, starts, |l| l.starts_with('@')) {
+            let Some(tree) = parser.parse(&piece, None) else {
+                continue;
+            };
+            let cx = Cx {
+                file_path,
+                bytes: piece.as_bytes(),
+                file_id: &file_id,
+            };
+            walk(&cx, tree.root_node(), None, &mut out);
+        }
         Ok(out)
     }
 }
@@ -122,9 +142,14 @@ fn walk(cx: &Cx, node: Node, class_ctx: Option<(&str, &str)>, out: &mut ParsedFi
             "import_from_statement" => from_imports(cx, def, out),
             "class_definition" => class(cx, def, out),
             "function_definition" => function(cx, def, class_ctx, out),
-            // `if TYPE_CHECKING:`, `try:` and the like at module level hold definitions too
+            // `if TYPE_CHECKING:`, `try:`, loops and `match` hold definitions too. `ERROR`
+            // wraps the rest of a file after a syntax error (an unclosed bracket mid-edit):
+            // its definitions are still found, as the old line-based parser found them.
             "if_statement" | "try_statement" | "with_statement" | "else_clause" | "elif_clause"
-            | "except_clause" | "finally_clause" | "block" => walk(cx, def, class_ctx, out),
+            | "except_clause" | "finally_clause" | "block" | "for_statement"
+            | "while_statement" | "match_statement" | "case_clause" | "ERROR" => {
+                walk(cx, def, class_ctx, out)
+            }
             _ => {}
         }
     }
@@ -317,7 +342,15 @@ fn calls(
 fn is_py_builtin(name: &str) -> bool {
     matches!(
         name,
-        "print"
+        "def"
+            | "class"
+            | "lambda"
+            | "return"
+            | "if"
+            | "elif"
+            | "while"
+            | "for"
+            | "print"
             | "len"
             | "range"
             | "str"
@@ -487,5 +520,41 @@ def test_build_user():
                 .iter()
                 .any(|s| s.name == "fake" || s.name == "inner")
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::PythonExtractor;
+    use crate::parser::LanguageExtractor;
+
+    fn names(src: &str) -> Vec<String> {
+        PythonExtractor
+            .parse("m.py", src)
+            .unwrap()
+            .symbols
+            .iter()
+            .skip(1)
+            .map(|s| s.qualified_name.clone())
+            .collect()
+    }
+
+    /// A file mid-edit (one unclosed bracket) must not lose every later definition.
+    #[test]
+    fn a_syntax_error_does_not_hide_later_definitions() {
+        let src = "import os\nCONFIG = {\n    \"a\": 1,\n\ndef one():\n    return two()\n\ndef two():\n    pass\n\nclass K:\n    def m(self):\n        pass\n";
+        let got = names(src);
+        for want in ["one", "two", "K", "K::m"] {
+            assert!(got.iter().any(|n| n == want), "{want}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn definitions_inside_loops_and_match_are_kept() {
+        let src = "for i in range(2):\n    def in_for():\n        pass\nwhile False:\n    def in_while():\n        pass\nmatch x:\n    case 1:\n        def in_case():\n            pass\n";
+        let got = names(src);
+        for want in ["in_for", "in_while", "in_case"] {
+            assert!(got.iter().any(|n| n == want), "{want}: {got:?}");
+        }
     }
 }

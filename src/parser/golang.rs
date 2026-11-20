@@ -43,20 +43,48 @@ impl LanguageExtractor for GoExtractor {
         let mut out = ParsedFile::default();
         let file_id = file_symbol_id(file_path);
         out.symbols.push(make_file_symbol(file_path, source));
-        let bytes = source.as_bytes();
-        let root = tree.root_node();
-        let mut cursor = root.walk();
-        for decl in root.named_children(&mut cursor) {
-            match decl.kind() {
-                "import_declaration" => imports(decl, bytes, &file_id, &mut out),
-                "type_declaration" => types(decl, bytes, file_path, &file_id, &mut out),
-                "function_declaration" | "method_declaration" => {
-                    function(decl, bytes, file_path, &file_id, &mut out)
-                }
-                _ => {}
+        if !tree.root_node().has_error() {
+            declarations(
+                tree.root_node(),
+                source.as_bytes(),
+                file_path,
+                &file_id,
+                &mut out,
+            );
+            return Ok(out);
+        }
+        // A syntax error can swallow the rest of the file: parse each top-level piece alone
+        let starts = |l: &str| {
+            ["func ", "func(", "type ", "var ", "const ", "import "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        };
+        for piece in crate::parser::recovery_segments(source, starts, |l| l.starts_with("//")) {
+            if let Some(tree) = parser.parse(&piece, None) {
+                declarations(
+                    tree.root_node(),
+                    piece.as_bytes(),
+                    file_path,
+                    &file_id,
+                    &mut out,
+                );
             }
         }
         Ok(out)
+    }
+}
+
+fn declarations(root: Node, bytes: &[u8], file_path: &str, file_id: &str, out: &mut ParsedFile) {
+    let mut cursor = root.walk();
+    for decl in root.named_children(&mut cursor) {
+        match decl.kind() {
+            "import_declaration" => imports(decl, bytes, file_id, out),
+            "type_declaration" => types(decl, bytes, file_path, file_id, out),
+            "function_declaration" | "method_declaration" => {
+                function(decl, bytes, file_path, file_id, out)
+            }
+            _ => {}
+        }
     }
 }
 
@@ -415,5 +443,29 @@ func helper() int { return compute(2) }
         assert!(has("helper#", "CALLS", "compute"), "{refs:?}");
         assert!(!has("Start#", "CALLS", "stopCluster"), "{refs:?}");
         assert!(!has("Start#", "CALLS", "Errorf"), "{refs:?}");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::GoExtractor;
+    use crate::parser::LanguageExtractor;
+
+    /// A file mid-edit (one unclosed brace) must not lose every later declaration.
+    #[test]
+    fn a_syntax_error_does_not_hide_later_declarations() {
+        let src = "package p\n\nvar cfg = map[string]int{\n\t\"a\": 1,\n\n// One does things.\nfunc One() { two() }\n\nfunc two() {}\n\ntype T struct{}\n";
+        let parsed = GoExtractor.parse("p.go", src).unwrap();
+        let got: Vec<(&str, usize)> = parsed
+            .symbols
+            .iter()
+            .skip(1)
+            .map(|s| (s.qualified_name.as_str(), s.start_line))
+            .collect();
+        for want in [("One", 7), ("two", 9), ("T", 11)] {
+            assert!(got.contains(&want), "{want:?}: {got:?}");
+        }
+        let one = parsed.symbols.iter().find(|s| s.name == "One").unwrap();
+        assert_eq!(one.doc_summary, "One does things.");
     }
 }
