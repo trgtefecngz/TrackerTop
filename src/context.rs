@@ -1538,7 +1538,18 @@ impl TrackerEngine {
     /// Everything `resume` reports, read from the index DB, git and the progress file.
     fn resume_data(&self, db: &Database, cg: &CodeGraph) -> Result<crate::journal::ResumeData> {
         use crate::journal::{ChangedFile, NoteView, OpenFinding, ResumeData, WorkTree};
-        let (journal, journal_total) = db.recent_journal(2_000)?;
+        let (mut journal, mut journal_total) = db.recent_journal(2_000)?;
+        // Agent calls from before the journal existed (telemetry has no session or
+        // outcome; they are grouped by day)
+        if journal.len() < 2_000 {
+            let before = journal
+                .last()
+                .map(|e| e.timestamp.clone())
+                .unwrap_or_default();
+            let (older, older_total) = db.telemetry_as_journal(&before, 2_000 - journal.len())?;
+            journal_total += older_total;
+            journal.extend(older);
+        }
         let notes = db
             .list_notes(None)?
             .into_iter()
@@ -1558,12 +1569,19 @@ impl TrackerEngine {
             })
             .collect();
         let worktree = (|| -> Result<WorkTree> {
-            let head = crate::changes::resolve_ref(&self.repo_root, "HEAD")?;
-            let branch =
-                crate::changes::git(&self.repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
-                    .trim()
-                    .to_string();
-            let (diffs, untracked) = crate::changes::diff_since(&self.repo_root, &head, &[])?;
+            // Each git process costs ~0.1 s on Windows: run them side by side so the
+            // SessionStart briefing stays fast
+            let root = &self.repo_root;
+            let (branch, diff) = std::thread::scope(|s| {
+                let branch = s.spawn(|| {
+                    crate::changes::git(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+                        .map(|b| b.trim().to_string())
+                });
+                let diff = crate::changes::diff_since(root, "HEAD", &[]);
+                (branch.join(), diff)
+            });
+            let branch = branch.map_err(|_| anyhow::anyhow!("git thread panicked"))??;
+            let (diffs, untracked) = diff?;
             let mut files: Vec<ChangedFile> = diffs
                 .iter()
                 .map(|d| {

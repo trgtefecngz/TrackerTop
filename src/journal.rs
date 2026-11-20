@@ -327,6 +327,8 @@ struct Caps {
     progress_log: usize,
     section_lines: usize,
     files: usize,
+    /// Longest progress-file line shown before it is clipped with `…`.
+    line_chars: usize,
 }
 
 const FULL: Caps = Caps {
@@ -338,6 +340,7 @@ const FULL: Caps = Caps {
     progress_log: 8,
     section_lines: 40,
     files: 20,
+    line_chars: 400,
 };
 
 const BRIEF: Caps = Caps {
@@ -346,9 +349,10 @@ const BRIEF: Caps = Caps {
     tried: 3,
     findings: 3,
     decisions: 3,
-    progress_log: 2,
-    section_lines: 10,
-    files: 6,
+    progress_log: 1,
+    section_lines: 8,
+    files: 4,
+    line_chars: 140,
 };
 
 fn hidden_line(out: &mut String, hidden: usize, how: &str) {
@@ -369,7 +373,11 @@ fn note_item(v: &NoteView) -> String {
     if !n.reason.is_empty() {
         s.push_str(&format!(" (why: {})", n.reason));
     }
-    if let Some(w) = &v.outdated {
+    // A progress / tried / blocked entry is history: its file changing afterwards is
+    // expected, so only rules and decisions carry the outdated warning
+    if let Some(w) = &v.outdated
+        && !matches!(n.kind.as_str(), "progress" | "tried" | "blocked")
+    {
         s.push_str(&format!(" [{w}]"));
     }
     s.push('\n');
@@ -378,7 +386,7 @@ fn note_item(v: &NoteView) -> String {
 
 /// Open findings: the latest review per base, minus findings dismissed since (a dismissal
 /// whose code changed does not count, matching `review_changes`).
-fn open_findings<'a>(d: &'a ResumeData) -> Vec<&'a OpenFinding> {
+fn open_findings(d: &ResumeData) -> Vec<&OpenFinding> {
     let dismissed: HashSet<String> = d
         .notes
         .iter()
@@ -443,8 +451,10 @@ pub fn render_resume(d: &ResumeData, brief: bool) -> String {
         Err(e) => out.push_str(&format!("Uncommitted work: unknown ({e}).\n")),
     }
 
-    // Progress file sections
-    for s in &d.progress {
+    // Progress file sections, `## Next` first (it is what to do now)
+    let mut sections: Vec<&ProgressSection> = d.progress.iter().collect();
+    sections.sort_by_key(|s| !wanted_next(&s.heading));
+    for s in sections {
         out.push_str(&format!(
             "\n## {} ({}:{})\n",
             s.heading.trim_start_matches('#').trim(),
@@ -455,7 +465,9 @@ pub fn render_resume(d: &ResumeData, brief: bool) -> String {
             out.push_str("(empty)\n");
         }
         for l in s.lines.iter().take(caps.section_lines) {
-            out.push_str(l);
+            let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+            out.push_str(&indent);
+            out.push_str(&clip(l, caps.line_chars));
             out.push('\n');
         }
         hidden_line(
@@ -700,7 +712,7 @@ pub fn timeline(
                 None => tools.push((e.tool.clone(), 1)),
             }
         }
-        tools.sort_by(|a, b| b.1.cmp(&a.1));
+        tools.sort_by_key(|t| std::cmp::Reverse(t.1));
         let mut focus: Vec<String> = Vec::new();
         for e in run.iter().rev() {
             if let Some(t) = call_target(e)
@@ -798,8 +810,18 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
 
 /// Headings `resume` lifts out of the progress file.
 fn wanted_heading(h: &str) -> bool {
-    let t = h.trim_start_matches('#').trim().to_lowercase();
-    t.starts_with("next") || t.starts_with("kararını bekleyenler")
+    wanted_next(h)
+        || h.trim_start_matches('#')
+            .trim()
+            .to_lowercase()
+            .starts_with("kararını bekleyenler")
+}
+
+fn wanted_next(h: &str) -> bool {
+    h.trim_start_matches('#')
+        .trim()
+        .to_lowercase()
+        .starts_with("next")
 }
 
 /// `## Next` and `## Kararını bekleyenler` from the newest `docs/*PROGRESS*.md` (natural

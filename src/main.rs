@@ -195,6 +195,12 @@ enum QueryAction {
         #[arg(long, default_value_t = 1000)]
         max_tokens: usize,
     },
+    /// Where work stands: recent agent sessions, tried/blocked entries, open findings,
+    /// decisions, the progress file's Next section and uncommitted work
+    Resume {
+        #[arg(long, default_value_t = 3000)]
+        max_tokens: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -281,6 +287,7 @@ fn main() -> Result<()> {
                 } => engine.smart_grep(&pattern, filter.as_deref(), max_tokens)?,
                 QueryAction::Diff { max_tokens } => engine.diff_impact(max_tokens)?,
                 QueryAction::Health { max_tokens } => engine.health_check(max_tokens)?,
+                QueryAction::Resume { max_tokens } => engine.resume(max_tokens)?,
             };
             println!("{}", res.text);
         }

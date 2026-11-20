@@ -17,7 +17,7 @@ use std::time::Duration;
 pub const HOOK_HINT: &str = "TrackerTop MCP is active for this workspace. Prefer `repo_map`, `task_context`, `smart_grep`, `file_outline`, `read_symbol`, `read_symbols_batch`, and `diff_impact` BEFORE raw grep or reading full files (saves 80-99% tokens).";
 
 /// Token budget for the briefing (the task asks for roughly 300-500).
-pub const BRIEFING_TOKENS: usize = 450;
+pub const BRIEFING_TOKENS: usize = 520;
 
 /// Deadline for the briefing; past it the classic hint alone is printed.
 pub const BRIEFING_DEADLINE: Duration = Duration::from_millis(900);
@@ -65,12 +65,12 @@ pub fn briefing_for(start: &Path, source: &str) -> anyhow::Result<Option<String>
         return Ok(None);
     };
     let why = if source == "compact" {
-        "Context was just compacted. "
+        "Context was just compacted: this is where work stood.\n"
     } else {
         ""
     };
     Ok(Some(format!(
-        "{why}{text}\nRecord milestones, dead ends and blockers with remember(kind=progress|tried|blocked, reason=...) so the next session sees them."
+        "{why}{text}\nLog milestones, dead ends and blockers: remember(kind=progress|tried|blocked, reason=...)."
     )))
 }
 

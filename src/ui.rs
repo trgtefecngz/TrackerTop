@@ -1,5 +1,7 @@
 #![cfg(feature = "gui")]
 
+mod journal_view;
+
 use crate::context::TrackerEngine;
 use crate::db::Database;
 use crate::graph::{CodeGraph, CommunitySummary, HealthReport, ScoredNode};
@@ -2537,6 +2539,7 @@ impl TrackerTopApp {
         ui.add_space(12.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            journal_view::render_timeline(ui, Path::new(&repo_path));
             if lp.notes.is_empty() {
                 soft_card_frame(16).show(ui, |ui| {
                     ui.set_width(ui.available_width());

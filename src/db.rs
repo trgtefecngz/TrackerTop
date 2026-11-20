@@ -306,6 +306,46 @@ impl Database {
         Ok(id)
     }
 
+    /// MCP telemetry rows (agent calls) written before `before` (RFC 3339; empty = all),
+    /// newest first, as journal entries without a session: the history from before the
+    /// journal existed. Telemetry only records answered calls, so the outcome is `ok`.
+    pub fn telemetry_as_journal(
+        &self,
+        before: &str,
+        limit: usize,
+    ) -> Result<(Vec<JournalEntry>, usize)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM telemetry WHERE source LIKE 'mcp:%' AND (?1 = '' OR timestamp < ?1)",
+            params![before],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, source, tool, query FROM telemetry \
+             WHERE source LIKE 'mcp:%' AND (?1 = '' OR timestamp < ?1) \
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![before, limit as i64], |r| {
+                let query: String = r.get(4)?;
+                Ok(JournalEntry {
+                    // Shifted below every real journal id, order preserved
+                    id: r.get::<_, i64>(0)? - (1 << 40),
+                    timestamp: r.get(1)?,
+                    session: String::new(),
+                    source: r.get(2)?,
+                    tool: r.get(3)?,
+                    query: if query.is_empty() {
+                        query
+                    } else {
+                        format!("query={query}")
+                    },
+                    outcome: "ok".to_string(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total as usize))
+    }
+
     /// The newest `limit` journal rows, newest first, and how many rows exist in total.
     pub fn recent_journal(&self, limit: usize) -> Result<(Vec<JournalEntry>, usize)> {
         let total: i64 = self
