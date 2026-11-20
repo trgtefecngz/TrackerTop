@@ -316,6 +316,14 @@ pub struct ProjectNote {
     pub kind: String,
     /// Why: required for decisions and dismissed leads, empty for plain notes.
     pub reason: String,
+    /// Provenance: the commit checked out when the note was written (empty if unknown).
+    #[serde(default)]
+    pub commit: String,
+    /// Hash of the target's code when the note was written (empty if the target was not
+    /// code, or for notes written before v0.8). A different hash now means the code changed
+    /// and the note may be outdated.
+    #[serde(default)]
+    pub code_hash: String,
 }
 
 impl ProjectNote {

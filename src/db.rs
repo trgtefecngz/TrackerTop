@@ -142,6 +142,9 @@ impl Database {
         // v0.7: decision memory. Added in place so existing notes keep working (kind 'note').
         self.ensure_column("notes", "kind", "TEXT NOT NULL DEFAULT 'note'")?;
         self.ensure_column("notes", "reason", "TEXT NOT NULL DEFAULT ''")?;
+        // v0.8: note provenance (commit + hash of the target's code when written)
+        self.ensure_column("notes", "commit_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("notes", "code_hash", "TEXT NOT NULL DEFAULT ''")?;
         // v0.7: honest metrics. Rows recorded before this are `legacy` (source unknown).
         self.ensure_column("telemetry", "source", "TEXT NOT NULL DEFAULT 'legacy'")?;
         Ok(())
@@ -667,6 +670,20 @@ impl Database {
         kind: &str,
         reason: &str,
     ) -> Result<(i64, Option<String>)> {
+        self.add_note_with_provenance(target, content, kind, reason, "", "")
+    }
+
+    /// Like `add_note_full`, also recording the commit and a hash of the target's code at
+    /// the time, so a later reader can tell when the code has changed under the note.
+    pub fn add_note_with_provenance(
+        &self,
+        target: &str,
+        content: &str,
+        kind: &str,
+        reason: &str,
+        commit: &str,
+        code_hash: &str,
+    ) -> Result<(i64, Option<String>)> {
         if !matches!(kind, "note" | "decision" | "dismissed") {
             anyhow::bail!("unknown note kind `{kind}`: use note, decision or dismissed");
         }
@@ -683,8 +700,17 @@ impl Database {
             target.trim()
         };
         self.conn.execute(
-            "INSERT INTO notes (target, content, created_at, kind, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![clean_target, content.trim(), ts, kind, reason.trim()],
+            "INSERT INTO notes (target, content, created_at, kind, reason, commit_id, code_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                clean_target,
+                content.trim(),
+                ts,
+                kind,
+                reason.trim(),
+                commit,
+                code_hash
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
         let note = ProjectNote {
@@ -694,6 +720,8 @@ impl Database {
             created_at: ts,
             kind: kind.to_string(),
             reason: reason.trim().to_string(),
+            commit: commit.to_string(),
+            code_hash: code_hash.to_string(),
         };
         let mirror_err = self
             .write_note_markdown(&note)
@@ -714,11 +742,14 @@ impl Database {
         // The front-matter `reason` (a JSON string) is what restoring reads; the trailing
         // `Reason:` paragraph is only for people reading the file.
         let mut body = format!(
-            "---\nid: {}\nkind: {}\ntarget: {}\ncreated_at: {}\nreason: {}\n---\n\n{}\n",
+            "---\nid: {}\nkind: {}\ntarget: {}\ncreated_at: {}\ncommit: {}\ncode_hash: {}\n\
+             reason: {}\n---\n\n{}\n",
             n.id,
             n.kind,
             n.target.replace('\n', " "),
             n.created_at,
+            n.commit,
+            n.code_hash,
             serde_json::to_string(&n.reason)?,
             n.content
         );
@@ -753,9 +784,19 @@ impl Database {
             };
             if let Some(n) = parse_note_markdown(&text) {
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO notes (id, target, content, created_at, kind, reason) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![n.id, n.target, n.content, n.created_at, n.kind, n.reason],
+                    "INSERT OR IGNORE INTO notes \
+                     (id, target, content, created_at, kind, reason, commit_id, code_hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        n.id,
+                        n.target,
+                        n.content,
+                        n.created_at,
+                        n.kind,
+                        n.reason,
+                        n.commit,
+                        n.code_hash
+                    ],
                 )?;
                 imported += 1;
             }
@@ -766,7 +807,8 @@ impl Database {
     /// All notes, newest first (no cap: a capped list would silently hide old decisions).
     pub fn list_notes(&self, filter: Option<&str>) -> Result<Vec<ProjectNote>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, target, content, created_at, kind, reason FROM notes ORDER BY id DESC",
+            "SELECT id, target, content, created_at, kind, reason, commit_id, code_hash \
+             FROM notes ORDER BY id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -777,6 +819,8 @@ impl Database {
                     created_at: r.get(3)?,
                     kind: r.get(4)?,
                     reason: r.get(5)?,
+                    commit: r.get(6)?,
+                    code_hash: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1020,6 +1064,8 @@ fn parse_note_markdown(text: &str) -> Option<ProjectNote> {
         created_at: field("created_at").unwrap_or_default(),
         kind: field("kind").unwrap_or_else(|| "note".to_string()),
         reason,
+        commit: field("commit").unwrap_or_default(),
+        code_hash: field("code_hash").unwrap_or_default(),
     })
 }
 

@@ -12,6 +12,9 @@ All notable changes to TrackerTop are documented here.
   - `untested`: new or modified code that no test reaches.
 - New MCP tool `review_changes`: the same review for the agent, findings first. A finding checked and dismissed with `remember(target=<finding id>, kind=dismissed, reason=...)` is not raised again and is listed with its reason instead.
 
+### Added: note provenance
+- Notes, decisions and dismissed leads record the commit and a hash of the code they are about. When that code changes, the note is still shown but marked **POSSIBLY OUTDATED**, so an old decision is re-checked instead of trusted. A dismissed review finding is raised again once its code changes.
+
 ### Fixed: call edges (all tools)
 - Calls inside Rust macro arguments (`assert_eq!(parse(x), 3)`, `vec![a.b()]`) are now edges. Most Rust test-to-code edges were missing, so tests looked unrelated to the code they test.
 - A Rust method call on a value (`x.flush()`) resolves only to methods, never to a free function of the same name; a call into a library type gets no edge.
