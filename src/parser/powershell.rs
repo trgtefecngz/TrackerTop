@@ -48,14 +48,13 @@ impl LanguageExtractor for PowerShellExtractor {
                     if pending_doc.is_empty() && !before.is_empty() && !before.starts_with('.') {
                         pending_doc = compact_signature(before, 110);
                     }
-                } else if trimmed.starts_with(".SYNOPSIS") {
-                    if let Some(next_l) = lines.get(i + 1) {
+                } else if trimmed.starts_with(".SYNOPSIS")
+                    && let Some(next_l) = lines.get(i + 1) {
                         let s = next_l.trim();
                         if !s.is_empty() && !s.starts_with('.') {
                             pending_doc = compact_signature(s, 110);
                         }
                     }
-                }
                 i += 1;
                 continue;
             }

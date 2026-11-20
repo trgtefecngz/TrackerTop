@@ -75,8 +75,8 @@ impl LanguageExtractor for TypeScriptExtractor {
 
             // ES import / re-export: `import ... from "./foo"` or `import "./foo"`
             if trimmed.starts_with("import ") || (trimmed.starts_with("export ") && trimmed.contains(" from ")) {
-                if let Some(spec) = extract_quoted_path(trimmed) {
-                    if spec.starts_with('.') || spec.starts_with('/') {
+                if let Some(spec) = extract_quoted_path(trimmed)
+                    && (spec.starts_with('.') || spec.starts_with('/')) {
                         out.refs.push(RawReference {
                             source_symbol_id: file_id.clone(),
                             target_name: normalize_ts_import(&spec),
@@ -84,15 +84,14 @@ impl LanguageExtractor for TypeScriptExtractor {
                             line: line_no,
                         });
                     }
-                }
                 i += 1;
                 continue;
             }
 
             // CommonJS require("./foo")
-            if let Some(req_pos) = trimmed.find("require(") {
-                if let Some(spec) = extract_quoted_path(&trimmed[req_pos..]) {
-                    if spec.starts_with('.') || spec.starts_with('/') {
+            if let Some(req_pos) = trimmed.find("require(")
+                && let Some(spec) = extract_quoted_path(&trimmed[req_pos..])
+                    && (spec.starts_with('.') || spec.starts_with('/')) {
                         out.refs.push(RawReference {
                             source_symbol_id: file_id.clone(),
                             target_name: normalize_ts_import(&spec),
@@ -100,8 +99,6 @@ impl LanguageExtractor for TypeScriptExtractor {
                             line: line_no,
                         });
                     }
-                }
-            }
 
             let (vis, rest) = strip_ts_modifiers(trimmed);
 
@@ -194,8 +191,7 @@ impl LanguageExtractor for TypeScriptExtractor {
             if let Some(after) = rest
                 .strip_prefix("const ")
                 .or_else(|| rest.strip_prefix("let "))
-            {
-                if trimmed.contains("=>") {
+                && trimmed.contains("=>") {
                     let name = read_ts_ident(after);
                     if !name.is_empty() {
                         let end_idx = if trimmed.contains('{') {
@@ -225,11 +221,10 @@ impl LanguageExtractor for TypeScriptExtractor {
                         continue;
                     }
                 }
-            }
 
             // Test blocks: `test("...", () => {` / `it("...", () => {`
-            if trimmed.starts_with("test(") || trimmed.starts_with("it(") {
-                if let Some(test_name) = extract_quoted_path(trimmed) {
+            if (trimmed.starts_with("test(") || trimmed.starts_with("it("))
+                && let Some(test_name) = extract_quoted_path(trimmed) {
                     let end_idx = find_brace_end(&lines, i);
                     let block = lines[i..=end_idx].join("\n");
                     let sym_id = make_symbol_id(file_path, &test_name, line_no);
@@ -251,7 +246,6 @@ impl LanguageExtractor for TypeScriptExtractor {
                     i = end_idx + 1;
                     continue;
                 }
-            }
 
             pending_doc.clear();
             i += 1;

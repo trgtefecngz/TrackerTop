@@ -137,12 +137,11 @@ pub fn index_repository_with_registry(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        if let Some(prev) = existing.get(&rel_path) {
-            if prev.mtime_secs == mtime && prev.size_bytes == size {
+        if let Some(prev) = existing.get(&rel_path)
+            && prev.mtime_secs == mtime && prev.size_bytes == size {
                 skipped_files += 1;
                 continue;
             }
-        }
         candidates.push(Candidate {
             rel_path,
             abs_path,
@@ -159,11 +158,10 @@ pub fn index_repository_with_registry(
             let source = std::fs::read_to_string(&cand.abs_path).ok()?;
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
 
-            if let Some(prev) = existing.get(&cand.rel_path) {
-                if prev.hash == hash {
+            if let Some(prev) = existing.get(&cand.rel_path)
+                && prev.hash == hash {
                     return None;
                 }
-            }
 
             let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
             let line_count = source.lines().count().max(1);
@@ -358,13 +356,11 @@ fn resolve_edges(
                 {
                     let segs: Vec<&str> = rest.split("::").collect();
                     // Try symbol resolution on last segment
-                    if let Some(&last) = segs.last() {
-                        if let Some(syms) = by_name.get(last) {
-                            if let Some(best) = pick_best_symbol(syms, src_file, &segs) {
+                    if let Some(&last) = segs.last()
+                        && let Some(syms) = by_name.get(last)
+                            && let Some(best) = pick_best_symbol(syms, src_file, &segs) {
                                 resolved_targets.push(best.id.clone());
                             }
-                        }
-                    }
                     // Also link to module file if found
                     if !segs.is_empty() {
                         let mod_path = format!("src/{}.rs", segs[0]);
@@ -397,11 +393,9 @@ fn resolve_edges(
                         if let Some(fids) = file_by_basename
                             .get(&key)
                             .or_else(|| file_by_stem.get(&key))
-                        {
-                            if let Some(first) = fids.first() {
+                            && let Some(first) = fids.first() {
                                 resolved_targets.push(first.clone());
                             }
-                        }
                     }
                 }
             }

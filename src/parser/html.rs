@@ -117,8 +117,8 @@ fn walk_html(
 
                 // External links & assets
                 for attr_key in ["href", "src", "action"] {
-                    if let Some(val) = attrs.get(attr_key) {
-                        if is_local_ref(val) {
+                    if let Some(val) = attrs.get(attr_key)
+                        && is_local_ref(val) {
                             out.refs.push(RawReference {
                                 source_symbol_id: file_id.to_string(),
                                 target_name: normalize_asset_ref(val),
@@ -126,7 +126,6 @@ fn walk_html(
                                 line: start_line,
                             });
                         }
-                    }
                 }
 
                 // Meaningful structural elements: elements with `id`, `<template>`, `<canvas>`, custom elements (`<my-foo>`)
@@ -166,8 +165,8 @@ fn walk_html(
 
                 // Inline event handlers (onclick="foo()")
                 for (k, v) in &attrs {
-                    if k.starts_with("on") {
-                        if let Some(fn_name) = v.split('(').next() {
+                    if k.starts_with("on")
+                        && let Some(fn_name) = v.split('(').next() {
                             let clean = fn_name.trim();
                             if !clean.is_empty()
                                 && clean.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -180,7 +179,6 @@ fn walk_html(
                                 });
                             }
                         }
-                    }
                 }
 
                 walk_html(child, file_path, bytes, file_id, out);
@@ -284,8 +282,8 @@ fn extract_inline_js_symbols(
         let fn_rest = trimmed
             .strip_prefix("async function ")
             .or_else(|| trimmed.strip_prefix("function "));
-        if let Some(rest) = fn_rest {
-            if let Some(paren) = rest.find('(') {
+        if let Some(rest) = fn_rest
+            && let Some(paren) = rest.find('(') {
                 let name = rest[..paren].trim();
                 if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
                     let sym_id = make_symbol_id(file_path, name, line_no);
@@ -305,7 +303,6 @@ fn extract_inline_js_symbols(
                     });
                 }
             }
-        }
 
         // Detect references to `.wgsl` / `.js` / `.html` / `.css` files in fetch/import strings
         for quote in ['"', '\''] {

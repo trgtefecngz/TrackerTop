@@ -55,6 +55,7 @@ impl TrackerEngine {
         Ok((db, graph))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize(
         &self,
         db: &Database,
@@ -166,7 +167,7 @@ impl TrackerEngine {
             .into_iter()
             .map(|(l, (c, t))| (l, c, t))
             .collect();
-        lang_vec.sort_by(|a, b| b.2.cmp(&a.2));
+        lang_vec.sort_by_key(|x| std::cmp::Reverse(x.2));
 
         let mut out = String::new();
         out.push_str(&format!(
@@ -213,14 +214,13 @@ impl TrackerEngine {
         }
 
         // Include persistent project-level AI memory notes if any exist
-        if let Ok(notes) = db.find_notes_for_targets(&["project"]) {
-            if !notes.is_empty() {
+        if let Ok(notes) = db.find_notes_for_targets(&["project"])
+            && !notes.is_empty() {
                 out.push_str("\n## Saved Project Memory\n");
                 for n in notes.into_iter().take(6) {
                     out.push_str(&format!("- [{}] {}\n", n.target, n.content));
                 }
             }
-        }
 
         // Baseline: exploring a repo typically reads up to 15 largest/hub files (or full repo if small)
         let mut file_toks: Vec<usize> = cg.files.values().map(|f| f.token_count).collect();
@@ -659,7 +659,7 @@ impl TrackerEngine {
     }
 
     /// 7. AI-First Flagship Tool: packs the highest-value surgical context for a task inside `max_tokens`!
-    /// Includes full code for top 1-2 primary symbols + signatures only for 1-hop neighbors + shortest links.
+    ///    Includes full code for top 1-2 primary symbols + signatures only for 1-hop neighbors + shortest links.
     pub fn task_context(&self, task: &str, max_tokens: usize) -> Result<QueryOutput> {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;
@@ -742,7 +742,7 @@ impl TrackerEngine {
         let mut neighbor_seen = included_ids.clone();
         for core_id in &included_ids {
             let (callers, callees) = cg.neighborhood(core_id, 1);
-            for (_, kind, nbr) in callees.into_iter().chain(callers.into_iter()) {
+            for (_, kind, nbr) in callees.into_iter().chain(callers) {
                 if neighbor_seen.insert(nbr.id.clone()) && nbr.kind != SymbolKind::File {
                     touched_files.insert(nbr.file_path.clone());
                     out.push_str(&format!(
@@ -865,7 +865,7 @@ impl TrackerEngine {
     }
 
     /// 9. Graph-aware text search: finds literal/case-insensitive matches across indexed files
-    /// and tags every matching line with its enclosing symbol (`fn`, `struct`, shader, etc.).
+    ///    and tags every matching line with its enclosing symbol (`fn`, `struct`, shader, etc.).
     pub fn smart_grep(
         &self,
         pattern: &str,
@@ -897,11 +897,10 @@ impl TrackerEngine {
         let mut matched_files = Vec::new();
 
         for rel_path in sorted_files {
-            if let Some(ref flt) = filter_l {
-                if !flt.is_empty() && !rel_path.to_ascii_lowercase().contains(flt) {
+            if let Some(ref flt) = filter_l
+                && !flt.is_empty() && !rel_path.to_ascii_lowercase().contains(flt) {
                     continue;
                 }
-            }
             let abs = self.repo_root.join(rel_path);
             let Ok(content) = std::fs::read_to_string(&abs) else {
                 continue;
@@ -1062,7 +1061,7 @@ impl TrackerEngine {
     }
 
     /// 11. Git-powered diff blast radius: maps uncommitted (or latest commit) changed files
-    /// to dependent files, git co-changing files, and linked tests to re-run.
+    ///     to dependent files, git co-changing files, and linked tests to re-run.
     pub fn diff_impact(&self, max_tokens: usize) -> Result<QueryOutput> {
         let start = Instant::now();
         let (db, cg) = self.load_fresh()?;

@@ -208,11 +208,10 @@ fn walk_items(
                     let mut seen_types = HashSet::new();
                     collect_type_refs(node, bytes, &sym_id, &mut seen_types, out);
 
-                    if node.kind() == "trait_item" {
-                        if let Some(body) = node.child_by_field_name("body") {
+                    if node.kind() == "trait_item"
+                        && let Some(body) = node.child_by_field_name("body") {
                             walk_items(body, file_path, bytes, &sym_id, Some(&sym_id), out);
                         }
-                    }
                 }
             }
             "impl_item" => {

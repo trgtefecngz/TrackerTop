@@ -230,8 +230,8 @@ pub fn load_global_overview() -> GlobalOverview {
             stats: TokenStatsSummary::default(),
         };
 
-        if exists && db_path.exists() {
-            if let Ok(db) = Database::open_path(&db_path) {
+        if exists && db_path.exists()
+            && let Ok(db) = Database::open_path(&db_path) {
                 snap.indexed = true;
                 if let Ok(files) = db.load_all_files() {
                     snap.total_files = files.len();
@@ -247,7 +247,6 @@ pub fn load_global_overview() -> GlobalOverview {
                     snap.stats = stats;
                 }
             }
-        }
 
         overview.total_files += snap.total_files;
         overview.total_symbols += snap.total_symbols;

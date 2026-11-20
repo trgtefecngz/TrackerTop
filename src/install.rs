@@ -101,11 +101,10 @@ pub fn is_agent_installed(agent: AiAgentKind) -> bool {
         AiAgentKind::Windsurf => vec![home.join(".codeium").join("windsurf").join("mcp_config.json")],
     };
     for p in paths {
-        if let Ok(content) = std::fs::read_to_string(p) {
-            if content.contains("trackertop") {
+        if let Ok(content) = std::fs::read_to_string(p)
+            && content.contains("trackertop") {
                 return true;
             }
-        }
     }
     false
 }
@@ -322,8 +321,8 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
     }
 
     // Install lightweight SessionStart hook in `~/.claude/settings.json` when global
-    if global {
-        if let Some(home) = user_home() {
+    if global
+        && let Some(home) = user_home() {
             let settings_path = home.join(".claude").join("settings.json");
             match install_claude_session_hook(&settings_path, &exe_str) {
                 Ok(()) => actions.push(format!(
@@ -333,7 +332,6 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
                 Err(e) => actions.push(format!("Skipped SessionStart hook: {e:#}")),
             }
         }
-    }
 
     Ok(actions)
 }

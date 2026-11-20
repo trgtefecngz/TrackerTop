@@ -134,11 +134,10 @@ pub struct TrackerTopApp {
 
 impl TrackerTopApp {
     pub fn new(initial_repo: Option<PathBuf>) -> Self {
-        if let Some(ref p) = initial_repo {
-            if p.join(".trackertop").join("index.db").exists() {
+        if let Some(ref p) = initial_repo
+            && p.join(".trackertop").join("index.db").exists() {
                 let _ = register_project(p);
             }
-        }
         let overview = load_global_overview();
         let selection = if let Some(ref p) = initial_repo {
             let s = p.to_string_lossy().to_string();
@@ -283,20 +282,19 @@ impl TrackerTopApp {
     }
 
     fn reset_project_stats(&mut self, repo_path: &str) {
-        if let Ok(db) = Database::open_for_repo(Path::new(repo_path)) {
-            if db.clear_telemetry().is_ok() {
+        if let Ok(db) = Database::open_for_repo(Path::new(repo_path))
+            && db.clear_telemetry().is_ok() {
                 self.status_banner = "Reset token-savings telemetry to 0 for this project.".to_string();
                 self.reload_overview();
                 if let Some(ref mut lp) = self.loaded {
                     lp.stats = db.get_token_stats(30).unwrap_or_default();
                 }
             }
-        }
     }
 
     fn poll_background(&mut self) {
-        if let Some(ref rx) = self.bg_rx {
-            if let Ok(msg) = rx.try_recv() {
+        if let Some(ref rx) = self.bg_rx
+            && let Ok(msg) = rx.try_recv() {
                 self.bg_busy = false;
                 self.bg_rx = None;
                 self.status_banner = msg.status;
@@ -306,7 +304,6 @@ impl TrackerTopApp {
                 self.reload_overview();
                 self.reload_selected_project();
             }
-        }
     }
 
     fn pick_and_add_project(&mut self) {
@@ -1842,8 +1839,8 @@ impl TrackerTopApp {
             }
 
             // Right: Floating Rounded Inspector Drawer
-            if let (Some(idx), Some(lp)) = (self.selected_node_idx, &self.loaded) {
-                if let Some(node) = lp.nodes.get(idx) {
+            if let (Some(idx), Some(lp)) = (self.selected_node_idx, &self.loaded)
+                && let Some(node) = lp.nodes.get(idx) {
                     ui.add_space(8.0);
                     ui.allocate_ui(Vec2::new(inspector_w, (avail.y - 6.0).max(200.0)), |ui| {
                         soft_card_frame(16).show(ui, |ui| {
@@ -1915,7 +1912,6 @@ impl TrackerTopApp {
                         });
                     });
                 }
-            }
         });
     }
 
@@ -2217,8 +2213,8 @@ impl TrackerTopApp {
             }
         });
 
-        if let Some((rp, target, content)) = add_note_req {
-            if let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
+        if let Some((rp, target, content)) = add_note_req
+            && let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
                 let _ = db.add_note(&target, &content);
                 self.note_content_input.clear();
                 self.status_banner = format!("Saved memory note for `{target}`");
@@ -2226,15 +2222,13 @@ impl TrackerTopApp {
                     lp_mut.notes = db.list_notes(None).unwrap_or_default();
                 }
             }
-        }
-        if let Some((rp, id)) = del_note_req {
-            if let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
+        if let Some((rp, id)) = del_note_req
+            && let Ok(db) = Database::open_for_repo(Path::new(&rp)) {
                 let _ = db.delete_note(id);
                 if let Some(ref mut lp_mut) = self.loaded {
                     lp_mut.notes = db.list_notes(None).unwrap_or_default();
                 }
             }
-        }
     }
 }
 
@@ -2261,7 +2255,9 @@ fn build_app_icon() -> egui::IconData {
     const S: usize = 64;
     let mut rgba = vec![0u8; S * S * 4];
 
-    let nodes: [(f32, f32, f32, (f32, f32, f32)); 4] = [
+    // (x, y, radius, rgb)
+    type GlowNode = (f32, f32, f32, (f32, f32, f32));
+    let nodes: [GlowNode; 4] = [
         (17.0, 20.0, 6.2, (56.0, 189.0, 248.0)), // top-left cyan
         (32.0, 20.0, 7.2, (110.0, 231.0, 183.0)), // top-center emerald hub
         (47.0, 20.0, 6.2, (129.0, 140.0, 248.0)), // top-right indigo
@@ -2384,7 +2380,7 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
             (id, disp, hex, fc, tc)
         })
         .collect();
-    lang_breakdown.sort_by(|a, b| b.4.cmp(&a.4));
+    lang_breakdown.sort_by_key(|l| std::cmp::Reverse(l.4));
 
     let mut sorted_files: Vec<_> = cg.files.values().collect();
     sorted_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2449,13 +2445,11 @@ fn load_project_details(repo_root: &Path) -> Result<LoadedProject> {
             continue;
         }
         if let (Some(&si), Some(&ti)) = (idx_by_path.get(&s.file_path), idx_by_path.get(&t.file_path))
-        {
-            if edge_seen.insert((si, ti)) {
+            && edge_seen.insert((si, ti)) {
                 nodes[si].degree += 1;
                 nodes[ti].degree += 1;
                 edges.push(GraphEdgeVis { src: si, tgt: ti });
             }
-        }
     }
 
     let total_symbols = cg
@@ -2689,7 +2683,9 @@ fn build_smooth_aurora_texture(ctx: &egui::Context) -> egui::TextureHandle {
     let mut pixels = vec![Color32::TRANSPARENT; W * H];
 
     let base = (7.0_f32, 11.0_f32, 20.0_f32);
-    let lights: [((f32, f32), f32, (f32, f32, f32), f32); 3] = [
+    // (center, radius, rgb, strength)
+    type SoftLight = ((f32, f32), f32, (f32, f32, f32), f32);
+    let lights: [SoftLight; 3] = [
         ((0.16, 0.14), 0.42, (56.0, 189.0, 248.0), 0.16),  // soft cyan top-left
         ((0.86, 0.84), 0.48, (129.0, 140.0, 248.0), 0.15), // soft indigo bottom-right
         ((0.50, 0.92), 0.38, (16.0, 185.0, 129.0), 0.10),  // whisper emerald bottom
@@ -2814,15 +2810,14 @@ fn glow_kpi_card(
 
 fn parse_hex_color(hex: &str) -> Color32 {
     let h = hex.trim_start_matches('#');
-    if h.len() == 6 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
+    if h.len() == 6
+        && let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&h[0..2], 16),
             u8::from_str_radix(&h[2..4], 16),
             u8::from_str_radix(&h[4..6], 16),
         ) {
             return Color32::from_rgb(r, g, b);
         }
-    }
     Color32::from_rgb(148, 163, 184)
 }
 

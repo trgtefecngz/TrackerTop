@@ -138,8 +138,8 @@ impl LanguageExtractor for TomlExtractor {
                     doc_summary: String::new(),
                     parent_id: Some(file_id.clone()),
                 });
-            } else if in_deps && !trimmed.is_empty() && !trimmed.starts_with('#') {
-                if let Some((dep_name, _)) = trimmed.split_once('=') {
+            } else if in_deps && !trimmed.is_empty() && !trimmed.starts_with('#')
+                && let Some((dep_name, _)) = trimmed.split_once('=') {
                     let dep = dep_name.trim();
                     if !dep.is_empty() {
                         let sym_id = make_symbol_id(file_path, dep, line_no);
@@ -159,7 +159,6 @@ impl LanguageExtractor for TomlExtractor {
                         });
                     }
                 }
-            }
         }
         Ok(out)
     }

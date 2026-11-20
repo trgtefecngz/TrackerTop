@@ -122,8 +122,8 @@ impl LanguageExtractor for PythonExtractor {
                     });
 
                     // Base classes
-                    if let (Some(open), Some(close)) = (rest.find('('), rest.find(')')) {
-                        if close > open {
+                    if let (Some(open), Some(close)) = (rest.find('('), rest.find(')'))
+                        && close > open {
                             for base in rest[open + 1..close].split(',') {
                                 let bname = read_py_ident(base.trim().rsplit('.').next().unwrap_or(base));
                                 if !bname.is_empty() && !matches!(bname.as_str(), "object" | "ABC" | "Exception") {
@@ -136,7 +136,6 @@ impl LanguageExtractor for PythonExtractor {
                                 }
                             }
                         }
-                    }
 
                     class_stack.push((indent, name, sym_id));
                     i += 1;
