@@ -101,6 +101,32 @@ pub fn fmt_ts(ts: &str) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
+/// Whole seconds from `ts` (RFC 3339) to `now` (Unix seconds); `None` if `ts` does not
+/// parse. A timestamp ahead of `now` (another clock) counts as 0, not as negative.
+pub fn secs_since(ts: &str, now: i64) -> Option<i64> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|t| (now - t.timestamp()).max(0))
+}
+
+/// A relative age, rounded down: `just now`, `12 s ago`, `2 min ago`, `3 h ago`, `4 d ago`.
+pub fn fmt_age(secs: i64) -> String {
+    match secs {
+        ..=1 => "just now".to_string(),
+        2..=59 => format!("{secs} s ago"),
+        60..=3_599 => format!("{} min ago", secs / 60),
+        3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
+}
+
+/// Who made a call and what it was about, for a one-line status:
+/// `("claude-code", "read_symbol", Some("review::rules"))`.
+pub fn call_headline(e: &JournalEntry) -> (String, String, Option<String>) {
+    let agent = e.source.strip_prefix("mcp:").unwrap_or(&e.source);
+    (agent.to_string(), e.tool.clone(), call_target(e))
+}
+
 /// `HH:MM` of a timestamp (for the end of a same-day range).
 fn fmt_time(ts: &str) -> String {
     DateTime::parse_from_rfc3339(ts)
@@ -1225,5 +1251,45 @@ mod tests {
         assert_eq!(kinds, vec!["error", "tried", "check", "calls"]);
         assert_eq!(t[3].title, "2 calls: read_symbol×1, smart_grep×1");
         assert_eq!(t[1].detail, "too slow");
+    }
+
+    #[test]
+    fn ages_are_computed_from_the_timestamp_and_rounded_down() {
+        let now = DateTime::parse_from_rfc3339("2026-11-21T12:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        let age = |ts: &str| fmt_age(secs_since(ts, now).unwrap());
+        assert_eq!(age("2026-11-21T12:00:00+00:00"), "just now");
+        assert_eq!(age("2026-11-21T11:59:48+00:00"), "12 s ago");
+        assert_eq!(age("2026-11-21T11:58:00+00:00"), "2 min ago");
+        assert_eq!(age("2026-11-21T11:00:01+00:00"), "59 min ago");
+        // Another time zone, same instant arithmetic
+        assert_eq!(age("2026-11-21T12:00:00+03:00"), "3 h ago");
+        assert_eq!(age("2026-11-18T11:00:00+00:00"), "3 d ago");
+        // A clock ahead of ours is not a negative age
+        assert_eq!(age("2026-11-21T12:05:00+00:00"), "just now");
+        assert_eq!(secs_since("not a time", now), None);
+    }
+
+    #[test]
+    fn call_headline_names_the_agent_tool_and_target() {
+        let e = entry(
+            1,
+            "s",
+            "",
+            "read_symbol",
+            "symbol=review::rules path=src/a.rs",
+            "ok",
+        );
+        assert_eq!(
+            call_headline(&e),
+            (
+                "test".to_string(),
+                "read_symbol".to_string(),
+                Some("review::rules".to_string())
+            )
+        );
+        let r = entry(2, "s", "", "remember", "content=long text", "ok");
+        assert_eq!(call_headline(&r).2, None);
     }
 }

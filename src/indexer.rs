@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Revision of what the extractors produce (symbols, raw references). Bump it whenever an
@@ -33,6 +34,65 @@ pub struct IndexStats {
     /// `Database::index_generation` after this run; changes whenever the graph data changed.
     pub generation: i64,
     pub elapsed_ms: u128,
+}
+
+/// Live progress of one index run, shared with another thread (the desktop app's status
+/// bar). Counts are real: `done` goes up as each new or changed file finishes parsing.
+#[derive(Debug, Default)]
+pub struct IndexProgress {
+    stage: AtomicU8,
+    done: AtomicUsize,
+    total: AtomicUsize,
+}
+
+/// What an index run is doing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStage {
+    /// Walking the folder for supported files.
+    Scanning,
+    /// Parsing the new or changed files: `done` of `total` finished.
+    Parsing { done: usize, total: usize },
+    /// Resolving references into graph edges and saving them.
+    Linking,
+}
+
+impl IndexProgress {
+    const SCANNING: u8 = 0;
+    const PARSING: u8 = 1;
+    const LINKING: u8 = 2;
+
+    pub fn stage(&self) -> IndexStage {
+        match self.stage.load(Ordering::Acquire) {
+            Self::SCANNING => IndexStage::Scanning,
+            Self::PARSING => IndexStage::Parsing {
+                done: self.done.load(Ordering::Relaxed),
+                total: self.total.load(Ordering::Relaxed),
+            },
+            _ => IndexStage::Linking,
+        }
+    }
+
+    fn start_parsing(&self, total: usize) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+        self.stage.store(Self::PARSING, Ordering::Release);
+    }
+
+    /// Files parsed so far and files to parse in this run, whatever the stage.
+    pub fn files(&self) -> (usize, usize) {
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+
+    fn file_done(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn start_linking(&self) {
+        self.stage.store(Self::LINKING, Ordering::Release);
+    }
 }
 
 /// Refuses to index the user's home directory or a filesystem root.
@@ -134,7 +194,16 @@ pub fn index_repository(repo_root: &Path, force: bool) -> Result<IndexStats> {
 /// Indexes a temporary snapshot (for example a review's base commit checked out in a
 /// worktree) without adding it to the global project list shown in the desktop app.
 pub fn index_snapshot(root: &Path) -> Result<IndexStats> {
-    index_with(root, false, default_registry(), false)
+    index_with(root, false, default_registry(), false, None)
+}
+
+/// [`index_repository`] that reports its progress into `progress` while it runs.
+pub fn index_repository_with_progress(
+    repo_root: &Path,
+    force: bool,
+    progress: &IndexProgress,
+) -> Result<IndexStats> {
+    index_with(repo_root, force, default_registry(), true, Some(progress))
 }
 
 /// Runs an incremental index using any custom `LanguageRegistry` (open core for community languages).
@@ -143,7 +212,7 @@ pub fn index_repository_with_registry(
     force: bool,
     registry: &LanguageRegistry,
 ) -> Result<IndexStats> {
-    index_with(repo_root, force, registry, true)
+    index_with(repo_root, force, registry, true, None)
 }
 
 fn index_with(
@@ -151,6 +220,7 @@ fn index_with(
     force: bool,
     registry: &LanguageRegistry,
     register: bool,
+    progress: Option<&IndexProgress>,
 ) -> Result<IndexStats> {
     let start = Instant::now();
     ensure_indexable_root(repo_root)?;
@@ -235,37 +305,50 @@ fn index_with(
         Touched(String, i64, u64),
     }
 
+    let parse_candidate = |cand: Candidate| -> Option<Outcome> {
+        let source = std::fs::read_to_string(&cand.abs_path).ok()?;
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let recorded_mtime =
+            trustworthy_mtime(&cand.abs_path, cand.mtime, cand.size, source.len() as u64);
+
+        if !reparse_all
+            && let Some(prev) = existing.get(&cand.rel_path)
+            && prev.hash == hash
+        {
+            return Some(Outcome::Touched(cand.rel_path, recorded_mtime, cand.size));
+        }
+
+        let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
+        let line_count = source.lines().count().max(1);
+        let token_count = count_tokens(&source);
+        let rec = FileRecord {
+            path: cand.rel_path,
+            language: cand.extractor.id().to_string(),
+            hash,
+            mtime_secs: recorded_mtime,
+            size_bytes: cand.size,
+            line_count,
+            token_count,
+        };
+        Some(Outcome::Parsed(rec, parsed.symbols, parsed.refs))
+    };
+    if let Some(p) = progress {
+        p.start_parsing(candidates.len());
+    }
     // Read, hash, and parse changed candidates in parallel with rayon
     let outcomes: Vec<Outcome> = candidates
         .into_par_iter()
         .filter_map(|cand| {
-            let source = std::fs::read_to_string(&cand.abs_path).ok()?;
-            let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
-            let recorded_mtime =
-                trustworthy_mtime(&cand.abs_path, cand.mtime, cand.size, source.len() as u64);
-
-            if !reparse_all
-                && let Some(prev) = existing.get(&cand.rel_path)
-                && prev.hash == hash
-            {
-                return Some(Outcome::Touched(cand.rel_path, recorded_mtime, cand.size));
+            let outcome = parse_candidate(cand);
+            if let Some(p) = progress {
+                p.file_done();
             }
-
-            let parsed = cand.extractor.parse(&cand.rel_path, &source).ok()?;
-            let line_count = source.lines().count().max(1);
-            let token_count = count_tokens(&source);
-            let rec = FileRecord {
-                path: cand.rel_path,
-                language: cand.extractor.id().to_string(),
-                hash,
-                mtime_secs: recorded_mtime,
-                size_bytes: cand.size,
-                line_count,
-                token_count,
-            };
-            Some(Outcome::Parsed(rec, parsed.symbols, parsed.refs))
+            outcome
         })
         .collect();
+    if let Some(p) = progress {
+        p.start_linking();
+    }
 
     let mut parsed_batch: Vec<(FileRecord, Vec<Symbol>, Vec<RawReference>)> = Vec::new();
     let mut touched: Vec<(String, i64, u64)> = Vec::new();
@@ -365,6 +448,7 @@ fn index_with(
     if outdated {
         db.set_extractor_revision(EXTRACTOR_REVISION)?;
     }
+    db.set_indexed_at(chrono::Utc::now().timestamp())?;
 
     Ok(IndexStats {
         total_files,

@@ -41,6 +41,13 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
+    /// Whether the symbol counts in the "N symbols" figures the desktop app shows. File
+    /// rows and `impl` blocks are graph plumbing, not symbols someone would look up; every
+    /// count in the app uses this one rule so the header, status bar and overview agree.
+    pub fn is_counted(&self) -> bool {
+        !matches!(self, Self::File | Self::Impl)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::File => "file",

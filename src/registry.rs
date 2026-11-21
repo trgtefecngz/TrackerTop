@@ -296,46 +296,52 @@ pub fn list_projects() -> Vec<ProjectEntry> {
     reg.projects
 }
 
+/// One project's live metrics from its index. Symbol counts follow
+/// [`SymbolKind::is_counted`](crate::model::SymbolKind::is_counted), like the rest of the app.
+pub fn project_snapshot(entry: ProjectEntry) -> ProjectSnapshot {
+    let p = PathBuf::from(&entry.path);
+    let exists = p.exists();
+    let db_path = p.join(".trackertop").join("index.db");
+    let mut snap = ProjectSnapshot {
+        entry,
+        exists_on_disk: exists,
+        indexed: false,
+        total_files: 0,
+        total_symbols: 0,
+        total_edges: 0,
+        total_repo_tokens: 0,
+        stats: TokenStatsSummary::default(),
+    };
+
+    if exists
+        && db_path.exists()
+        && let Ok(db) = Database::open_path(&db_path)
+    {
+        snap.indexed = true;
+        if let Ok(files) = db.load_all_files() {
+            snap.total_files = files.len();
+            snap.total_repo_tokens = files.iter().map(|f| f.token_count).sum();
+        }
+        if let Ok(syms) = db.load_all_symbols() {
+            snap.total_symbols = syms.iter().filter(|s| s.kind.is_counted()).count();
+        }
+        if let Ok(edges) = db.load_all_edges() {
+            snap.total_edges = edges.len();
+        }
+        if let Ok(stats) = db.get_token_stats(15) {
+            snap.stats = stats;
+        }
+    }
+    snap
+}
+
 /// Loads live metrics & token savings across every registered project.
 pub fn load_global_overview() -> GlobalOverview {
     let entries = list_projects();
     let mut overview = GlobalOverview::default();
 
     for entry in entries {
-        let p = PathBuf::from(&entry.path);
-        let exists = p.exists();
-        let db_path = p.join(".trackertop").join("index.db");
-        let mut snap = ProjectSnapshot {
-            entry,
-            exists_on_disk: exists,
-            indexed: false,
-            total_files: 0,
-            total_symbols: 0,
-            total_edges: 0,
-            total_repo_tokens: 0,
-            stats: TokenStatsSummary::default(),
-        };
-
-        if exists
-            && db_path.exists()
-            && let Ok(db) = Database::open_path(&db_path)
-        {
-            snap.indexed = true;
-            if let Ok(files) = db.load_all_files() {
-                snap.total_files = files.len();
-                snap.total_repo_tokens = files.iter().map(|f| f.token_count).sum();
-            }
-            if let Ok(syms) = db.load_all_symbols() {
-                snap.total_symbols = syms.len();
-            }
-            if let Ok(edges) = db.load_all_edges() {
-                snap.total_edges = edges.len();
-            }
-            if let Ok(stats) = db.get_token_stats(15) {
-                snap.stats = stats;
-            }
-        }
-
+        let snap = project_snapshot(entry);
         overview.total_files += snap.total_files;
         overview.total_symbols += snap.total_symbols;
         overview.total_repo_tokens += snap.total_repo_tokens;

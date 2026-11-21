@@ -281,3 +281,115 @@ fn full_reparse_drops_files_it_could_not_reparse() {
         "rows from the old extractor survived a full re-parse"
     );
 }
+
+/// The desktop status bar shows "Indexed N ago" and "Indexing… done/total files": both
+/// come from the run itself, so a finished run must record its time and report every
+/// changed file as parsed, and an unchanged re-run still counts as a fresh check.
+#[test]
+fn index_runs_record_their_time_and_progress() {
+    use trackertop::db::Database;
+    use trackertop::indexer::{IndexProgress, IndexStage, index_repository_with_progress};
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    for i in 0..3 {
+        std::fs::write(
+            root.join(format!("src/m{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let progress = IndexProgress::default();
+    assert_eq!(progress.stage(), IndexStage::Scanning);
+    let before = chrono::Utc::now().timestamp();
+    index_repository_with_progress(root, false, &progress).unwrap();
+    let after = chrono::Utc::now().timestamp();
+    // Parsing finished; the run ended in the linking stage
+    assert_eq!(progress.stage(), IndexStage::Linking);
+
+    let db = Database::open_for_repo(root).unwrap();
+    let first = db.indexed_at().unwrap().expect("indexed_at recorded");
+    assert!(
+        (before..=after).contains(&first),
+        "{first} not in {before}..={after}"
+    );
+
+    // Unchanged re-run: nothing to parse, but the check time moves forward
+    let again = IndexProgress::default();
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    index_repository_with_progress(root, false, &again).unwrap();
+    assert!(db.indexed_at().unwrap().unwrap() > first);
+}
+
+#[test]
+fn parsing_progress_counts_every_changed_file() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use trackertop::indexer::{IndexProgress, IndexStage, index_repository_with_progress};
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    for i in 0..40 {
+        std::fs::write(
+            root.join(format!("src/m{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let progress = Arc::new(IndexProgress::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    // Sample the progress from another thread while the run goes, like the UI does
+    let sampler = {
+        let (p, stop) = (progress.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                if let IndexStage::Parsing { done, total } = p.stage() {
+                    seen.push((done, total));
+                }
+                std::thread::yield_now();
+            }
+            seen
+        })
+    };
+    index_repository_with_progress(&root, false, &progress).unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let seen = sampler.join().unwrap();
+    assert!(
+        seen.iter().all(|&(d, t)| t == 40 && d <= t),
+        "every sample is within 0..=40 of 40: {seen:?}"
+    );
+    assert_eq!(progress.files(), (40, 40), "every changed file was counted");
+}
+
+/// The app shows a symbol count in its header and in its status bar (from the project
+/// snapshot): both must count the same thing, code symbols without file rows and `impl`
+/// blocks, or the same screen shows two different numbers.
+#[test]
+fn project_snapshot_counts_code_symbols_only() {
+    use trackertop::registry::{ProjectEntry, project_snapshot};
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub struct S;\nimpl S {\n    pub fn m(&self) {}\n}\npub fn f() {}\n",
+    )
+    .unwrap();
+    index_repository(root, false).unwrap();
+
+    let snap = project_snapshot(ProjectEntry {
+        path: root.to_string_lossy().to_string(),
+        name: "p".to_string(),
+        added_at: String::new(),
+        last_seen: String::new(),
+    });
+    assert!(snap.indexed);
+    assert_eq!(snap.total_files, 1);
+    // S, S::m, f — not the file row, not the impl block
+    assert_eq!(snap.total_symbols, 3);
+}

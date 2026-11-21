@@ -83,10 +83,10 @@ impl TrackerTopApp {
                     match install_agent(agent, &base) {
                         Ok(lines) => {
                             self.connected_agents = poll_agent_statuses();
-                            self.status_banner = lines.join(" | ");
+                            self.notify(lines.join(" | "));
                         }
                         Err(e) => {
-                            self.status_banner = format!("Install error: {e}");
+                            self.notify_error(format!("Install error: {e}"));
                         }
                     }
                 }
@@ -109,7 +109,7 @@ impl TrackerTopApp {
                                 .clicked()
                             {
                                 ui.ctx().copy_text(generic_mcp_json_snippet());
-                                self.status_banner = "Copied universal MCP JSON to clipboard!".to_string();
+                                self.notify("Copied universal MCP JSON to clipboard!");
                             }
                         });
                     });

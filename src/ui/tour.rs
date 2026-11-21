@@ -14,6 +14,8 @@ pub struct Tour {
     frames: u32,
     requested: bool,
     name: &'static str,
+    /// A click being injected: position and phase (move, press, release).
+    click: Option<(egui::Pos2, u8)>,
 }
 
 const SETTLE_FRAMES: u32 = 45;
@@ -28,6 +30,7 @@ impl Tour {
             frames: 0,
             requested: false,
             name: "",
+            click: None,
         })
     }
 }
@@ -147,9 +150,33 @@ impl TrackerTopApp {
                 "12-memory"
             }
             13 => {
+                // Opt-in: re-indexes the project, so the bar shows a run in progress.
+                let Selection::Project(p) = self.selection.clone() else {
+                    return None;
+                };
+                if std::env::var_os("TRACKERTOP_UI_TOUR_REINDEX").is_none() {
+                    return Some(SKIP);
+                }
+                self.start_bg_index(PathBuf::from(p), true, false);
+                "13-status-indexing"
+            }
+            14 => {
+                // The bar once that run finished (indexed again, or its error).
+                if std::env::var_os("TRACKERTOP_UI_TOUR_REINDEX").is_none() {
+                    return Some(SKIP);
+                }
+                "14-status-after-index"
+            }
+            15 => {
+                // From another tab, a real pointer click on the agent action (injected in
+                // `tour_input`) must open AI Memory.
+                self.active_tab = ProjectTab::Savings;
+                "15-click-agent-action"
+            }
+            16 => {
                 self.selection = Selection::AllProjects;
                 self.loaded = None;
-                "13-global"
+                "16-global"
             }
             _ => return None,
         };
@@ -187,12 +214,28 @@ impl TrackerTopApp {
         if !tour.requested {
             if tour.frames == 0 {
                 match self.tour_apply(tour.step) {
+                    Some(SKIP) => {
+                        tour.step += 1;
+                        self.tour = Some(tour);
+                        return;
+                    }
                     Some(name) => tour.name = name,
                     None => std::process::exit(0),
                 }
             }
+            // Wait for a running index job before shooting its result.
+            if tour.name.contains("after-index") && self.bg_busy {
+                self.tour = Some(tour);
+                return;
+            }
+            if tour.name.contains("click") && tour.frames == 10 {
+                match self.agent_action_rect {
+                    Some(r) => tour.click = Some((r.center(), 0)),
+                    None => eprintln!("tour: no agent action in the status bar to click"),
+                }
+            }
             tour.frames += 1;
-            let settle = if tour.name.contains("transition") {
+            let settle = if tour.name.contains("transition") || tour.name.contains("indexing") {
                 4
             } else {
                 SETTLE_FRAMES
@@ -207,7 +250,33 @@ impl TrackerTopApp {
         }
         self.tour = Some(tour);
     }
+
+    /// Feeds a pending tour click into egui as real pointer events, one per frame:
+    /// move, press, release. egui's own hit-testing decides what it lands on.
+    pub(super) fn tour_input(&mut self, raw: &mut egui::RawInput) {
+        let Some(tour) = self.tour.as_mut() else {
+            return;
+        };
+        let Some((pos, phase)) = tour.click else {
+            return;
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        match phase {
+            0 => raw.events.push(egui::Event::PointerMoved(pos)),
+            1 => raw.events.push(button(true)),
+            _ => raw.events.push(button(false)),
+        }
+        tour.click = (phase < 2).then_some((pos, phase + 1));
+    }
 }
+
+/// A step that does not apply in this run (see `tour_apply`).
+const SKIP: &str = "";
 
 fn write_bmp(path: &std::path::Path, img: &egui::ColorImage) -> std::io::Result<()> {
     let [w, h] = img.size;
