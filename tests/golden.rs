@@ -170,7 +170,11 @@ fn run_fixture(dir: &Path) -> Outcome {
     for e in edges {
         let pair = format!("{} -> {}", key(&e.source_id), key(&e.target_id));
         if dump {
-            println!("EDGE {pair} [{} {}]", e.kind.as_str(), e.confidence.as_str());
+            println!(
+                "EDGE {pair} [{} {}]",
+                e.kind.as_str(),
+                e.confidence.as_str()
+            );
         }
         if e.confidence == Confidence::Exact {
             exact_calls.insert(pair.clone());
@@ -296,7 +300,11 @@ fn golden_corpus_answers_match_hand_checked_expectations() {
         for (what, got, min) in [
             ("call precision", o.calls.precision(), floor.call_precision),
             ("call recall", o.calls.recall(), floor.call_recall),
-            ("answer precision", o.answers.precision(), floor.answer_precision),
+            (
+                "answer precision",
+                o.answers.precision(),
+                floor.answer_precision,
+            ),
             ("answer recall", o.answers.recall(), floor.answer_recall),
         ] {
             if r(got) < r(min) {

@@ -310,6 +310,149 @@ pub struct ProgressSection {
     pub line: usize,
     /// Non-empty lines of the section body.
     pub lines: Vec<String>,
+    /// Why git suggests the section no longer describes where work stands (empty: no
+    /// sign of that). See [`mark_outdated_progress`].
+    pub outdated: Vec<String>,
+}
+
+/// What git says happened since the progress file last changed: the inputs of
+/// [`mark_outdated_progress`], gathered by the engine.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressGit {
+    /// The file has uncommitted edits (or is not committed yet): it is being kept current.
+    pub file_dirty: bool,
+    /// Commits on HEAD after the one that last changed the file.
+    pub commits_since: usize,
+    /// Subject of the newest of those commits.
+    pub newest_since: Option<String>,
+    /// PR numbers merged after the file last changed (`(#12)` / `Merge pull request #12`
+    /// in a commit subject), with that subject.
+    pub merged_since: Vec<(u32, String)>,
+    /// The default branch (`main`) when the file's last change is already on it.
+    pub on_default_branch: Option<String>,
+}
+
+/// A progress file this many commits behind HEAD is flagged as possibly outdated.
+pub const PROGRESS_STALE_AFTER_COMMITS: usize = 3;
+
+/// Phrases that say work still waits for a merge (English and Turkish), lowercase.
+const AWAITS_MERGE: &[&str] = &[
+    "awaiting merge",
+    "await merge",
+    "awaits merge",
+    "before merge",
+    "waiting for merge",
+    "waits for merge",
+    "waiting to be merged",
+    "ready to merge",
+    "not merged",
+    "not yet merged",
+    "to be merged",
+    "merge bekl",
+    "merge edilmedi",
+    "birleştirilmeyi bekl",
+];
+
+/// PR numbers a line mentions as `#12` (a `#` followed by digits, not inside a word).
+fn pr_numbers(line: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    for (i, _) in line.match_indices('#') {
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'&') {
+            continue;
+        }
+        let digits: String = line[i + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(n) = digits.parse::<u32>()
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// PR numbers a commit subject records as merged: a squash merge `Title (#12)` or a
+/// merge commit `Merge pull request #12 from ...`.
+pub fn merged_pr_numbers(subject: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Some(rest) = subject.strip_prefix("Merge pull request #") {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(n) = digits.parse() {
+            out.push(n);
+        }
+    }
+    let mut rest = subject;
+    while let Some(i) = rest.find("(#") {
+        let after = &rest[i + 2..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if after[digits.len()..].starts_with(')')
+            && let Ok(n) = digits.parse()
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+        rest = after;
+    }
+    out
+}
+
+/// Marks progress sections git has overtaken, the way a note is flagged when its code
+/// changed since it was written: the file's last commit is the provenance, and later
+/// history is checked against what the section claims.
+///
+/// - a PR the section mentions was merged after the file last changed;
+/// - the section says work awaits a merge, but the file's last change is already on the
+///   default branch;
+/// - [`PROGRESS_STALE_AFTER_COMMITS`] or more commits came after the file last changed.
+///
+/// A file with uncommitted edits is being kept current and is never marked.
+pub fn mark_outdated_progress(sections: &mut [ProgressSection], git: &ProgressGit) {
+    if git.file_dirty {
+        return;
+    }
+    for s in sections.iter_mut() {
+        let mut reasons = Vec::new();
+        let mut mentioned: Vec<u32> = Vec::new();
+        for l in &s.lines {
+            for n in pr_numbers(l) {
+                if !mentioned.contains(&n) {
+                    mentioned.push(n);
+                }
+            }
+        }
+        for n in mentioned {
+            if let Some((_, subject)) = git.merged_since.iter().find(|(m, _)| *m == n) {
+                reasons.push(format!("PR #{n} is already merged (`{subject}`)"));
+            }
+        }
+        if let Some(branch) = &git.on_default_branch {
+            let awaits = s.lines.iter().any(|l| {
+                let l = l.to_lowercase();
+                AWAITS_MERGE.iter().any(|p| l.contains(p))
+            });
+            if awaits {
+                reasons.push(format!(
+                    "it says work awaits a merge, but this file's last change is already on \
+                     `{branch}`"
+                ));
+            }
+        }
+        if git.commits_since >= PROGRESS_STALE_AFTER_COMMITS {
+            reasons.push(format!(
+                "{} commits since {} last changed{}",
+                git.commits_since,
+                s.file,
+                git.newest_since
+                    .as_ref()
+                    .map(|m| format!(" (newest: `{m}`)"))
+                    .unwrap_or_default()
+            ));
+        }
+        s.outdated = reasons;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -482,11 +625,19 @@ pub fn render_resume(d: &ResumeData, brief: bool) -> String {
     sections.sort_by_key(|s| !wanted_next(&s.heading));
     for s in sections {
         out.push_str(&format!(
-            "\n## {} ({}:{})\n",
+            "\n## {} ({}:{}){}\n",
             s.heading.trim_start_matches('#').trim(),
             s.file,
-            s.line
+            s.line,
+            if s.outdated.is_empty() {
+                ""
+            } else {
+                " POSSIBLY OUTDATED"
+            }
         ));
+        for r in &s.outdated {
+            out.push_str(&format!("! {r}\n"));
+        }
         if s.lines.is_empty() {
             out.push_str("(empty)\n");
         }
@@ -897,6 +1048,7 @@ pub fn parse_progress_sections(file: &str, text: &str) -> Vec<ProgressSection> {
                     heading: line.to_string(),
                     line: i + 1,
                     lines: Vec::new(),
+                    outdated: Vec::new(),
                 });
             }
             continue;
@@ -1077,6 +1229,37 @@ mod tests {
             !r.contains(&5),
             "a progress entry written before the block cannot close it"
         );
+    }
+
+    #[test]
+    fn pr_numbers_come_from_mentions_and_merge_subjects() {
+        assert_eq!(
+            pr_numbers("PR #12 and #13, issue#3, &#14;, #12 again"),
+            [12, 13]
+        );
+        assert_eq!(merged_pr_numbers("Status bar: index state (#10)"), [10]);
+        assert_eq!(merged_pr_numbers("Merge pull request #7 from a/b"), [7]);
+        assert!(merged_pr_numbers("fix (#abc) and (#5 wip").is_empty());
+    }
+
+    #[test]
+    fn a_progress_file_with_uncommitted_edits_is_never_marked() {
+        let mut s = parse_progress_sections("docs/P.md", "## Next\n- awaiting merge of #4\n");
+        let git = ProgressGit {
+            file_dirty: true,
+            commits_since: 9,
+            merged_since: vec![(4, "x (#4)".into())],
+            on_default_branch: Some("main".into()),
+            ..Default::default()
+        };
+        mark_outdated_progress(&mut s, &git);
+        assert!(s[0].outdated.is_empty());
+        let git = ProgressGit {
+            file_dirty: false,
+            ..git
+        };
+        mark_outdated_progress(&mut s, &git);
+        assert_eq!(s[0].outdated.len(), 3, "{:?}", s[0].outdated);
     }
 
     #[test]

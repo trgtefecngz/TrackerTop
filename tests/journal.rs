@@ -206,3 +206,78 @@ fn journal_rows_feed_the_timeline() {
     assert_eq!(t.len(), 1);
     assert_eq!(t[0].title, "2 calls: read_symbol×1, smart_grep×1");
 }
+
+/// A progress file can outlive the work it describes: its `## Next` still says "awaiting
+/// merge" after the PR was merged. `resume` marks such a section POSSIBLY OUTDATED, with
+/// the git facts behind it (a mentioned PR found merged in git history, a merge awaited by
+/// a file that is already on the default branch, commits made after the file last
+/// changed). A current file is not marked.
+#[test]
+fn resume_marks_progress_sections_git_has_overtaken() {
+    let progress = "# v0.1\n## Next\n1. Awaiting merge of PR #12.\n2. Then tag the release.\n\
+                    ## Kararını bekleyenler\n- Should PR #12 be squashed?\n";
+    let marked = |out: &str, heading: &str| -> bool {
+        out.lines()
+            .any(|l| l.starts_with(&format!("## {heading} (")) && l.contains("POSSIBLY OUTDATED"))
+    };
+
+    // Stale: PR #12 merged on main and more commits followed
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/V0.1_PROGRESS.md"), progress).unwrap();
+    std::fs::write(root.join("a.txt"), "0").unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "progress"]);
+    for (i, msg) in ["Parser rewrite (#12)", "fix a", "fix b", "release: 0.1.0"]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(root.join("a.txt"), (i + 1).to_string()).unwrap();
+        git_in(root, &["commit", "-q", "-am", msg]);
+    }
+    let out = TrackerEngine::new(root).resume(6_000).unwrap().text;
+    assert!(marked(&out, "Next"), "{out}");
+    assert!(marked(&out, "Kararını bekleyenler"), "{out}");
+    assert!(
+        out.contains("PR #12 is already merged (`Parser rewrite (#12)`)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("4 commits since docs/V0.1_PROGRESS.md last changed"),
+        "{out}"
+    );
+
+    // Awaits a merge, but the file's last change is already on main (no PR number)
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(
+        root.join("docs/V0.1_PROGRESS.md"),
+        "## Next\n1. All done; remaining before merge: nothing.\n",
+    )
+    .unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "progress"]);
+    let out = TrackerEngine::new(root).resume(6_000).unwrap().text;
+    assert!(marked(&out, "Next"), "{out}");
+    assert!(out.contains("already on `main`"), "{out}");
+
+    // Current: written on a work branch, nothing merged, no later commits
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("a.txt"), "0").unwrap();
+    git_in(root, &["init", "-q", "-b", "main"]);
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "base"]);
+    git_in(root, &["checkout", "-q", "-b", "work"]);
+    std::fs::write(root.join("docs/V0.1_PROGRESS.md"), progress).unwrap();
+    git_in(root, &["add", "."]);
+    git_in(root, &["commit", "-q", "-m", "progress"]);
+    let out = TrackerEngine::new(root).resume(6_000).unwrap().text;
+    assert!(out.contains("## Next (docs/V0.1_PROGRESS.md:2)"), "{out}");
+    assert!(!out.contains("POSSIBLY OUTDATED"), "{out}");
+}
