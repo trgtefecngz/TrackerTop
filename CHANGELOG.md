@@ -2,6 +2,17 @@
 
 All notable changes to TrackerTop are documented here.
 
+## [Unreleased]
+
+### Added: edge confidence and a golden correctness corpus
+- **Every resolved edge is labelled `exact` or `heuristic`.** Exact: a qualified path (`Type::f`, `module::f`), `Self::`, a module or file path, or a name defined once in the caller's own file. Heuristic: a bare name picked among several candidates or found only in another file, a method call on a value whose type is unknown, a case-insensitive or last-segment fallback, and co-change links. Heuristic edges are kept and labelled, never dropped. Stored in the index (`edges.confidence`); an older index is migrated in place and its edges are rebuilt on the next index run.
+- `call_graph` and `read_symbol` label each caller and callee (`[CALLS exact]`, `[CALLS heuristic]`); `call_graph` and `impact_analysis` split their counts (`Direct: 5 (3 exact, 2 heuristic)`). A path is exact only when every edge on it is.
+- Review findings `impact` and `untested` say how many of their dependents rest on heuristic edges.
+- **Golden corpus** (`tests/golden/`): small Rust, Python, TypeScript (monorepo) and Go projects with hand-written answers (callers and callees, impact, untested functions, orphan files). The test prints precision and recall per language, fails on any wrong exact edge, and fails when a number drops below `tests/golden/baseline.json`. It runs in CI.
+
+### Changed: `resume` flags a progress file git has overtaken
+- A `## Next` or `## Kararını bekleyenler` section is marked **POSSIBLY OUTDATED**, with the reason, when a PR it mentions was merged after the file last changed, when it says work awaits a merge but the file is already on the default branch, or when 3 or more commits came after the file last changed. A file with uncommitted edits is never marked. Uses local git only.
+
 ## [0.8.2] - 2026-11-21
 
 ### Changed: the desktop status bar shows live state

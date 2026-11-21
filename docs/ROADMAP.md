@@ -131,6 +131,7 @@ The TypeScript/JavaScript extractor is line-based: test spans, braces, strings, 
 
 ## v0.9: precision
 
+- **Edge confidence labels and a golden corpus.** *Delivered first (branch `claude/elastic-franklin-e6e1fa`): every edge is labelled exact or heuristic, and `tests/golden/` measures precision and recall per language in CI.* The LSP bridge below can now be judged by how many heuristic edges it turns into exact ones, and how far the golden numbers rise.
 - **LSP bridge.** When rust-analyzer, tsserver, pyright or gopls is available, ask it which function a call really reaches, and mark each edge as exact or heuristic. Tree-sitter stays the fallback. This removes the remaining guesswork in call edges (trait calls, methods on values, re-exports) instead of dropping those edges.
 - **Affected-test selection.** `run_checks` can run only the tests that reach the changed symbols, for fast feedback while working. The full suite still runs before a commit and in CI.
 
