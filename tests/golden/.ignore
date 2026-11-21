@@ -1,0 +1,4 @@
+# Golden-corpus fixtures: small projects the golden test indexes on their own (copied to
+# a temporary folder). Kept out of TrackerTop's own index so their names (`New`, `save`,
+# `register`, ...) never mix with this repository's symbols.
+*

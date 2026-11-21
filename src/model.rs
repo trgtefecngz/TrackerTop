@@ -182,6 +182,63 @@ pub struct RawReference {
     pub line: usize,
 }
 
+/// How far an edge can be trusted.
+///
+/// - `Exact`: the target was named without ambiguity: a qualified path (`Type::f`,
+///   `module::f`), `Self::`, a module or file path, or a name defined once in the caller's
+///   own file.
+/// - `Heuristic`: a guess that may be wrong: a bare name picked among several candidates
+///   or found in another file by name only, a method call on a value whose type is
+///   unknown, a case-insensitive or last-segment fallback, or a statistical link
+///   (co-change).
+///
+/// Heuristic edges are kept and labelled, never dropped.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    Exact,
+    #[default]
+    Heuristic,
+}
+
+impl Confidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Heuristic => "heuristic",
+        }
+    }
+
+    /// Anything but `exact` reads as heuristic: an unknown value is not a proof.
+    pub fn from_str_lossy(s: &str) -> Self {
+        if s == "exact" {
+            Self::Exact
+        } else {
+            Self::Heuristic
+        }
+    }
+
+    /// The confidence of a path: exact only if every step is exact.
+    pub fn and(self, other: Self) -> Self {
+        if self == Self::Exact && other == Self::Exact {
+            Self::Exact
+        } else {
+            Self::Heuristic
+        }
+    }
+
+    /// The better of two ways to reach the same target.
+    pub fn or(self, other: Self) -> Self {
+        if self == Self::Exact || other == Self::Exact {
+            Self::Exact
+        } else {
+            Self::Heuristic
+        }
+    }
+}
+
 /// Resolved directed edge stored in the graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
@@ -189,6 +246,8 @@ pub struct Edge {
     pub target_id: String,
     pub kind: EdgeKind,
     pub weight: f32,
+    #[serde(default)]
+    pub confidence: Confidence,
 }
 
 /// Telemetry record for every AI/CLI query measuring real token savings.

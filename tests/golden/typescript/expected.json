@@ -1,0 +1,45 @@
+{
+  "language": "typescript",
+  "calls": {
+    "packages/core/src/date.ts::formatDate": ["packages/core/src/date.ts::pad"],
+    "packages/core/src/http.ts::Http::get": [
+      "packages/core/src/cache.ts::Cache::get",
+      "packages/core/src/http.ts::Http::fetchBody",
+      "packages/core/src/cache.ts::Cache::set"
+    ],
+    "packages/web/src/page.ts::renderHeader": ["packages/core/src/date.ts::formatDate"],
+    "packages/web/src/page.ts::loadPage": [
+      "packages/core/src/http.ts::Http",
+      "packages/core/src/cache.ts::Cache",
+      "packages/web/src/page.ts::renderHeader",
+      "packages/core/src/http.ts::Http::get"
+    ],
+    "packages/web/src/page.test.ts::header shows the date": [
+      "packages/web/src/page.ts::renderHeader"
+    ]
+  },
+  "impact": {
+    "packages/core/src/date.ts::pad": [
+      "packages/core/src/date.ts::formatDate",
+      "packages/web/src/page.ts::renderHeader"
+    ],
+    "packages/core/src/cache.ts::Cache::get": [
+      "packages/core/src/http.ts::Http::get",
+      "packages/web/src/page.ts::loadPage"
+    ],
+    "packages/web/src/page.ts::renderHeader": [
+      "packages/web/src/page.ts::loadPage",
+      "packages/web/src/page.test.ts::header shows the date"
+    ]
+  },
+  "untested": [
+    "packages/core/src/cache.ts::Cache::get",
+    "packages/core/src/cache.ts::Cache::set",
+    "packages/core/src/http.ts::Http::constructor",
+    "packages/core/src/http.ts::Http::get",
+    "packages/core/src/http.ts::Http::fetchBody",
+    "packages/web/src/page.ts::loadPage",
+    "packages/web/src/unused.js::leftover"
+  ],
+  "orphan_files": ["packages/web/src/unused.js"]
+}

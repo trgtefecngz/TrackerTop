@@ -1,6 +1,7 @@
 use crate::model::{
-    Edge, EdgeKind, FileRecord, JournalEntry, NOTE_KINDS, ProjectNote, SourceBreakdown, Symbol,
-    SymbolKind, TelemetryEntry, TokenStatsSummary, ToolSavingsBreakdown, note_kind_needs_reason,
+    Confidence, Edge, EdgeKind, FileRecord, JournalEntry, NOTE_KINDS, ProjectNote, SourceBreakdown,
+    Symbol, SymbolKind, TelemetryEntry, TokenStatsSummary, ToolSavingsBreakdown,
+    note_kind_needs_reason,
 };
 use crate::tokens::estimate_usd_saved;
 use anyhow::{Context, Result};
@@ -107,6 +108,7 @@ impl Database {
                 target_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 weight REAL NOT NULL,
+                confidence TEXT NOT NULL DEFAULT 'heuristic',
                 PRIMARY KEY (source_id, target_id, kind)
             );
 
@@ -173,11 +175,21 @@ impl Database {
         self.ensure_column("notes", "code_hash", "TEXT NOT NULL DEFAULT ''")?;
         // v0.7: honest metrics. Rows recorded before this are `legacy` (source unknown).
         self.ensure_column("telemetry", "source", "TEXT NOT NULL DEFAULT 'legacy'")?;
+        // v0.9: edge confidence. Rows resolved before labels existed read as heuristic, and
+        // the edge set is marked stale so the next index run labels it for real.
+        if self.ensure_column("edges", "confidence", "TEXT NOT NULL DEFAULT 'heuristic'")? {
+            self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES('edges_generation', -1)
+                 ON CONFLICT(key) DO UPDATE SET value = -1",
+                [],
+            )?;
+        }
         Ok(())
     }
 
     /// Adds `column` to `table` if it does not exist yet (idempotent, safe on old DBs).
-    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+    /// Returns whether this call added it.
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<bool> {
         let exists = {
             let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
             let names = stmt
@@ -190,13 +202,13 @@ impl Database {
                 &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
                 [],
             ) {
-                Ok(_) => {}
+                Ok(_) => return Ok(true),
                 // Another process added it between our check and the ALTER
                 Err(e) if e.to_string().contains("duplicate column") => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Monotonic counter bumped each time a complete, consistent graph is committed (by
@@ -681,7 +693,7 @@ impl Database {
     pub fn load_all_edges(&self) -> Result<Vec<Edge>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT source_id, target_id, kind, weight FROM edges")?;
+            .prepare("SELECT source_id, target_id, kind, weight, confidence FROM edges")?;
         let rows = stmt.query_map([], |row| {
             let kind_str: String = row.get(2)?;
             Ok(Edge {
@@ -689,6 +701,7 @@ impl Database {
                 target_id: row.get(1)?,
                 kind: EdgeKind::from_str_lossy(&kind_str),
                 weight: row.get(3)?,
+                confidence: Confidence::from_str_lossy(&row.get::<_, String>(4)?),
             })
         })?;
         let mut out = Vec::new();
@@ -1165,13 +1178,21 @@ fn bump_meta(conn: &Connection, key: &str) -> Result<()> {
 fn write_edges(conn: &Connection, edges: &[Edge]) -> Result<usize> {
     conn.execute("DELETE FROM edges", [])?;
     let mut stmt = conn.prepare(
-        "INSERT INTO edges (source_id, target_id, kind, weight)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO edges (source_id, target_id, kind, weight, confidence)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(source_id, target_id, kind)
-         DO UPDATE SET weight = max(weight, excluded.weight)",
+         DO UPDATE SET weight = max(weight, excluded.weight),
+             confidence = CASE WHEN confidence = 'exact' OR excluded.confidence = 'exact'
+                 THEN 'exact' ELSE 'heuristic' END",
     )?;
     for e in edges {
-        stmt.execute(params![e.source_id, e.target_id, e.kind.as_str(), e.weight])?;
+        stmt.execute(params![
+            e.source_id,
+            e.target_id,
+            e.kind.as_str(),
+            e.weight,
+            e.confidence.as_str()
+        ])?;
     }
     let stored: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
     Ok(stored as usize)
@@ -1239,6 +1260,7 @@ mod tests {
             target_id: "t".to_string(),
             kind: EdgeKind::Calls,
             weight,
+            confidence: Default::default(),
         };
         // Duplicate (source, target, kind) collapses into a single stored row that keeps the
         // strongest weight, whichever order the duplicates arrive in.
@@ -1371,6 +1393,75 @@ mod note_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn old_edges_table_gets_confidence_and_is_marked_for_rebuild() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE edges (source_id TEXT NOT NULL, target_id TEXT NOT NULL, \
+                 kind TEXT NOT NULL, weight REAL NOT NULL, \
+                 PRIMARY KEY (source_id, target_id, kind));
+                 INSERT INTO edges VALUES ('a', 'b', 'CALLS', 1.5);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                 INSERT INTO meta VALUES ('files_generation', 3), ('edges_generation', 3);",
+            )
+            .unwrap();
+        }
+        let db = Database::open_path(&path).unwrap();
+        let edges = db.load_all_edges().unwrap();
+        assert_eq!(edges.len(), 1, "old edges are kept");
+        assert_eq!(
+            edges[0].confidence,
+            Confidence::Heuristic,
+            "an edge resolved before labels existed is not claimed exact"
+        );
+        assert_ne!(
+            db.edges_generation().unwrap(),
+            db.files_generation().unwrap(),
+            "the next index run rebuilds the edges with real labels"
+        );
+        // A second open does not mark a rebuilt graph stale again
+        drop(db);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute(
+                "UPDATE meta SET value = 3 WHERE key = 'edges_generation'",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Database::open_path(&path).unwrap();
+        assert_eq!(db.edges_generation().unwrap(), 3);
+    }
+
+    #[test]
+    fn duplicate_edges_keep_the_exact_label() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut db = Database::open_for_repo(repo.path()).unwrap();
+        let e = |c: Confidence| Edge {
+            source_id: "a".to_string(),
+            target_id: "t".to_string(),
+            kind: EdgeKind::Calls,
+            weight: 1.0,
+            confidence: c,
+        };
+        for order in [
+            [Confidence::Heuristic, Confidence::Exact],
+            [Confidence::Exact, Confidence::Heuristic],
+        ] {
+            let edges = [e(order[0]), e(order[1])];
+            let built_from = db.files_generation().unwrap();
+            db.replace_edges_if_current(&edges, built_from)
+                .unwrap()
+                .unwrap();
+            let stored = db.load_all_edges().unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].confidence, Confidence::Exact, "{order:?}");
+        }
     }
 
     #[test]

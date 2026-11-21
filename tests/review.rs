@@ -150,8 +150,15 @@ fn review_rules_flag_broken_refs_impact_and_untested_code() {
         )
         .replace("    renamed_away()\n", "    new_name()\n")
         .replace("    x + 1\n", "    x + 2\n")
-        + "pub fn brand_new() -> i32 {\n    7\n}\n";
+        + "pub fn brand_new() -> i32 {\n    7\n}\n"
+        + "pub fn far_new() -> i32 {\n    8\n}\nmod other;\n";
     std::fs::write(root.join("src/lib.rs"), new_lib).unwrap();
+    // A bare call from another file is found by name only: a heuristic edge
+    std::fs::write(
+        root.join("src/other.rs"),
+        "pub fn uses_far() -> i32 { far_new() }\n",
+    )
+    .unwrap();
 
     let cs = review(root, "main").unwrap();
     let ids: Vec<&str> = cs.findings.iter().map(|f| f.id.as_str()).collect();
@@ -176,12 +183,27 @@ fn review_rules_flag_broken_refs_impact_and_untested_code() {
     let hub = get("impact:src/lib.rs:hub").unwrap_or_else(|| panic!("{ids:?}"));
     assert!(hub.message.contains("10 direct"), "{}", hub.message);
     assert!(
+        hub.message
+            .ends_with("(all dependents through exact edges)"),
+        "{}",
+        hub.message
+    );
+    assert!(
         hub.evidence.iter().any(|e| e.contains("hub_works")),
         "{:?}",
         hub.evidence
     );
 
     assert!(get("untested:src/lib.rs:brand_new").is_some(), "{ids:?}");
+    let far = get("untested:src/lib.rs:far_new").unwrap_or_else(|| panic!("{ids:?}"));
+    assert_eq!(
+        far.evidence,
+        vec![
+            "1 direct and 0 transitive callers, none of them a test \
+             (1 of the callers through heuristic edges)"
+                .to_string()
+        ]
+    );
     // hub is reached by a test through `assert_eq!(hub(1), 2)`
     assert!(get("untested:src/lib.rs:hub").is_none(), "{ids:?}");
 

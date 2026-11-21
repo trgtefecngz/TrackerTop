@@ -1,0 +1,6 @@
+{
+  "go": { "call_precision": 0.875, "call_recall": 0.7, "answer_precision": 0.667, "answer_recall": 0.667 },
+  "python": { "call_precision": 0.846, "call_recall": 0.688, "answer_precision": 0.706, "answer_recall": 0.857 },
+  "rust": { "call_precision": 1.0, "call_recall": 0.762, "answer_precision": 0.85, "answer_recall": 0.81 },
+  "typescript": { "call_precision": 0.889, "call_recall": 0.8, "answer_precision": 0.867, "answer_recall": 0.929 }
+}

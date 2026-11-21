@@ -118,3 +118,18 @@ pub fn git_in(root: &std::path::Path, args: &[&str]) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Sorted `(source, target, kind, confidence)` rows of the persisted edge set.
+pub fn labelled_edges(root: &std::path::Path) -> Vec<(String, String, String, String)> {
+    let conn = open_existing_index(root);
+    let mut stmt = conn
+        .prepare("SELECT source_id, target_id, kind, confidence FROM edges")
+        .unwrap();
+    let mut rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort();
+    rows
+}

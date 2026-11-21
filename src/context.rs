@@ -209,6 +209,26 @@ impl TrackerEngine {
         db.get_token_stats(20)
     }
 }
+
+/// `N (E exact, H heuristic)`, or just `0`: how many of a list's entries rest on exact
+/// edges and how many on at least one heuristic edge.
+pub(crate) fn confidence_split(total: usize, heuristic: usize) -> String {
+    if total == 0 {
+        return "0".to_string();
+    }
+    format!(
+        "{total} ({} exact, {heuristic} heuristic)",
+        total.saturating_sub(heuristic)
+    )
+}
+
+/// How many hops of a neighborhood are reached through a heuristic edge.
+pub(crate) fn count_heuristic(hops: &crate::graph::HopList<'_>) -> usize {
+    hops.iter()
+        .filter(|h| h.2 == crate::model::Confidence::Heuristic)
+        .count()
+}
+
 /// One line telling the agent that a list was cut, so a partial list never looks complete.
 fn more_note(total: usize, shown: usize, what: &str) -> String {
     if total > shown {

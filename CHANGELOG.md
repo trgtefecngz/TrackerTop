@@ -4,6 +4,15 @@ All notable changes to TrackerTop are documented here.
 
 ## [Unreleased]
 
+### Added: edge confidence and a golden correctness corpus
+- **Every resolved edge is labelled `exact` or `heuristic`.** Exact: a qualified path (`Type::f`, `module::f`), `Self::`, a module or file path, or a name defined once in the caller's own file. Heuristic: a bare name picked among several candidates or found only in another file, a method call on a value whose type is unknown, a case-insensitive or last-segment fallback, and co-change links. Heuristic edges are kept and labelled, never dropped. Stored in the index (`edges.confidence`); an older index is migrated in place and its edges are rebuilt on the next index run.
+- `call_graph` and `read_symbol` label each caller and callee (`[CALLS exact]`, `[CALLS heuristic]`); `call_graph` and `impact_analysis` split their counts (`Direct: 5 (3 exact, 2 heuristic)`). A path is exact only when every edge on it is.
+- Review findings `impact` and `untested` say how many of their dependents rest on heuristic edges.
+- **Golden corpus** (`tests/golden/`): small Rust, Python, TypeScript (monorepo) and Go projects with hand-written answers (callers and callees, impact, untested functions, orphan files). The test prints precision and recall per language, fails on any wrong exact edge, and fails when a number drops below `tests/golden/baseline.json`. It runs in CI.
+
+### Changed: `resume` flags a progress file git has overtaken
+- A `## Next` or `## Kararını bekleyenler` section is marked **POSSIBLY OUTDATED**, with the reason, when a PR it mentions was merged after the file last changed, when it says work awaits a merge but the file is already on the default branch, or when 3 or more commits came after the file last changed. A file with uncommitted edits is never marked. Uses local git only.
+
 ### Fixed: the installer never overwrites a file it could not read
 - `trackertop install claude` used to treat a `CLAUDE.md` it could not read as UTF-8 as empty and write over it, with no backup. A UTF-16 file (what Windows PowerShell 5.1 `Out-File` writes) lost all its content this way.
 - Every installer writer (`CLAUDE.md`, project `.mcp.json`, `~/.claude/settings.json` hook, Cursor and Windsurf `mcp.json`, Codex `config.toml`) now reads UTF-8, UTF-8 with a byte order mark, and UTF-16 LE/BE with a byte order mark, and writes the file back in the same encoding.
