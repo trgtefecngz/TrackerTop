@@ -110,7 +110,7 @@ pub fn is_agent_installed(agent: AiAgentKind) -> bool {
             .join("windsurf")
             .join("mcp_config.json"),
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(Some((content, _))) = crate::fsutil::read_text_file(&path) else {
         return false;
     };
     match agent {
@@ -158,30 +158,46 @@ pub fn install_agent(agent: AiAgentKind, repo_root: &Path) -> Result<Vec<String>
         AiAgentKind::Codex => {
             let home = user_home().context("cannot determine home directory")?;
             let path = home.join(".codex").join("config.toml");
-            let exe = current_exe_string()?
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
-            let existing = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(e) => {
-                    return Err(e).with_context(|| format!("failed to read {}", path.display()));
-                }
-            };
-            if !existing.contains("[mcp_servers.trackertop]") {
-                let mut updated = existing;
-                if !updated.is_empty() && !updated.ends_with('\n') {
-                    updated.push('\n');
-                }
-                updated.push_str(&format!(
-                    "\n[mcp_servers.trackertop]\ncommand = \"{exe}\"\nargs = [\"mcp\"]\n"
-                ));
-                crate::fsutil::backup_file(&path)?;
-                crate::fsutil::atomic_write(&path, updated.as_bytes())?;
-            }
+            add_codex_server(&path, &current_exe_string()?)?;
             Ok(vec![format!("Connected Codex CLI: {}", path.display())])
         }
     }
+}
+
+/// Adds the `[mcp_servers.trackertop]` table to Codex's `config.toml` unless it is there.
+/// The existing file is backed up, keeps its encoding, and is never written when it could
+/// not be read.
+fn add_codex_server(path: &Path, exe: &str) -> Result<()> {
+    let exe = exe.replace('\\', "\\\\").replace('"', "\\\"");
+    let existing = crate::fsutil::read_text_file(path)?.map_or_else(String::new, |(t, _)| t);
+    if existing.contains("[mcp_servers.trackertop]") {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&format!(
+        "\n[mcp_servers.trackertop]\ncommand = \"{exe}\"\nargs = [\"mcp\"]\n"
+    ));
+    crate::fsutil::rewrite_text_file(path, &updated)
+}
+
+/// Appends TrackerTop's navigation section to a `CLAUDE.md` unless it is already there.
+/// Returns whether the file changed. The existing file is backed up, keeps its encoding
+/// (Windows PowerShell 5.1 writes UTF-16), and is never written when it could not be read.
+fn add_claude_md_section(path: &Path) -> Result<bool> {
+    let existing = crate::fsutil::read_text_file(path)?.map_or_else(String::new, |(t, _)| t);
+    if existing.contains("TrackerTop MCP Navigation") {
+        return Ok(false);
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(CLAUDE_MD_SECTION);
+    crate::fsutil::rewrite_text_file(path, &updated)?;
+    Ok(true)
 }
 
 /// Reads a user-owned JSON config file as an object.
@@ -189,11 +205,9 @@ pub fn install_agent(agent: AiAgentKind, repo_root: &Path) -> Result<Vec<String>
 /// comments or trailing commas) or whose root is not an object is an ERROR: TrackerTop must
 /// never replace a user's configuration it does not understand.
 pub(crate) fn read_json_config(path: &Path) -> Result<Value> {
-    if !path.exists() {
+    let Some((text, _)) = crate::fsutil::read_text_file(path)? else {
         return Ok(json!({}));
-    }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    };
     let body = text.trim_start_matches('\u{feff}').trim();
     if body.is_empty() {
         return Ok(json!({}));
@@ -214,10 +228,10 @@ pub(crate) fn read_json_config(path: &Path) -> Result<Value> {
     Ok(val)
 }
 
-/// Backs up the existing file (`<name>.trackertop.bak`) and writes `val` atomically.
+/// Backs up the existing file (`<name>.trackertop.bak`) and writes `val` atomically, in the
+/// file's existing encoding.
 pub(crate) fn write_json_config(path: &Path, val: &Value) -> Result<()> {
-    crate::fsutil::backup_file(path)?;
-    crate::fsutil::atomic_write(path, serde_json::to_string_pretty(val)?.as_bytes())
+    crate::fsutil::rewrite_text_file(path, &serde_json::to_string_pretty(val)?)
 }
 
 fn merge_json_mcp_config(config_path: &Path) -> Result<()> {
@@ -338,14 +352,7 @@ pub fn install_claude_code(repo_root: &Path, global: bool) -> Result<Vec<String>
     if let Some(parent) = claude_md.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing_md = std::fs::read_to_string(&claude_md).unwrap_or_default();
-    if !existing_md.contains("TrackerTop MCP Navigation") {
-        let mut updated = existing_md;
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(CLAUDE_MD_SECTION);
-        std::fs::write(&claude_md, updated)?;
+    if add_claude_md_section(&claude_md)? {
         actions.push(format!("Updated {}", claude_md.display()));
     } else {
         actions.push(format!("{} already configured", claude_md.display()));
@@ -501,5 +508,72 @@ mod tests {
         assert!(!toml_registers_trackertop(
             "# [mcp_servers.trackertop] removed\n"
         ));
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        crate::fsutil::encode_text(s, crate::fsutil::TextEncoding::Utf16Le)
+    }
+
+    #[test]
+    fn codex_config_keeps_utf16_and_refuses_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let original = utf16le("model = \"o3\"\n");
+        std::fs::write(&p, &original).unwrap();
+        add_codex_server(&p, r"C:\t\trackertop.exe").unwrap();
+        let (text, enc) = crate::fsutil::decode_text(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(enc, crate::fsutil::TextEncoding::Utf16Le);
+        assert!(text.starts_with("model = \"o3\"\n"), "{text}");
+        assert!(toml_registers_trackertop(&text), "{text}");
+        assert_eq!(
+            std::fs::read(dir.path().join("config.toml.trackertop.bak")).unwrap(),
+            original
+        );
+
+        let bad = b"model = \"caf\xE9\"\n".to_vec();
+        std::fs::write(&p, &bad).unwrap();
+        assert!(add_codex_server(&p, "t").is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), bad);
+    }
+
+    #[test]
+    fn session_hook_keeps_utf16_settings_and_refuses_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, utf16le(r#"{"theme":"dark"}"#)).unwrap();
+        install_claude_session_hook(&p, "C:/t/trackertop.exe").unwrap();
+        let (text, enc) = crate::fsutil::decode_text(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(enc, crate::fsutil::TextEncoding::Utf16Le);
+        assert!(
+            text.contains("\"theme\"") && text.contains("hook-hint"),
+            "{text}"
+        );
+
+        let bad = b"{\"theme\":\"caf\xE9\"}".to_vec();
+        std::fs::write(&p, &bad).unwrap();
+        assert!(install_claude_session_hook(&p, "t").is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), bad);
+    }
+
+    #[test]
+    fn claude_md_section_is_added_once_and_refused_when_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        assert!(
+            add_claude_md_section(&p).unwrap(),
+            "a missing file is created"
+        );
+        assert!(
+            !add_claude_md_section(&p).unwrap(),
+            "second run changes nothing"
+        );
+        // UTF-16 without a byte order mark cannot be told apart from binary: refused
+        let no_bom: Vec<u8> = "# Rules\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        std::fs::write(&p, &no_bom).unwrap();
+        assert!(add_claude_md_section(&p).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), no_bom);
     }
 }

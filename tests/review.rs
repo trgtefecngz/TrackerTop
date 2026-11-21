@@ -531,3 +531,36 @@ fn orphan_ignores_functions_reached_outside_the_call_graph() {
         .collect();
     assert!(orphans.is_empty(), "{orphans:?}");
 }
+
+/// N1: a project-scoped install starts the server with `--repo <path>`, which is
+/// canonicalized (on Windows to a `\?\C:\…` path). `review`, `changes_since` and `resume`
+/// must still work: git cannot use a verbatim path for its index lock file.
+#[test]
+fn review_works_with_a_canonicalized_repo_root() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn a() -> i32 {\n    1\n}\n").unwrap();
+    git_in(repo, &["init", "-q", "-b", "main"]);
+    git_in(repo, &["add", "."]);
+    git_in(repo, &["commit", "-q", "-m", "base"]);
+    git_in(repo, &["checkout", "-q", "-b", "work"]);
+    std::fs::write(repo.join("src/lib.rs"), "pub fn a() -> i32 {\n    2\n}\n").unwrap();
+
+    // What `main.rs` does with `--repo`
+    let root = std::fs::canonicalize(repo).unwrap();
+    let cs = trackertop::review::review(&root, "main").unwrap();
+    assert!(
+        cs.symbols.iter().any(|s| s.qualified_name == "a"),
+        "{:?}",
+        cs.symbols
+    );
+
+    let engine = TrackerEngine::new(&root);
+    let out = engine.review_changes("main", 4_000).unwrap().text;
+    assert!(!out.contains("failed"), "{out}");
+    let out = engine.changes_since("HEAD", &[], &[], 4_000).unwrap().text;
+    assert!(out.contains("src/lib.rs"), "{out}");
+    let out = engine.resume(4_000).unwrap().text;
+    assert!(!out.contains("failed"), "{out}");
+}

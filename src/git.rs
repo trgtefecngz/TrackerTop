@@ -6,7 +6,8 @@ use std::process::Command;
 
 fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(repo_root).args(args);
+    cmd.current_dir(crate::fsutil::process_path(repo_root))
+        .args(args);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

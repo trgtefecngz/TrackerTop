@@ -240,6 +240,107 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{name}.{suffix}"))
 }
 
+/// How a user-owned text file was stored on disk, so a rewrite keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    Utf8,
+    /// UTF-8 starting with the byte order mark `EF BB BF`.
+    Utf8Bom,
+    /// UTF-16 little endian with the mark `FF FE` (what Windows PowerShell 5.1 writes).
+    Utf16Le,
+    /// UTF-16 big endian with the mark `FE FF`.
+    Utf16Be,
+}
+
+/// Decodes a text file's bytes. UTF-16 is recognised only by its byte order mark. Returns
+/// `None` when the bytes are not valid text in any of these encodings, or contain a NUL
+/// character: no config or Markdown file has one, and UTF-16 without a byte order mark is
+/// valid UTF-8 full of NULs, so appending UTF-8 to it would corrupt the file.
+pub fn decode_text(bytes: &[u8]) -> Option<(String, TextEncoding)> {
+    let decoded = decode_text_allowing_nul(bytes)?;
+    (!decoded.0.contains('\0')).then_some(decoded)
+}
+
+fn decode_text_allowing_nul(bytes: &[u8]) -> Option<(String, TextEncoding)> {
+    fn utf16(body: &[u8], to_u16: fn([u8; 2]) -> u16) -> Option<String> {
+        let (pairs, rest) = body.as_chunks::<2>();
+        if !rest.is_empty() {
+            return None;
+        }
+        let units: Vec<u16> = pairs.iter().map(|&pair| to_u16(pair)).collect();
+        String::from_utf16(&units).ok()
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Some((
+            String::from_utf8(body.to_vec()).ok()?,
+            TextEncoding::Utf8Bom,
+        ));
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return Some((utf16(body, u16::from_le_bytes)?, TextEncoding::Utf16Le));
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return Some((utf16(body, u16::from_be_bytes)?, TextEncoding::Utf16Be));
+    }
+    Some((String::from_utf8(bytes.to_vec()).ok()?, TextEncoding::Utf8))
+}
+
+/// Encodes `text` the way `decode_text` read it, byte order mark included.
+pub fn encode_text(text: &str, encoding: TextEncoding) -> Vec<u8> {
+    match encoding {
+        TextEncoding::Utf8 => text.as_bytes().to_vec(),
+        TextEncoding::Utf8Bom => [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(),
+        TextEncoding::Utf16Le => [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect(),
+        TextEncoding::Utf16Be => [0xFE, 0xFF]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect(),
+    }
+}
+
+/// Reads a user-owned text file. `Ok(None)` when it does not exist. Any other read failure,
+/// and content that is not UTF-8 or BOM-marked UTF-16, is an error: a caller must never
+/// treat a file it could not read as empty and write over it.
+pub fn read_text_file(path: &Path) -> Result<Option<(String, TextEncoding)>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    match decode_text(&bytes) {
+        Some(decoded) => Ok(Some(decoded)),
+        None => bail!(
+            "{} is not UTF-8 or UTF-16 text, so TrackerTop cannot read it and left it \
+             untouched. Save it as UTF-8 and run the installer again, or make the change by hand",
+            path.display()
+        ),
+    }
+}
+
+/// Replaces a user-owned text file with `text`: backs up the existing file first
+/// (`backup_file`), keeps its encoding, and writes atomically. A new file is plain UTF-8.
+/// Fails without writing when the existing file cannot be read (see `read_text_file`).
+pub fn rewrite_text_file(path: &Path, text: &str) -> Result<()> {
+    let encoding = read_text_file(path)?.map_or(TextEncoding::Utf8, |(_, enc)| enc);
+    backup_file(path)?;
+    atomic_write(path, &encode_text(text, encoding))
+}
+
+/// A path to hand to a child process (git, its env vars such as `GIT_INDEX_FILE`, or a
+/// check command's working folder). Git cannot create files under a Windows verbatim path
+/// (`\\?\C:\…`, what `std::fs::canonicalize` returns) and `cmd.exe` refuses one as its
+/// current folder, so the prefix is dropped; other paths come back unchanged.
+pub fn process_path(path: &Path) -> PathBuf {
+    if path.to_string_lossy().starts_with(r"\\?\") {
+        PathBuf::from(display_path(path))
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Human-readable form of a canonicalized path: strips the Windows verbatim prefix
 /// (`\\?\C:\x` -> `C:\x`) and restores UNC shares (`\\?\UNC\srv\share` -> `\\srv\share`).
 pub fn display_path(path: &Path) -> String {
@@ -304,6 +405,74 @@ impl Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_round_trips_in_every_supported_encoding() {
+        let text = "# Kurallar\nAsla main'e itme. ✓\n";
+        for enc in [
+            TextEncoding::Utf8,
+            TextEncoding::Utf8Bom,
+            TextEncoding::Utf16Le,
+            TextEncoding::Utf16Be,
+        ] {
+            let bytes = encode_text(text, enc);
+            assert_eq!(
+                decode_text(&bytes),
+                Some((text.to_string(), enc)),
+                "{enc:?}"
+            );
+        }
+        assert_eq!(
+            &encode_text("a", TextEncoding::Utf16Be),
+            &[0xFE, 0xFF, 0, b'a']
+        );
+        // Odd length, lone surrogate, invalid UTF-8: not text
+        assert_eq!(decode_text(&[0xFF, 0xFE, b'a']), None);
+        assert_eq!(decode_text(&[0xFF, 0xFE, 0x00, 0xD8]), None);
+        assert_eq!(decode_text(b"caf\xE9"), None);
+    }
+
+    #[test]
+    fn read_text_file_reports_read_errors_instead_of_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            read_text_file(&dir.path().join("missing"))
+                .unwrap()
+                .is_none()
+        );
+        // A folder at the path cannot be read: that must not look like a missing file
+        assert!(read_text_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn rewrite_text_file_never_writes_over_unreadable_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        std::fs::write(&p, b"caf\xE9").unwrap();
+        assert!(rewrite_text_file(&p, "new").is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"caf\xE9");
+        assert!(!dir.path().join("f.txt.trackertop.bak").exists());
+        // A missing file is created as plain UTF-8
+        let q = dir.path().join("g.txt");
+        rewrite_text_file(&q, "new").unwrap();
+        assert_eq!(std::fs::read(&q).unwrap(), b"new");
+    }
+
+    #[test]
+    fn process_path_drops_only_the_verbatim_prefix() {
+        assert_eq!(
+            process_path(Path::new(r"\\?\C:\repo\.git-index")),
+            PathBuf::from(r"C:\repo\.git-index")
+        );
+        assert_eq!(
+            process_path(Path::new(r"\\?\UNC\srv\share\repo")),
+            PathBuf::from(r"\\srv\share\repo")
+        );
+        assert_eq!(
+            process_path(Path::new("/home/u/repo")),
+            PathBuf::from("/home/u/repo")
+        );
+    }
 
     #[test]
     fn atomic_write_replaces_existing_file() {

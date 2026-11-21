@@ -18,7 +18,7 @@ const LINES_PER_FILE: usize = 40;
 
 pub(crate) fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(repo_root)
+    cmd.current_dir(crate::fsutil::process_path(repo_root))
         .args(["-c", "core.quotepath=false"])
         .args(args);
     #[cfg(target_os = "windows")]

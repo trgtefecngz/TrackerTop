@@ -13,6 +13,17 @@ All notable changes to TrackerTop are documented here.
 ### Changed: `resume` flags a progress file git has overtaken
 - A `## Next` or `## Kararını bekleyenler` section is marked **POSSIBLY OUTDATED**, with the reason, when a PR it mentions was merged after the file last changed, when it says work awaits a merge but the file is already on the default branch, or when 3 or more commits came after the file last changed. A file with uncommitted edits is never marked. Uses local git only.
 
+### Fixed: the installer never overwrites a file it could not read
+- `trackertop install claude` used to treat a `CLAUDE.md` it could not read as UTF-8 as empty and write over it, with no backup. A UTF-16 file (what Windows PowerShell 5.1 `Out-File` writes) lost all its content this way.
+- Every installer writer (`CLAUDE.md`, project `.mcp.json`, `~/.claude/settings.json` hook, Cursor and Windsurf `mcp.json`, Codex `config.toml`) now reads UTF-8, UTF-8 with a byte order mark, and UTF-16 LE/BE with a byte order mark, and writes the file back in the same encoding.
+- A file in any other form (for example Latin-1, or UTF-16 without a byte order mark) stops the install with an error that names the file; the file is left as it was.
+- Before changing an existing file, the installer always keeps the first copy as `<name>.trackertop.bak`, and it writes the new content atomically. `CLAUDE.md` now gets the same treatment as the config files.
+- Agent detection in the desktop app also reads UTF-16 config files.
+
+### Fixed: `review` works with `--repo` on Windows
+- A project-scoped install starts the server with `--repo <path>`, which is turned into a `\\?\C:\…` path. Git cannot create its lock file under such a path, so `review` and the `review_changes` tool failed with "Unable to create '\\?\C:\…\.git-index.lock': Invalid argument".
+- Paths handed to git (its working folder and `GIT_INDEX_FILE`) and the working folder of `run_checks` commands no longer carry that prefix. This covers `review`, `changes_since`, `resume`, memory notes and the co-change history.
+
 ## [0.8.2] - 2026-11-21
 
 ### Changed: the desktop status bar shows live state

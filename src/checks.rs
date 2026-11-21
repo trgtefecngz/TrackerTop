@@ -373,7 +373,7 @@ pub fn run_command(
     let mut command = Command::new(resolve_program(&cmd.program));
     command
         .args(cmd.argv(extra))
-        .current_dir(root)
+        .current_dir(crate::fsutil::process_path(root))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
