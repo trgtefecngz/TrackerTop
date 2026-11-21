@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::model::{Edge, EdgeKind, FileRecord, Symbol, SymbolKind};
+use crate::model::{Confidence, Edge, EdgeKind, FileRecord, Symbol, SymbolKind};
 use anyhow::Result;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -73,6 +73,13 @@ pub struct ImpactReport {
     pub transitive_dependents: Vec<Symbol>,
     pub related_tests: Vec<Symbol>,
     pub affected_files: Vec<String>,
+    /// How many of `direct_dependents` / `transitive_dependents` / `related_tests` are
+    /// reached only through at least one heuristic edge (see [`Confidence`]).
+    pub heuristic_direct: usize,
+    pub heuristic_transitive: usize,
+    pub heuristic_tests: usize,
+    /// Path confidence of every listed symbol, by symbol id.
+    pub confidence: HashMap<String, Confidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,8 +102,10 @@ pub struct HealthReport {
     pub orphan_excluded: Vec<(String, String)>,
 }
 
-/// `(hop distance, edge kind, symbol)` entries returned by [`CodeGraph::neighborhood`].
-pub type HopList<'a> = Vec<(usize, EdgeKind, &'a Symbol)>;
+/// `(hop distance, edge kind, confidence, symbol)` entries returned by
+/// [`CodeGraph::neighborhood`]. The confidence is the path's: exact only when every edge
+/// on it is exact (the best path of that length is used).
+pub type HopList<'a> = Vec<(usize, EdgeKind, Confidence, &'a Symbol)>;
 
 pub struct CodeGraph {
     pub files: HashMap<String, FileRecord>,
@@ -104,6 +113,8 @@ pub struct CodeGraph {
     pub symbols_by_file: HashMap<String, Vec<String>>,
     pub edges: Vec<Edge>,
     pub graph: DiGraph<String, EdgeKind>,
+    /// Confidence of each graph edge, indexed by `EdgeIndex::index()`.
+    pub edge_confidence: Vec<Confidence>,
     pub id_to_idx: HashMap<String, NodeIndex>,
     pub pagerank: HashMap<String, f64>,
     pub file_communities: HashMap<String, usize>,
@@ -135,11 +146,14 @@ impl CodeGraph {
             symbols.insert(s.id.clone(), s);
         }
 
+        let mut edge_confidence = Vec::with_capacity(edges.len());
         for e in &edges {
             if let (Some(&src), Some(&tgt)) =
                 (id_to_idx.get(&e.source_id), id_to_idx.get(&e.target_id))
             {
-                graph.add_edge(src, tgt, e.kind);
+                let idx = graph.add_edge(src, tgt, e.kind);
+                debug_assert_eq!(idx.index(), edge_confidence.len());
+                edge_confidence.push(e.confidence);
             }
         }
 
@@ -152,6 +166,7 @@ impl CodeGraph {
             symbols_by_file,
             edges,
             graph,
+            edge_confidence,
             id_to_idx,
             pagerank,
             file_communities,
@@ -453,17 +468,24 @@ impl CodeGraph {
         let mut direct_dependents = Vec::new();
         let mut transitive_dependents = Vec::new();
         let mut related_tests = Vec::new();
+        let (mut heuristic_direct, mut heuristic_transitive, mut heuristic_tests) = (0, 0, 0);
         let mut files_set: HashSet<String> = HashSet::new();
         files_set.insert(root.file_path.clone());
 
-        for (d, kind, sym) in incoming {
+        let mut confidence = HashMap::new();
+        for (d, kind, conf, sym) in incoming {
             files_set.insert(sym.file_path.clone());
+            confidence.insert(sym.id.clone(), conf);
+            let guess = usize::from(conf == Confidence::Heuristic);
             if sym.kind == SymbolKind::Test || kind == EdgeKind::Tests {
                 related_tests.push(sym.clone());
+                heuristic_tests += guess;
             } else if d == 1 {
                 direct_dependents.push(sym.clone());
+                heuristic_direct += guess;
             } else {
                 transitive_dependents.push(sym.clone());
+                heuristic_transitive += guess;
             }
         }
 
@@ -476,6 +498,10 @@ impl CodeGraph {
             transitive_dependents,
             related_tests,
             affected_files,
+            heuristic_direct,
+            heuristic_transitive,
+            heuristic_tests,
+            confidence,
         })
     }
 
@@ -719,35 +745,83 @@ fn bfs_neighbors(
     start: NodeIndex,
     dir: Direction,
     max_depth: usize,
-) -> Vec<(usize, EdgeKind, &Symbol)> {
-    let mut visited = HashSet::new();
-    visited.insert(start);
-    let mut queue = VecDeque::new();
-    queue.push_back((start, 0usize));
-    let mut out = Vec::new();
+) -> HopList<'_> {
+    cg.labelled_bfs(start, dir, max_depth, |k| k != EdgeKind::Contains, |_| true)
+}
 
-    while let Some((curr, dist)) = queue.pop_front() {
-        if dist >= max_depth {
-            continue;
-        }
-        for edge in cg.graph.edges_directed(curr, dir) {
-            let ek = *edge.weight();
-            if ek == EdgeKind::Contains {
-                continue;
-            }
-            let next = match dir {
-                Direction::Outgoing => edge.target(),
-                Direction::Incoming => edge.source(),
-            };
-            if visited.insert(next) {
-                if let Some(sym) = cg.symbols.get(&cg.graph[next]) {
-                    out.push((dist + 1, ek, sym));
-                }
-                queue.push_back((next, dist + 1));
-            }
-        }
+impl CodeGraph {
+    /// The confidence of one graph edge (heuristic when unknown).
+    pub fn confidence_of(&self, edge: petgraph::graph::EdgeIndex) -> Confidence {
+        self.edge_confidence
+            .get(edge.index())
+            .copied()
+            .unwrap_or(Confidence::Heuristic)
     }
-    out
+
+    /// Breadth-first walk from `start` along edges whose kind passes `edge_ok`, up to
+    /// `max_depth` hops. Each symbol reached is listed once, at its shortest distance, with
+    /// the confidence of the best path of that length (exact only when every edge on it
+    /// is exact). A symbol failing `node_ok` is neither listed nor walked through.
+    pub fn labelled_bfs(
+        &self,
+        start: NodeIndex,
+        dir: Direction,
+        max_depth: usize,
+        edge_ok: impl Fn(EdgeKind) -> bool,
+        node_ok: impl Fn(&Symbol) -> bool,
+    ) -> Vec<(usize, EdgeKind, Confidence, &Symbol)> {
+        let mut visited = HashSet::from([start]);
+        let mut frontier = vec![(start, Confidence::Exact)];
+        let mut out = Vec::new();
+        for dist in 1..=max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+            // Nodes first reached at this distance: (node, kind, confidence, symbol)
+            let mut level: Vec<(NodeIndex, EdgeKind, Confidence, &Symbol)> = Vec::new();
+            let mut at: HashMap<NodeIndex, usize> = HashMap::new();
+            for &(node, path_conf) in &frontier {
+                for edge in self.graph.edges_directed(node, dir) {
+                    let kind = *edge.weight();
+                    if !edge_ok(kind) {
+                        continue;
+                    }
+                    let next = match dir {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    };
+                    if visited.contains(&next) {
+                        continue;
+                    }
+                    let conf = path_conf.and(self.confidence_of(edge.id()));
+                    if let Some(&i) = at.get(&next) {
+                        // Another path of the same length: keep the better one
+                        if conf == Confidence::Exact && level[i].2 != Confidence::Exact {
+                            level[i].1 = kind;
+                            level[i].2 = conf;
+                        }
+                        continue;
+                    }
+                    let Some(sym) = self.symbols.get(&self.graph[next]) else {
+                        continue;
+                    };
+                    if !node_ok(sym) {
+                        visited.insert(next);
+                        continue;
+                    }
+                    at.insert(next, level.len());
+                    level.push((next, kind, conf, sym));
+                }
+            }
+            frontier.clear();
+            for (node, kind, conf, sym) in level {
+                visited.insert(node);
+                frontier.push((node, conf));
+                out.push((dist, kind, conf, sym));
+            }
+        }
+        out
+    }
 }
 
 fn bfs_path(

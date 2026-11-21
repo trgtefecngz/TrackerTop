@@ -7,11 +7,10 @@
 
 use super::{Change, ChangeSet, ChangedSymbol, Span};
 use crate::graph::{CodeGraph, file_cycles};
-use crate::model::{EdgeKind, Symbol, SymbolKind};
+use crate::model::{Confidence, EdgeKind, Symbol, SymbolKind};
 use petgraph::Direction;
-use petgraph::visit::EdgeRef;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Who depends on a symbol through code: calls, tests, type uses and trait impls. Doc
@@ -22,6 +21,22 @@ pub(super) struct Dependents {
     transitive_dependents: Vec<Symbol>,
     pub(super) related_tests: Vec<Symbol>,
     affected_files: BTreeSet<String>,
+    /// How many dependents (direct + transitive) and tests are reached only through at
+    /// least one heuristic edge.
+    heuristic_dependents: usize,
+    heuristic_tests: usize,
+}
+
+impl Dependents {
+    /// ` (H of them through heuristic edges)` when some dependents or tests rest on a guess.
+    fn heuristic_note(&self, what: &str) -> String {
+        let h = self.heuristic_dependents;
+        if h == 0 {
+            format!(" (all {what} through exact edges)")
+        } else {
+            format!(" ({h} of the {what} through heuristic edges)")
+        }
+    }
 }
 
 pub(super) fn code_dependents(cg: &CodeGraph, id: &str, depth: usize) -> Option<Dependents> {
@@ -32,40 +47,38 @@ pub(super) fn code_dependents(cg: &CodeGraph, id: &str, depth: usize) -> Option<
         transitive_dependents: Vec::new(),
         related_tests: Vec::new(),
         affected_files: BTreeSet::from([root.file_path.clone()]),
+        heuristic_dependents: 0,
+        heuristic_tests: 0,
     };
-    let mut seen = HashSet::from([start]);
-    let mut queue = VecDeque::from([(start, 0usize)]);
-    while let Some((node, dist)) = queue.pop_front() {
-        if dist >= depth {
-            continue;
-        }
-        for e in cg.graph.edges_directed(node, Direction::Incoming) {
-            let kind = *e.weight();
-            if !matches!(
+    let reached = cg.labelled_bfs(
+        start,
+        Direction::Incoming,
+        depth,
+        |kind| {
+            matches!(
                 kind,
                 EdgeKind::Calls | EdgeKind::Tests | EdgeKind::UsesType | EdgeKind::Implements
-            ) || !seen.insert(e.source())
-            {
-                continue;
-            }
-            let Some(sym) = cg.symbols.get(&cg.graph[e.source()]) else {
-                continue;
-            };
-            if matches!(
+            )
+        },
+        |sym| {
+            !matches!(
                 sym.kind,
                 SymbolKind::File | SymbolKind::Section | SymbolKind::Dependency
-            ) {
-                continue;
-            }
-            d.affected_files.insert(sym.file_path.clone());
-            if sym.kind == SymbolKind::Test || kind == EdgeKind::Tests {
-                d.related_tests.push(sym.clone());
-            } else if dist == 0 {
-                d.direct_dependents.push(sym.clone());
-            } else {
-                d.transitive_dependents.push(sym.clone());
-            }
-            queue.push_back((e.source(), dist + 1));
+            )
+        },
+    );
+    for (dist, kind, conf, sym) in reached {
+        let guess = usize::from(conf == Confidence::Heuristic);
+        d.affected_files.insert(sym.file_path.clone());
+        if sym.kind == SymbolKind::Test || kind == EdgeKind::Tests {
+            d.related_tests.push(sym.clone());
+            d.heuristic_tests += guess;
+        } else if dist == 1 {
+            d.direct_dependents.push(sym.clone());
+            d.heuristic_dependents += guess;
+        } else {
+            d.transitive_dependents.push(sym.clone());
+            d.heuristic_dependents += guess;
         }
     }
     Some(d)
@@ -351,9 +364,10 @@ fn untested(cs: &ChangeSet, head: &CodeGraph, out: &mut Vec<Finding>) {
                     .to_string()
             } else {
                 format!(
-                    "{} direct and {} transitive callers, none of them a test",
+                    "{} direct and {} transitive callers, none of them a test{}",
                     report.direct_dependents.len(),
-                    report.transitive_dependents.len()
+                    report.transitive_dependents.len(),
+                    report.heuristic_note("callers")
                 )
             }],
         });
@@ -386,7 +400,12 @@ fn impact(cs: &ChangeSet, head: &CodeGraph, out: &mut Vec<Finding>) {
             ));
         }
         evidence.push(format!(
-            "tests that reach it: {}",
+            "tests that reach it{}: {}",
+            if report.heuristic_tests > 0 {
+                format!(" ({} through heuristic edges)", report.heuristic_tests)
+            } else {
+                String::new()
+            },
             if report.related_tests.is_empty() {
                 "none found".to_string()
             } else {
@@ -410,11 +429,12 @@ fn impact(cs: &ChangeSet, head: &CodeGraph, out: &mut Vec<Finding>) {
             symbol: s.qualified_name.clone(),
             location: loc(span),
             message: format!(
-                "modified `{}` has {} dependents within {IMPACT_DEPTH} hops ({} direct) in {} files",
+                "modified `{}` has {} dependents within {IMPACT_DEPTH} hops ({} direct) in {} files{}",
                 s.qualified_name,
                 dependents,
                 report.direct_dependents.len(),
-                report.affected_files.len()
+                report.affected_files.len(),
+                report.heuristic_note("dependents")
             ),
             evidence,
         });

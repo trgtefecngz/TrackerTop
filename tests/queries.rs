@@ -435,3 +435,53 @@ fn health_check_reports_only_real_issues() {
         assert!(text.contains(want), "missing {want:?}:\n{text}");
     }
 }
+
+/// Graph answers say how far to trust each edge: `call_graph` and `read_symbol` label every
+/// caller and callee, and `impact_analysis` splits its direct and transitive counts into
+/// exact and heuristic (a path is exact only when every edge on it is).
+#[test]
+fn graph_answers_label_edge_confidence() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "mod core;\nmod far;\n").unwrap();
+    std::fs::write(
+        root.join("src/core.rs"),
+        "pub fn target() -> u8 { 1 }\n\
+         pub fn near() -> u8 { target() }\n\
+         pub fn near_top() -> u8 { near() }\n",
+    )
+    .unwrap();
+    // `target` is defined in another file: a bare call to it is found by name only
+    std::fs::write(
+        root.join("src/far.rs"),
+        "pub fn far() -> u8 { target() }\npub fn far_top() -> u8 { far() }\n",
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+    let engine = TrackerEngine::new(root);
+
+    let out = engine.call_graph("target", 2, 4_000).unwrap().text;
+    assert!(
+        out.contains("## Incoming / Callers: 4 (2 exact, 2 heuristic)"),
+        "{out}"
+    );
+    assert!(out.contains("d1 [CALLS exact] near "), "{out}");
+    assert!(out.contains("d1 [CALLS heuristic] far "), "{out}");
+    // `far_top -> far` is exact, but the path to `target` goes through a guess
+    assert!(out.contains("d2 [CALLS heuristic] far_top "), "{out}");
+    assert!(out.contains("d2 [CALLS exact] near_top "), "{out}");
+
+    let out = engine.impact_analysis("target", 2, 4_000).unwrap().text;
+    assert!(
+        out.contains("Direct: 2 (1 exact, 1 heuristic) | Transitive: 2 (1 exact, 1 heuristic)"),
+        "{out}"
+    );
+    assert!(out.contains("- far [fn] heuristic (src/far.rs"), "{out}");
+    assert!(out.contains("- near [fn] exact (src/core.rs"), "{out}");
+
+    let out = engine.read_symbol("near", true, 4_000).unwrap().text;
+    assert!(out.contains("- [CALLS exact] target "), "{out}");
+    let out = engine.read_symbol("far", true, 4_000).unwrap().text;
+    assert!(out.contains("- [CALLS heuristic] target "), "{out}");
+}

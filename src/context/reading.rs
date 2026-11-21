@@ -181,11 +181,12 @@ impl TrackerEngine {
             if !callees.is_empty() {
                 out.push_str("\n## Direct Callees / Types (Signatures Only)\n");
                 out.push_str(&more_note(callees.len(), 10, "callees"));
-                for (_, kind, dep) in callees.into_iter().take(10) {
+                for (_, kind, conf, dep) in callees.into_iter().take(10) {
                     touched_files.insert(dep.file_path.clone());
                     out.push_str(&format!(
-                        "- [{}] {} ({}:L{}) -> `{}`\n",
+                        "- [{} {}] {} ({}:L{}) -> `{}`\n",
                         kind.as_str(),
+                        conf.as_str(),
                         dep.qualified_name,
                         dep.file_path,
                         dep.start_line,
@@ -196,11 +197,12 @@ impl TrackerEngine {
             if !callers.is_empty() {
                 out.push_str("\n## Direct Callers\n");
                 out.push_str(&more_note(callers.len(), 10, "callers"));
-                for (_, kind, caller) in callers.into_iter().take(10) {
+                for (_, kind, conf, caller) in callers.into_iter().take(10) {
                     touched_files.insert(caller.file_path.clone());
                     out.push_str(&format!(
-                        "- [{}] {} ({}:L{})\n",
+                        "- [{} {}] {} ({}:L{})\n",
                         kind.as_str(),
+                        conf.as_str(),
                         caller.qualified_name,
                         caller.file_path,
                         caller.start_line
@@ -287,11 +289,12 @@ impl TrackerEngine {
             if include_deps {
                 let (_, callees) = cg.neighborhood(&sym.id, 1);
                 out.push_str(&more_note(callees.len(), 5, "callees"));
-                for (_, kind, dep) in callees.into_iter().take(5) {
+                for (_, kind, conf, dep) in callees.into_iter().take(5) {
                     touched_files.insert(dep.file_path.clone());
                     out.push_str(&format!(
-                        "- [{}] {} ({}:L{}) `{}`\n",
+                        "- [{} {}] {} ({}:L{}) `{}`\n",
                         kind.as_str(),
+                        conf.as_str(),
                         dep.qualified_name,
                         dep.file_path,
                         dep.start_line,

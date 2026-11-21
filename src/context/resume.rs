@@ -97,14 +97,84 @@ impl TrackerEngine {
             Ok(WorkTree { branch, files })
         })()
         .map_err(|e| format!("{e:#}"));
+        let mut progress = crate::journal::progress_sections(&self.repo_root);
+        if let Some(file) = progress.first().map(|s| s.file.clone())
+            && let Some(git) = self.progress_git(&file)
+        {
+            crate::journal::mark_outdated_progress(&mut progress, &git);
+        }
         Ok(ResumeData {
             journal,
             journal_total,
             notes,
             findings,
-            progress: crate::journal::progress_sections(&self.repo_root),
+            progress,
             worktree,
         })
+    }
+
+    /// What git says happened since the progress file `file` last changed (`None`: not a
+    /// git repository, or git failed). Offline and local only: `gh` is not asked, so the
+    /// SessionStart briefing stays fast and works without a network.
+    fn progress_git(&self, file: &str) -> Option<crate::journal::ProgressGit> {
+        use crate::changes::git;
+        let root = &self.repo_root;
+        let mut out = crate::journal::ProgressGit::default();
+        let status = git(root, &["status", "--porcelain", "--", file]).ok()?;
+        let last = git(root, &["log", "-1", "--format=%H", "--", file]).ok()?;
+        let last = last.trim();
+        if !status.trim().is_empty() || last.is_empty() {
+            out.file_dirty = true;
+            return Some(out);
+        }
+        let range = format!("{last}..HEAD");
+        let subjects = git(root, &["log", "--format=%s", &range]).ok()?;
+        let subjects: Vec<&str> = subjects.lines().collect();
+        out.commits_since = subjects.len();
+        out.newest_since = subjects.first().map(|s| s.to_string());
+        for s in &subjects {
+            for n in crate::journal::merged_pr_numbers(s) {
+                if !out.merged_since.iter().any(|(m, _)| *m == n) {
+                    out.merged_since.push((n, s.to_string()));
+                }
+            }
+        }
+        // The default branch: the remote's HEAD when known, else a local main / master
+        let default = git(
+            root,
+            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        )
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .or_else(|| {
+            ["main", "master"]
+                .into_iter()
+                .find(|b| {
+                    git(
+                        root,
+                        &[
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            &format!("refs/heads/{b}"),
+                        ],
+                    )
+                    .is_ok()
+                })
+                .map(str::to_string)
+        });
+        if let Some(branch) = default
+            && git(root, &["merge-base", "--is-ancestor", last, &branch]).is_ok()
+        {
+            out.on_default_branch = Some(
+                branch
+                    .strip_prefix("origin/")
+                    .unwrap_or(&branch)
+                    .to_string(),
+            );
+        }
+        Some(out)
     }
 
     /// 19. Where work stands, for a new session or one after `/compact`: recent sessions,

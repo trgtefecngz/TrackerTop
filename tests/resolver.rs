@@ -211,3 +211,71 @@ pub fn real_assoc() -> usize { Set::all().len() }
     assert_eq!(from("real_assoc").len(), 1, "{calls:?}");
     assert!(from("real_assoc")[0].contains("::Set::all#"), "{calls:?}");
 }
+
+/// Every resolved edge says how it was found: a qualified path, `Self::`, a module path or
+/// a name defined once in the caller's own file is `exact`; a bare name found only in
+/// other files, a name with several candidates, or a method call on a value is
+/// `heuristic`. Heuristic edges are kept, never dropped.
+#[test]
+fn edges_are_labelled_exact_or_heuristic() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "mod app;\nmod util;\nmod more;\n").unwrap();
+    std::fs::write(
+        root.join("src/util.rs"),
+        "pub fn helper() {}\npub fn only_there() {}\npub fn twice() {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/more.rs"), "pub fn twice() {}\n").unwrap();
+    std::fs::write(
+        root.join("src/app.rs"),
+        r#"pub struct App { n: usize }
+impl App {
+    pub fn new() -> Self { App { n: 0 } }
+    pub fn build() -> Self { Self::new() }
+    pub fn size(&self) -> usize { self.n }
+}
+fn local() {}
+pub fn by_type() -> App { App::new() }
+pub fn by_module() { util::helper(); }
+pub fn by_local() { local(); }
+pub fn by_far_name() { only_there(); }
+pub fn by_shared_name() { twice(); }
+pub fn by_method(a: &App) -> usize { a.size() }
+"#,
+    )
+    .unwrap();
+    index_repository(root, true).unwrap();
+
+    let calls: Vec<(String, String, String)> = labelled_edges(root)
+        .into_iter()
+        .filter(|(_, _, k, _)| k == "CALLS")
+        .map(|(s, t, _, c)| (s, t, c))
+        .collect();
+    let label = |f: &str| -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|(s, _, _)| s.contains(&format!("::{f}#")))
+            .map(|(_, _, c)| c.as_str())
+            .collect()
+    };
+    for (f, want) in [
+        ("by_type", "exact"),
+        ("App::build", "exact"),
+        ("by_module", "exact"),
+        ("by_local", "exact"),
+        ("by_far_name", "heuristic"),
+        ("by_shared_name", "heuristic"),
+        ("by_method", "heuristic"),
+    ] {
+        assert_eq!(label(f), vec![want], "{f}: {calls:?}");
+    }
+    // Module declarations resolve by path
+    let imports: Vec<_> = labelled_edges(root)
+        .into_iter()
+        .filter(|(s, _, k, _)| k == "IMPORTS" && s.starts_with("src/lib.rs"))
+        .collect();
+    assert_eq!(imports.len(), 3, "{imports:?}");
+    assert!(imports.iter().all(|e| e.3 == "exact"), "{imports:?}");
+}

@@ -40,6 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run headless CLI/MCP tests
         run: cargo test --no-default-features --verbose
+      - name: Golden correctness corpus (precision/recall per language)
+        run: cargo test --no-default-features --test golden -- --nocapture
       - name: Build headless release binary
         run: cargo build --release --no-default-features
 

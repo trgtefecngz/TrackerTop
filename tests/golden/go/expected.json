@@ -1,0 +1,33 @@
+{
+  "language": "go",
+  "calls": {
+    "store/store.go::Store::Put": ["store/store.go::normalize"],
+    "main.go::lookup": ["store/store.go::Store::Get", "cache/cache.go::Cache::Get"],
+    "main.go::main": [
+      "store/store.go::New",
+      "store/store.go::Store::Put",
+      "cache/cache.go::New",
+      "main.go::lookup"
+    ],
+    "main_test.go::TestLookup": [
+      "store/store.go::New",
+      "store/store.go::Store::Put",
+      "main.go::lookup"
+    ]
+  },
+  "impact": {
+    "store/store.go::normalize": [
+      "store/store.go::Store::Put",
+      "main.go::main",
+      "main_test.go::TestLookup"
+    ],
+    "store/store.go::New": ["main.go::main", "main_test.go::TestLookup"],
+    "cache/cache.go::Cache::Get": [
+      "main.go::lookup",
+      "main.go::main",
+      "main_test.go::TestLookup"
+    ]
+  },
+  "untested": ["cache/cache.go::New"],
+  "orphan_files": []
+}

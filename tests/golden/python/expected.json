@@ -1,0 +1,50 @@
+{
+  "language": "python",
+  "calls": {
+    "app/models.py::User::save": [
+      "app/models.py::User::validate",
+      "app/models.py::Admin::validate",
+      "app/storage.py::write"
+    ],
+    "app/models.py::Admin::save": ["app/models.py::User::save", "app/audit.py::log"],
+    "app/storage.py::write": ["app/storage.py::_encode"],
+    "app/service.py::register": [
+      "app/models.py::Admin",
+      "app/models.py::User",
+      "app/models.py::User::save",
+      "app/models.py::Admin::save"
+    ],
+    "app/service.py::lookup": ["app/storage.py::read"],
+    "app/service.py::cached_lookup": [
+      "app/storage.py::Cache::read",
+      "app/service.py::lookup",
+      "app/storage.py::Cache::write"
+    ],
+    "tests/test_service.py::test_register_admin": ["app/service.py::register"],
+    "tests/test_service.py::test_lookup_missing": ["app/service.py::lookup"]
+  },
+  "impact": {
+    "app/storage.py::write": [
+      "app/models.py::User::save",
+      "app/models.py::Admin::save",
+      "app/service.py::register"
+    ],
+    "app/models.py::User::validate": [
+      "app/models.py::User::save",
+      "app/models.py::Admin::save",
+      "app/service.py::register"
+    ],
+    "app/service.py::lookup": [
+      "app/service.py::cached_lookup",
+      "tests/test_service.py::test_lookup_missing"
+    ]
+  },
+  "untested": [
+    "app/service.py::cached_lookup",
+    "app/storage.py::Cache::__init__",
+    "app/storage.py::Cache::read",
+    "app/storage.py::Cache::write",
+    "app/legacy.py::old_export"
+  ],
+  "orphan_files": ["app/legacy.py"]
+}

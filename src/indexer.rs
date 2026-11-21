@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::model::{Edge, EdgeKind, FileRecord, RawReference, Symbol, SymbolKind};
+use crate::model::{Confidence, Edge, EdgeKind, FileRecord, RawReference, Symbol, SymbolKind};
 use crate::parser::{LanguageExtractor, LanguageRegistry, default_registry, file_symbol_id};
 use crate::registry::register_project;
 use crate::tokens::count_tokens;
@@ -521,12 +521,15 @@ fn resolve_edges(
     symbols: &[Symbol],
     raw_refs: &[(String, RawReference)],
 ) -> Vec<Edge> {
-    let mut edge_map: HashMap<(String, String, EdgeKind), f32> = HashMap::new();
+    let mut edge_map: HashMap<(String, String, EdgeKind), (f32, Confidence)> = HashMap::new();
 
     // 1. Structural CONTAINS edges from parent_id
     for sym in symbols {
         if let Some(ref pid) = sym.parent_id {
-            edge_map.insert((pid.clone(), sym.id.clone(), EdgeKind::Contains), 1.0);
+            edge_map.insert(
+                (pid.clone(), sym.id.clone(), EdgeKind::Contains),
+                (1.0, Confidence::Exact),
+            );
         }
     }
 
@@ -574,7 +577,7 @@ fn resolve_edges(
             continue;
         }
 
-        let mut resolved_targets: Vec<String> = Vec::new();
+        let mut resolved_targets: Vec<(String, Confidence)> = Vec::new();
 
         match rref.kind {
             EdgeKind::Imports => {
@@ -589,7 +592,7 @@ fn resolve_edges(
                     ];
                     for c in &candidates {
                         if let Some(fid) = file_by_path.get(c) {
-                            resolved_targets.push(fid.clone());
+                            resolved_targets.push((fid.clone(), Confidence::Exact));
                             break;
                         }
                     }
@@ -603,9 +606,9 @@ fn resolve_edges(
                     // Try symbol resolution on last segment
                     if let Some(&last) = segs.last()
                         && let Some(syms) = by_name.get(last)
-                        && let Some(best) = pick_best_symbol(syms, src_file, &segs)
+                        && let Some((best, conf)) = pick_best_symbol(syms, src_file, &segs)
                     {
-                        resolved_targets.push(best.id.clone());
+                        resolved_targets.push((best.id.clone(), conf));
                     }
                     // Also link to module file if found
                     if !segs.is_empty() {
@@ -615,12 +618,12 @@ fn resolve_edges(
                             .get(&mod_path)
                             .or_else(|| file_by_path.get(&mod_dir_path))
                         {
-                            resolved_targets.push(fid.clone());
+                            resolved_targets.push((fid.clone(), Confidence::Exact));
                         }
                         if segs.len() >= 2 {
                             let sub = format!("src/{}/{}.rs", segs[0], segs[1]);
                             if let Some(fid) = file_by_path.get(&sub) {
-                                resolved_targets.push(fid.clone());
+                                resolved_targets.push((fid.clone(), Confidence::Exact));
                             }
                         }
                     }
@@ -636,7 +639,7 @@ fn resolve_edges(
                         .get(&norm)
                         .or_else(|| file_by_path.get(&rel_from_dir))
                     {
-                        resolved_targets.push(fid.clone());
+                        resolved_targets.push((fid.clone(), Confidence::Exact));
                     } else if let Some(base) = norm.rsplit('/').next() {
                         let key = base.to_ascii_lowercase();
                         if let Some(fids) = file_by_basename
@@ -644,7 +647,8 @@ fn resolve_edges(
                             .or_else(|| file_by_stem.get(&key))
                             && let Some(first) = fids.first()
                         {
-                            resolved_targets.push(first.clone());
+                            // Matched by file name only: another file may share it
+                            resolved_targets.push((first.clone(), Confidence::Heuristic));
                         }
                     }
                 }
@@ -665,7 +669,8 @@ fn resolve_edges(
                 if method_call || (is_call && !target.contains("::")) {
                     let name = target.trim_start_matches('.');
                     let syms = by_name.get(name).map(Vec::as_slice).unwrap_or_default();
-                    let syms = if syms.is_empty() {
+                    let by_case = syms.is_empty();
+                    let syms = if by_case {
                         by_name_ci
                             .get(&name.to_ascii_lowercase())
                             .map(Vec::as_slice)
@@ -683,14 +688,21 @@ fn resolve_edges(
                     {
                         candidates.clear();
                     }
-                    if let Some(best) = pick_nearest_symbol(&candidates, src_file) {
-                        resolved_targets.push(best.id.clone());
+                    if let Some((best, conf)) = pick_labelled(&candidates, src_file) {
+                        // A method call on a value is found by name only: the receiver's
+                        // type is unknown, so even a unique candidate is a guess
+                        let conf = if method_call || by_case {
+                            Confidence::Heuristic
+                        } else {
+                            conf
+                        };
+                        resolved_targets.push((best.id.clone(), conf));
                     }
                 } else if rust_qualified {
-                    if let Some(best) =
+                    if let Some((best, conf)) =
                         resolve_qualified_rust_call(target, src_file, &by_qname, &by_name)
                     {
-                        resolved_targets.push(best.id.clone());
+                        resolved_targets.push((best.id.clone(), conf));
                     }
                 }
                 // A Rust type use names a type: never a function, module or doc section
@@ -713,30 +725,39 @@ fn resolve_edges(
                             )
                         })
                         .collect();
-                    if let Some(best) = pick_nearest_symbol(&types, src_file) {
-                        resolved_targets.push(best.id.clone());
+                    if let Some((best, conf)) = pick_labelled(&types, src_file) {
+                        resolved_targets.push((best.id.clone(), conf));
                     }
                 }
                 // Direct file path reference (e.g., from Markdown `src/graph.rs`)
                 else if let Some(fid) = file_by_path.get(target) {
-                    resolved_targets.push(fid.clone());
+                    resolved_targets.push((fid.clone(), Confidence::Exact));
                 } else if let Some(syms) = by_qname.get(target) {
-                    if let Some(best) = pick_nearest_symbol(syms, src_file) {
-                        resolved_targets.push(best.id.clone());
+                    // A qualified name (`a::B`, `pkg.f`) defined once names its target; a
+                    // bare name only does when it is defined once in the caller's file
+                    let qualified = target.contains("::") || target.contains('.');
+                    if let Some((best, conf)) = pick_labelled(syms, src_file) {
+                        let conf = if qualified && syms.len() == 1 {
+                            Confidence::Exact
+                        } else {
+                            conf
+                        };
+                        resolved_targets.push((best.id.clone(), conf));
                     }
                 } else if let Some(syms) = by_name.get(target) {
-                    if let Some(best) = pick_nearest_symbol(syms, src_file) {
-                        resolved_targets.push(best.id.clone());
+                    if let Some((best, conf)) = pick_labelled(syms, src_file) {
+                        resolved_targets.push((best.id.clone(), conf));
                     }
                 } else if let Some(last) = target.rsplit("::").next() {
+                    // Last-segment and case-insensitive matches are fallbacks: guesses
                     if let Some(syms) = by_name.get(last) {
                         if let Some(best) = pick_nearest_symbol(syms, src_file) {
-                            resolved_targets.push(best.id.clone());
+                            resolved_targets.push((best.id.clone(), Confidence::Heuristic));
                         }
                     } else if let Some(syms) = by_name_ci.get(&last.to_ascii_lowercase()) {
                         // PowerShell is case-insensitive
                         if let Some(best) = pick_nearest_symbol(syms, src_file) {
-                            resolved_targets.push(best.id.clone());
+                            resolved_targets.push((best.id.clone(), Confidence::Heuristic));
                         }
                     }
                 }
@@ -755,25 +776,31 @@ fn resolve_edges(
             EdgeKind::CoChanges => 1.1,
         };
 
-        for tgt in resolved_targets {
+        for (tgt, conf) in resolved_targets {
             if tgt == rref.source_symbol_id {
                 continue;
             }
             edge_map
                 .entry((rref.source_symbol_id.clone(), tgt, rref.kind))
-                .and_modify(|w| *w = w.max(weight))
-                .or_insert(weight);
+                .and_modify(|(w, c)| {
+                    *w = w.max(weight);
+                    *c = c.or(conf);
+                })
+                .or_insert((weight, conf));
         }
     }
 
     edge_map
         .into_iter()
-        .map(|((source_id, target_id, kind), weight)| Edge {
-            source_id,
-            target_id,
-            kind,
-            weight,
-        })
+        .map(
+            |((source_id, target_id, kind), (weight, confidence))| Edge {
+                source_id,
+                target_id,
+                kind,
+                weight,
+                confidence,
+            },
+        )
         .collect()
 }
 
@@ -887,10 +914,10 @@ fn resolve_qualified_rust_call<'a>(
     src_file: &str,
     by_qname: &HashMap<String, Vec<&'a Symbol>>,
     by_name: &HashMap<String, Vec<&'a Symbol>>,
-) -> Option<&'a Symbol> {
+) -> Option<(&'a Symbol, Confidence)> {
     let (qualifier, func) = target.rsplit_once("::")?;
     if qualifier.chars().next().is_some_and(char::is_uppercase) {
-        return pick_nearest_symbol(by_qname.get(target)?, src_file);
+        return pick_qualified(by_qname.get(target)?, src_file);
     }
     let in_module: Vec<&Symbol> = by_name
         .get(func)?
@@ -898,7 +925,33 @@ fn resolve_qualified_rust_call<'a>(
         .copied()
         .filter(|s| file_is_module(&s.file_path, qualifier))
         .collect();
-    pick_nearest_symbol(&in_module, src_file)
+    pick_qualified(&in_module, src_file)
+}
+
+/// The target of a qualified path: exact when the path names one symbol, a guess when
+/// several share it (the same type name in two modules).
+fn pick_qualified<'a>(syms: &[&'a Symbol], src_file: &str) -> Option<(&'a Symbol, Confidence)> {
+    let best = pick_nearest_symbol(syms, src_file)?;
+    let conf = if syms.len() == 1 {
+        Confidence::Exact
+    } else {
+        Confidence::Heuristic
+    };
+    Some((best, conf))
+}
+
+/// The target of a bare name, labelled: exact only when the name is defined once in the
+/// caller's own file (the local definition is what the name means there). A name found only
+/// in other files is a guess: an import, a library or a namesake may be what is meant.
+fn pick_labelled<'a>(syms: &[&'a Symbol], src_file: &str) -> Option<(&'a Symbol, Confidence)> {
+    let best = pick_nearest_symbol(syms, src_file)?;
+    let in_file = syms.iter().filter(|s| s.file_path == src_file).count();
+    let conf = if best.file_path == src_file && in_file == 1 {
+        Confidence::Exact
+    } else {
+        Confidence::Heuristic
+    };
+    Some((best, conf))
 }
 
 /// Whether `path` is the source of Rust module `module` (`.../module.rs`, `.../module/mod.rs`)
@@ -927,14 +980,30 @@ fn pick_nearest_symbol<'a>(syms: &[&'a Symbol], src_file: &str) -> Option<&'a Sy
     syms.first().copied()
 }
 
-fn pick_best_symbol<'a>(syms: &[&'a Symbol], src_file: &str, segs: &[&str]) -> Option<&'a Symbol> {
+/// The target of a `crate::a::b::Sym` / `super::b::Sym` path. Exact when exactly one
+/// candidate lives in the named module (`b.rs`, `b/mod.rs` or a file in `b/`); a path
+/// whose module is not found falls back to a guess.
+fn pick_best_symbol<'a>(
+    syms: &[&'a Symbol],
+    src_file: &str,
+    segs: &[&str],
+) -> Option<(&'a Symbol, Confidence)> {
     if segs.len() >= 2 {
+        let module = segs[segs.len() - 2];
+        let in_module: Vec<&Symbol> = syms
+            .iter()
+            .copied()
+            .filter(|s| file_is_module(&s.file_path, module))
+            .collect();
+        if in_module.len() == 1 {
+            return Some((in_module[0], Confidence::Exact));
+        }
         let hint = segs[segs.len() - 2];
         if let Some(matched) = syms.iter().find(|s| s.file_path.contains(hint)) {
-            return Some(*matched);
+            return Some((*matched, Confidence::Heuristic));
         }
     }
-    pick_nearest_symbol(syms, src_file)
+    pick_nearest_symbol(syms, src_file).map(|s| (s, Confidence::Heuristic))
 }
 
 #[cfg(test)]

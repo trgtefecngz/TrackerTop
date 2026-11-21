@@ -414,7 +414,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "call_graph",
-            "description": "Shows callers and callees/types around a symbol up to N hops.",
+            "description": "Shows callers and callees/types around a symbol up to N hops. Each edge is labelled exact (qualified path, Self::, module path, or a name defined once in the same file) or heuristic (found by name only: check it).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -427,7 +427,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "impact_analysis",
-            "description": "Blast radius before refactoring: shows direct dependents, transitive dependents, affected files, and linked tests to re-run.",
+            "description": "Blast radius before refactoring: shows direct dependents, transitive dependents, affected files, and linked tests to re-run. Counts are split into exact and heuristic (reached through at least one edge found by name only).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
