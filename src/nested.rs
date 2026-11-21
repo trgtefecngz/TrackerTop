@@ -484,6 +484,7 @@ mod tests {
             target_id: b.to_string(),
             kind,
             weight: 1.0,
+            confidence: Default::default(),
         }
     }
 

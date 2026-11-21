@@ -1,4 +1,4 @@
-use crate::model::{Edge, EdgeKind};
+use crate::model::{Confidence, Edge, EdgeKind};
 use crate::parser::file_symbol_id;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -112,12 +112,14 @@ pub fn extract_cochange_edges(repo_root: &Path, indexed_files: &HashSet<String>)
                 target_id: fb.clone(),
                 kind: EdgeKind::CoChanges,
                 weight,
+                confidence: Confidence::Heuristic,
             });
             edges.push(Edge {
                 source_id: fb,
                 target_id: fa,
                 kind: EdgeKind::CoChanges,
                 weight,
+                confidence: Confidence::Heuristic,
             });
         }
     }

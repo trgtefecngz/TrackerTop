@@ -45,13 +45,17 @@ impl TrackerEngine {
         }
         out.push_str(&format!("Sig: `{}`\n", sym.signature));
 
-        out.push_str(&format!("\n## Incoming / Callers ({})\n", callers.len()));
+        out.push_str(&format!(
+            "\n## Incoming / Callers: {}\n",
+            confidence_split(callers.len(), count_heuristic(&callers))
+        ));
         out.push_str(&more_note(callers.len(), 20, "callers"));
-        for (d, kind, s) in callers.iter().take(20) {
+        for (d, kind, conf, s) in callers.iter().take(20) {
             touched_files.insert(s.file_path.clone());
             out.push_str(&format!(
-                "- d{d} [{}] {} ({}:L{})\n",
+                "- d{d} [{} {}] {} ({}:L{})\n",
                 kind.as_str(),
+                conf.as_str(),
                 s.qualified_name,
                 s.file_path,
                 s.start_line
@@ -59,15 +63,16 @@ impl TrackerEngine {
         }
 
         out.push_str(&format!(
-            "\n## Outgoing / Callees & Types ({})\n",
-            callees.len()
+            "\n## Outgoing / Callees & Types: {}\n",
+            confidence_split(callees.len(), count_heuristic(&callees))
         ));
         out.push_str(&more_note(callees.len(), 20, "callees"));
-        for (d, kind, s) in callees.iter().take(20) {
+        for (d, kind, conf, s) in callees.iter().take(20) {
             touched_files.insert(s.file_path.clone());
             out.push_str(&format!(
-                "- d{d} [{}] {} ({}:L{}) -> `{}`\n",
+                "- d{d} [{} {}] {} ({}:L{}) -> `{}`\n",
                 kind.as_str(),
+                conf.as_str(),
                 s.qualified_name,
                 s.file_path,
                 s.start_line,
@@ -135,10 +140,28 @@ impl TrackerEngine {
             report.root.file_path,
             report.root.start_line,
             report.affected_files.len(),
-            report.direct_dependents.len(),
-            report.transitive_dependents.len(),
-            report.related_tests.len(),
+            confidence_split(report.direct_dependents.len(), report.heuristic_direct),
+            confidence_split(
+                report.transitive_dependents.len(),
+                report.heuristic_transitive
+            ),
+            confidence_split(report.related_tests.len(), report.heuristic_tests),
         );
+        if report.heuristic_direct + report.heuristic_transitive + report.heuristic_tests > 0 {
+            out.push_str(
+                "heuristic = reached through at least one edge found by name only (a bare \
+                 name with several candidates or in another file, a method call on a value): \
+                 check it before relying on it.\n",
+            );
+        }
+        let label = |s: &Symbol| {
+            report
+                .confidence
+                .get(&s.id)
+                .copied()
+                .unwrap_or_default()
+                .as_str()
+        };
         if let Some(c) = cg
             .resolve(symbol_query)
             .and_then(|r| r.caveat(symbol_query))
@@ -155,9 +178,10 @@ impl TrackerEngine {
             ));
             for s in report.direct_dependents.iter().take(15) {
                 out.push_str(&format!(
-                    "- {} [{}] ({}:L{})\n",
+                    "- {} [{}] {} ({}:L{})\n",
                     s.qualified_name,
                     s.kind.as_str(),
+                    label(s),
                     s.file_path,
                     s.start_line
                 ));
@@ -173,9 +197,10 @@ impl TrackerEngine {
             ));
             for s in report.transitive_dependents.iter().take(15) {
                 out.push_str(&format!(
-                    "- {} [{}] ({}:L{})\n",
+                    "- {} [{}] {} ({}:L{})\n",
                     s.qualified_name,
                     s.kind.as_str(),
+                    label(s),
                     s.file_path,
                     s.start_line
                 ));
@@ -186,8 +211,11 @@ impl TrackerEngine {
             out.push_str("\n## Linked Tests to Re-run\n");
             for t in &report.related_tests {
                 out.push_str(&format!(
-                    "- {} ({}:L{})\n",
-                    t.name, t.file_path, t.start_line
+                    "- {} {} ({}:L{})\n",
+                    t.name,
+                    label(t),
+                    t.file_path,
+                    t.start_line
                 ));
             }
         }
@@ -295,7 +323,7 @@ impl TrackerEngine {
         let mut neighbor_seen = included_ids.clone();
         for core_id in &included_ids {
             let (callers, callees) = cg.neighborhood(core_id, 1);
-            for (_, kind, nbr) in callees.into_iter().chain(callers) {
+            for (_, kind, _, nbr) in callees.into_iter().chain(callers) {
                 if neighbor_seen.insert(nbr.id.clone()) && nbr.kind != SymbolKind::File {
                     touched_files.insert(nbr.file_path.clone());
                     out.push_str(&format!(
@@ -472,7 +500,7 @@ impl TrackerEngine {
                     }
                     // Check CO_CHANGES neighbors
                     let (_, outgoing) = cg.neighborhood(sid, 1);
-                    for (_, kind, nbr) in outgoing {
+                    for (_, kind, _, nbr) in outgoing {
                         if kind == crate::model::EdgeKind::CoChanges
                             && !changed_files.contains(&nbr.file_path)
                         {
