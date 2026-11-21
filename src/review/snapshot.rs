@@ -81,7 +81,9 @@ fn checkout_snapshot(repo_root: &Path, commit: &str, cache: &Path, dir: &Path) -
     // project's subtree at its root.
     let toplevel = PathBuf::from(git(repo_root, &["rev-parse", "--show-toplevel"])?.trim());
     let result = (|| -> Result<()> {
-        let mut prefix_arg = tmp.to_string_lossy().replace('\\', "/");
+        let mut prefix_arg = crate::fsutil::process_path(&tmp)
+            .to_string_lossy()
+            .replace('\\', "/");
         if !prefix_arg.ends_with('/') {
             prefix_arg.push('/');
         }
@@ -116,8 +118,8 @@ fn checkout_snapshot(repo_root: &Path, commit: &str, cache: &Path, dir: &Path) -
 
 fn run_git_with_index(repo_root: &Path, index_file: &Path, args: &[&str]) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(repo_root)
-        .env("GIT_INDEX_FILE", index_file)
+    cmd.current_dir(crate::fsutil::process_path(repo_root))
+        .env("GIT_INDEX_FILE", crate::fsutil::process_path(index_file))
         .args(["-c", "core.quotepath=false"])
         .args(args);
     #[cfg(windows)]
