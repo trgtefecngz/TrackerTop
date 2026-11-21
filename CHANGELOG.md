@@ -2,7 +2,7 @@
 
 All notable changes to TrackerTop are documented here.
 
-## [Unreleased]
+## [0.8.3] - 2026-11-21
 
 ### Added: edge confidence and a golden correctness corpus
 - **Every resolved edge is labelled `exact` or `heuristic`.** Exact: a qualified path (`Type::f`, `module::f`), `Self::`, a module or file path, or a name defined once in the caller's own file. Heuristic: a bare name picked among several candidates or found only in another file, a method call on a value whose type is unknown, a case-insensitive or last-segment fallback, and co-change links. Heuristic edges are kept and labelled, never dropped. Stored in the index (`edges.confidence`); an older index is migrated in place and its edges are rebuilt on the next index run.
@@ -257,6 +257,7 @@ A reliability and safety release. There are no new MCP tools; everything that al
 
 Global Edition: TypeScript/JavaScript, Python and Go extractors, custom app icon, Claude Code SessionStart hook, macOS release CI, one-line installers.
 
+[0.8.3]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.3
 [0.8.2]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.2
 [0.8.1]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.1
 [0.8.0]: https://github.com/trgtefecngz/TrackerTop/releases/tag/v0.8.0
