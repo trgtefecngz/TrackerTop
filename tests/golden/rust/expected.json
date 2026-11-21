@@ -1,0 +1,57 @@
+{
+  "language": "rust",
+  "calls": {
+    "src/lib.rs::squared_area": ["src/lib.rs::square"],
+    "src/lib.rs::square": ["src/util.rs::mul"],
+    "src/lib.rs::report": ["src/util.rs::clamp"],
+    "src/lib.rs::circle_has_area": ["src/shapes.rs::Circle::new", "src/shapes.rs::Circle::area"],
+    "src/lib.rs::store_counts": [
+      "src/store.rs::Store::new",
+      "src/store.rs::Store::add",
+      "src/shapes.rs::Circle::new",
+      "src/store.rs::Store::len"
+    ],
+    "src/shapes.rs::Circle::area": ["src/util.rs::mul"],
+    "src/shapes.rs::Square::area": ["src/util.rs::mul"],
+    "src/shapes.rs::unit_square": ["src/shapes.rs::Square::new"],
+    "src/shapes.rs::total_area": [
+      "src/shapes.rs::area",
+      "src/shapes.rs::Circle::area",
+      "src/shapes.rs::Square::area"
+    ],
+    "src/store.rs::Store::add": ["src/store.rs::Store::log"],
+    "src/store.rs::Store::seeded": [
+      "src/store.rs::Store::new",
+      "src/store.rs::Store::add",
+      "src/shapes.rs::Circle::new"
+    ],
+    "src/events.rs::round_trip": ["src/events.rs::describe", "src/events.rs::make"]
+  },
+  "impact": {
+    "src/util.rs::mul": [
+      "src/lib.rs::square",
+      "src/shapes.rs::Circle::area",
+      "src/shapes.rs::Square::area",
+      "src/lib.rs::squared_area",
+      "src/lib.rs::circle_has_area",
+      "src/shapes.rs::total_area"
+    ],
+    "src/store.rs::Store::new": ["src/lib.rs::store_counts", "src/store.rs::Store::seeded"],
+    "src/events.rs::describe": ["src/events.rs::round_trip"]
+  },
+  "untested": [
+    "src/lib.rs::squared_area",
+    "src/lib.rs::report",
+    "src/shapes.rs::area",
+    "src/shapes.rs::Square::new",
+    "src/shapes.rs::Square::area",
+    "src/shapes.rs::unit_square",
+    "src/shapes.rs::total_area",
+    "src/store.rs::Store::seeded",
+    "src/events.rs::describe",
+    "src/events.rs::make",
+    "src/events.rs::round_trip",
+    "src/util.rs::clamp"
+  ],
+  "orphan_files": []
+}
